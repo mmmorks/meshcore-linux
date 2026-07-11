@@ -19,7 +19,13 @@ RADIO_CLASS radio = new Module(hal, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, RADIO
 WRAPPER_CLASS radio_driver(radio, board);
 
 LinuxRTCClock rtc_clock;
-EnvironmentSensorManager sensors;
+LinuxSerialStream gps_serial;
+MicroNMEALocationProvider gps_location(gps_serial, &rtc_clock, -1, -1, NULL);
+EnvironmentSensorManager sensors(gps_location);
+
+bool linux_gps_available() {
+  return gps_serial.isOpen() && gps_serial.available() > 0;
+}
 
 #ifdef DISPLAY_CLASS
   DISPLAY_CLASS display;
@@ -28,6 +34,10 @@ EnvironmentSensorManager sensors;
 
 bool radio_init() {
   rtc_clock.begin();
+
+  if (board.config.gps_device && board.config.gps_device[0] != '\0') {
+    gps_serial.begin(board.config.gps_device, board.config.gps_baud);
+  }
 
   radio = new Module(hal, board.config.lora_nss_pin, board.config.lora_irq_pin, board.config.lora_reset_pin, board.config.lora_busy_pin);
   return radio.std_init(&SPI);

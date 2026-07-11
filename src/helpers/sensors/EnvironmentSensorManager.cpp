@@ -730,8 +730,23 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
 }
 
 #if ENV_INCLUDE_GPS
+#if defined(ARDULINUX_PLATFORM)
+// Defined in variants/linux/target.cpp. The Linux build opens the serial GPS
+// device itself (there is no hardware UART); this reports whether that device
+// is open and currently has NMEA bytes to read.
+bool linux_gps_available();
+#endif
+
 void EnvironmentSensorManager::initBasicGPS() {
 
+#if defined(ARDULINUX_PLATFORM)
+  // Linux: the serial device is opened by the variant (target.cpp) from the
+  // gps_device/gps_baud config. If nothing was configured/opened, GPS is off.
+  _location->begin();   // no-op on Linux (pin_en/pin_reset == -1)
+  _location->reset();
+  delay(1000);          // let the device stream a first fix
+  gps_detected = linux_gps_available();
+#else
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
 
   #ifdef GPS_BAUD_RATE
@@ -757,6 +772,7 @@ void EnvironmentSensorManager::initBasicGPS() {
 #else
   gps_detected = (Serial1.available() > 0);
 #endif
+#endif  // ARDULINUX_PLATFORM
 
   if (gps_detected) {
     MESH_DEBUG_PRINTLN("GPS detected");
