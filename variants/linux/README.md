@@ -104,6 +104,8 @@ Key settings:
 | `advert_name` | `"Linux Repeater"` | Node name, first-run default only |
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
+| `gps_device` | *(empty)* | Path to a serial NMEA GPS device (e.g. `/dev/ttyACM0`). Empty disables GPS. |
+| `gps_baud` | `9600` | Baud rate for `gps_device`. One of 4800/9600/19200/38400/57600/115200. |
 
 ### 3. Enable SPI and GPIO access
 
@@ -203,6 +205,22 @@ set password <password>
 set lat <lat>
 set lon <lon>
 ```
+
+### GPS
+
+With `gps_device` configured, the standard MeshCore GPS commands work over the
+control CLI (`meshcorectl`):
+
+- `gps` — status: on/off, active/deactivated, fix/no-fix, satellite count
+- `gps on` / `gps off` — enable/disable GPS reading and location telemetry
+- `gps sync` — force a time re-sync from GPS
+- `gps setloc` — save the current GPS fix as the node's advertised location
+- `gps advert none|prefs|share` — control whether location is advertised
+
+The daemon needs read access to `gps_device`. USB GPS units are usually owned
+by root or the `dialout` group; the systemd service already runs with the
+privileges it needs for SPI/GPIO. For an unprivileged run, add the user to the
+device's group or install a udev rule granting access.
 
 There are two levels of reset:
 
