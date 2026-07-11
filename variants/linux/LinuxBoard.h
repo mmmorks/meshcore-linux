@@ -39,6 +39,8 @@ public:
   char *admin_password = "password";
   float lat = 0.0f;
   float lon = 0.0f;
+  char *gps_device = "";
+  int   gps_baud   = 9600;
 
   int load(const char *filename);
 };
