@@ -24,9 +24,9 @@ extern EnvironmentSensorManager sensors;
 extern LinuxSerialStream gps_serial;
 extern MicroNMEALocationProvider gps_location;
 
-// True if a serial GPS device is open and currently has bytes to read.
+// True if a serial GPS device was configured and successfully opened.
 // Consumed by EnvironmentSensorManager::initBasicGPS() on the Linux build.
-bool linux_gps_available();
+bool linux_gps_present();
 
 #ifdef DISPLAY_CLASS
   extern DISPLAY_CLASS display;

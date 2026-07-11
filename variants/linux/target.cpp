@@ -23,8 +23,8 @@ LinuxSerialStream gps_serial;
 MicroNMEALocationProvider gps_location(gps_serial, &rtc_clock, -1, -1, NULL);
 EnvironmentSensorManager sensors(gps_location);
 
-bool linux_gps_available() {
-  return gps_serial.isOpen() && gps_serial.available() > 0;
+bool linux_gps_present() {
+  return gps_serial.isOpen();
 }
 
 #ifdef DISPLAY_CLASS
