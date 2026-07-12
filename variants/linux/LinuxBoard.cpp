@@ -91,6 +91,21 @@ void LinuxBoard::begin() {
     printf("FATAL: %d GPIO pin(s) failed to bind; cannot start radio.\n", failures);
     exit(1);
   }
+
+  // GPS enable/standby pin: some modules (e.g. the L76K on the Waveshare
+  // LoRaWAN/GNSS HAT) must have their STANDBY line driven HIGH to wake and
+  // stream NMEA. Bind and hold it high for the daemon lifetime. Non-fatal: a
+  // repeater must still run without GPS.
+  if (config.gps_en_pin != -1) {
+    if (initGPIOPin(config.gps_en_pin, config.lora_gpiochip, config.gps_en_pin) == 0) {
+      pinMode(config.gps_en_pin, OUTPUT);
+      digitalWrite(config.gps_en_pin, HIGH);
+      printf("GPS enable pin %d driven HIGH\n", (int)config.gps_en_pin);
+    } else {
+      printf("WARNING: could not claim GPS enable pin %d; GPS may stay asleep\n",
+             (int)config.gps_en_pin);
+    }
+  }
 }
 
 void trim(char *str) {
@@ -173,6 +188,7 @@ int LinuxConfig::load(const char *filename) {
     else if (strcmp(key, "lon") == 0)            lon = atof(value);
     else if (strcmp(key, "gps_device") == 0)  gps_device = safe_copy(value, 64);
     else if (strcmp(key, "gps_baud") == 0)    gps_baud = atoi(value);
+    else if (strcmp(key, "gps_en_pin") == 0)  gps_en_pin = atoi(value);
   }
   fclose(f);
   return 0;

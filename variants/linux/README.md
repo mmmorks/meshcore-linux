@@ -106,6 +106,7 @@ Key settings:
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
 | `gps_device` | *(empty)* | Path to a serial NMEA GPS device (e.g. `/dev/ttyACM0`). Empty disables GPS. |
 | `gps_baud` | `9600` | Baud rate for `gps_device`. One of 4800/9600/19200/38400/57600/115200. |
+| `gps_en_pin` | `-1` | GPIO line held HIGH to wake a GPS module that boots in standby (e.g. the L76K STANDBY line on the Waveshare LoRaWAN/GNSS HAT). `-1` = none. |
 
 ### 3. Enable SPI and GPIO access
 
@@ -221,6 +222,11 @@ The daemon needs read access to `gps_device`. USB GPS units are usually owned
 by root or the `dialout` group; the systemd service already runs with the
 privileges it needs for SPI/GPIO. For an unprivileged run, add the user to the
 device's group or install a udev rule granting access.
+
+Some GPS modules boot into standby and stay silent until an enable/standby line
+is driven high. The L76K on the Waveshare LoRaWAN/GNSS HAT is one such module —
+set `gps_en_pin` to that GPIO (STANDBY is on GPIO 4 for that HAT) and the daemon
+holds it high on start so the module wakes and streams NMEA.
 
 There are two levels of reset:
 

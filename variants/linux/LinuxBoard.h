@@ -41,6 +41,7 @@ public:
   float lon = 0.0f;
   char *gps_device = "";
   int   gps_baud   = 9600;
+  int   gps_en_pin = -1;
 
   int load(const char *filename);
 };
