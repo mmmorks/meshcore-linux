@@ -8,6 +8,15 @@
   static UITask ui_task(display);
 #endif
 
+// On Linux, Serial is output-only, so the interactive CLI reads from a control
+// socket / stdin console instead. Other platforms keep using hardware Serial.
+#ifdef ARDULINUX_PLATFORM
+  #include <LinuxConsole.h>
+  #define MC_CLI Console
+#else
+  #define MC_CLI Serial
+#endif
+
 StdRNG fast_rng;
 SimpleMeshTables tables;
 
@@ -30,6 +39,10 @@ static unsigned long userBtnDownAt = 0;
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+#ifdef ARDULINUX_PLATFORM
+  Console.begin();  // open the control socket / prepare stdin for the CLI
+#endif
 
   board.begin();
 
@@ -111,12 +124,12 @@ void setup() {
 
 void loop() {
   int len = strlen(command);
-  while (Serial.available() && len < sizeof(command)-1) {
-    char c = Serial.read();
+  while (MC_CLI.available() && len < sizeof(command)-1) {
+    char c = MC_CLI.read();
     if (c != '\n') {
       command[len++] = c;
       command[len] = 0;
-      Serial.print(c);
+      MC_CLI.print(c);
     }
     if (c == '\r') break;
   }
@@ -125,12 +138,12 @@ void loop() {
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
-    Serial.print('\n');
+    MC_CLI.print('\n');
     command[len - 1] = 0;  // replace newline with C string null terminator
     char reply[160];
     the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
     if (reply[0]) {
-      Serial.print("  -> "); Serial.println(reply);
+      MC_CLI.print("  -> "); MC_CLI.println(reply);
     }
 
     command[0] = 0;  // reset command buffer
