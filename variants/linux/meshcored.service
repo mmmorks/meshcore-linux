@@ -18,6 +18,12 @@ ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
 StateDirectory=meshcore
+# Creates /run/meshcored (owned by meshcore:meshcore) for the CLI control
+# socket. meshcored listens on /run/meshcored/meshcored.sock by default; talk to
+# it with `meshcorectl` (or socat). RuntimeDirectory is exempt from PrivateTmp,
+# so an admin client outside the unit can still reach the socket.
+RuntimeDirectory=meshcored
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target

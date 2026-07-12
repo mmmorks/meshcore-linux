@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""meshcorectl - talk to a running meshcored over its control socket.
+
+  meshcorectl                    interactive REPL (line editing, history, tab-complete)
+  meshcorectl set name foo       one-shot: send one command, print the reply, exit
+  echo -e "advert\\nprefs" | meshcorectl   pipe: run each line, print replies
+
+The interactive mode is a self-contained readline client (equivalent to wrapping
+a raw socket in rlwrap): arrow-key editing, Ctrl-R reverse search, persistent
+history in ~/.meshcorectl_history, and Tab completion of known commands. No socat
+or rlwrap needed.
+
+Socket path: $MESHCORED_CONTROL_SOCKET, else /run/meshcored/meshcored.sock.
+Access: run as root or a member of the `meshcore` group.
+"""
+import os
+import sys
+import time
+import socket
+import select
+import atexit
+
+SOCK = os.environ.get("MESHCORED_CONTROL_SOCKET", "/run/meshcored/meshcored.sock")
+HISTFILE = os.path.expanduser("~/.meshcorectl_history")
+
+# Top-level commands (from src/helpers/CommonCLI.cpp).
+TOP = [
+    "advert", "advert.zerohop", "board", "clear stats", "clkreboot", "clock",
+    "clock sync", "erase", "get", "gps", "gps advert", "gps off", "gps on",
+    "gps setloc", "gps sync", "log", "log erase", "log start", "log stop",
+    "neighbors", "neighbor.remove", "password", "poweroff", "powersaving",
+    "powersaving off", "powersaving on", "prefs", "reboot", "region",
+    "sensor get", "sensor list", "sensor set", "set", "share", "shutdown",
+    "start ota", "stats-core", "stats-packets", "stats-radio", "tempradio",
+    "time", "ver",
+]
+
+# Keys usable after "set " / "get ".
+SETKEYS = [
+    "adc.multiplier", "advert.interval", "af", "agc.reset.interval",
+    "allow.read.only", "bridge.baud", "bridge.channel", "bridge.delay",
+    "bridge.enabled", "bridge.secret", "bridge.source", "direct.txdelay",
+    "dutycycle", "flood.advert.interval", "flood.max", "flood.max.advert",
+    "flood.max.unscoped", "freq", "guest.password", "int.thresh", "lat", "lon",
+    "loop.detect", "multi.acks", "name", "owner.info", "path.hash.mode",
+    "prv.key", "radio", "radio.rxgain", "repeat", "rxdelay", "tx", "txdelay",
+]
+
+
+def connect():
+    if not os.path.exists(SOCK):
+        sys.exit("meshcorectl: control socket not found at %s\n"
+                 "  is meshcored running? override with MESHCORED_CONTROL_SOCKET=/path"
+                 % SOCK)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except OSError as e:
+        sys.exit("meshcorectl: cannot connect to %s: %s" % (SOCK, e))
+    return s
+
+
+def send_command(sock, line, idle=0.4, total=6.0):
+    """Send one command and return the daemon's reply text (echo stripped)."""
+    sock.sendall((line + "\r").encode())
+    buf = b""
+    deadline = time.monotonic() + total
+    while True:
+        r, _, _ = select.select([sock], [], [], idle)
+        if r:
+            chunk = sock.recv(4096)
+            if not chunk:          # daemon closed the connection
+                break
+            buf += chunk
+            if time.monotonic() > deadline:
+                break
+        else:                      # idle gap -> reply is complete
+            break
+    return clean_reply(buf)
+
+
+def clean_reply(buf):
+    text = buf.decode(errors="replace")
+    nl = text.find("\n")           # first line is the echo of our input
+    if nl >= 0:
+        text = text[nl + 1:]
+    return text.replace("\r", "").strip("\n")
+
+
+def make_completer(readline):
+    def completer(text, state):
+        line = readline.get_line_buffer().lstrip()
+        pool = SETKEYS if (line.startswith("set ") or line.startswith("get ")) else TOP
+        matches = sorted({c for c in pool if c.startswith(text)})
+        return matches[state] if state < len(matches) else None
+    return completer
+
+
+def interactive():
+    import readline
+    try:
+        readline.read_history_file(HISTFILE)
+    except OSError:
+        pass
+    atexit.register(lambda: _save_history(readline))
+    readline.set_history_length(1000)
+    readline.set_completer_delims(" ")
+    readline.set_completer(make_completer(readline))
+    readline.parse_and_bind("tab: complete")
+
+    sock = connect()
+    print("meshcorectl -> %s   (Tab completes, Ctrl-D quits)" % SOCK)
+    while True:
+        try:
+            line = input("meshcore> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            continue
+        if not line:
+            continue
+        if line in ("quit", "exit"):
+            break
+        out = send_command(sock, line)
+        if out:
+            print(out)
+    sock.close()
+
+
+def _save_history(readline):
+    try:
+        readline.write_history_file(HISTFILE)
+    except OSError:
+        pass
+
+
+def run_lines(lines):
+    sock = connect()
+    for raw in lines:
+        cmd = raw.strip()
+        if cmd:
+            out = send_command(sock, cmd)
+            if out:
+                print(out)
+    sock.close()
+
+
+def main():
+    args = sys.argv[1:]
+    if args:
+        run_lines([" ".join(args)])          # one-shot
+    elif not sys.stdin.isatty():
+        run_lines(sys.stdin)                  # piped script
+    else:
+        interactive()
+
+
+if __name__ == "__main__":
+    main()
