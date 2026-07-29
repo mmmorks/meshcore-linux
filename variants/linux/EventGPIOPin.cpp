@@ -1,0 +1,393 @@
+#ifdef ARDULINUX_HARDWARE
+
+#include "EventGPIOPin.h"
+
+#include "AppInfo.h"
+#include "logging.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <stdexcept>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+
+#define consumer ardulinuxAppName
+
+// ---------------------------------------------------------------------------
+// Chip resolution.
+//
+// Copied verbatim from ardulinux's cores/ardulinux/linux/gpio/LinuxGPIOPin.cpp
+// (v0.2.2). Those helpers are file-static there and LinuxGPIOPin's chip/line
+// members are private, so neither reuse nor subclassing is possible without
+// forking ardulinux. Keep this copy byte-identical so an upstream fix can be
+// re-synced by diffing against that file.
+// ---------------------------------------------------------------------------
+
+static bool chip_is_gpiochip_device(const char *path) {
+  char *realname, *sysfsp, devpath[64];
+  struct stat statbuf;
+  bool ret = false;
+  int rv;
+
+  rv = lstat(path, &statbuf);
+  if (rv)
+    goto out;
+
+  realname = S_ISLNK(statbuf.st_mode) ? realpath(path, NULL) : strdup(path);
+  if (realname == NULL)
+    goto out;
+
+  rv = stat(realname, &statbuf);
+  if (rv)
+    goto out_free_realname;
+
+  if (!S_ISCHR(statbuf.st_mode)) {
+    errno = ENOTTY;
+    goto out_free_realname;
+  }
+
+  snprintf(devpath, sizeof(devpath), "/sys/dev/char/%u:%u/subsystem",
+           major(statbuf.st_rdev), minor(statbuf.st_rdev));
+
+  sysfsp = realpath(devpath, NULL);
+  if (!sysfsp)
+    goto out_free_realname;
+
+  errno = 0;
+
+  if (strcmp(sysfsp, "/sys/bus/gpio") != 0) {
+    errno = ENODEV;
+    goto out_free_sysfsp;
+  }
+
+  ret = true;
+
+out_free_sysfsp:
+  free(sysfsp);
+out_free_realname:
+  free(realname);
+out:
+  errno = 0;
+  return ret;
+}
+
+static int chip_dir_filter(const struct dirent *entry) {
+  bool is_chip;
+  char *path;
+  int ret;
+
+  ret = asprintf(&path, "/dev/%s", entry->d_name);
+  if (ret < 0)
+    return 0;
+
+  is_chip = chip_is_gpiochip_device(path);
+  free(path);
+  return !!is_chip;
+}
+
+static struct gpiod_chip *chip_open_by_name(const char *name) {
+  struct gpiod_chip *chip;
+  char *path;
+  int ret;
+
+  ret = asprintf(&path, "/dev/%s", name);
+  if (ret < 0)
+    return NULL;
+
+  chip = gpiod_chip_open(path);
+  free(path);
+
+  return chip;
+}
+
+static struct gpiod_chip *find_chip_by_label(const char *chipLabel) {
+  std::string path = "/dev/";
+  path += chipLabel;
+  if (access(path.c_str(), R_OK) == 0)
+    return chip_open_by_name(chipLabel);
+
+  struct dirent **entries;
+  int num_chips = scandir("/dev/", &entries, chip_dir_filter, alphasort);
+  if (num_chips <= 0)
+    return NULL;
+
+  struct gpiod_chip *match = NULL;
+  for (int i = 0; i < num_chips; i++) {
+    if (!match) {
+      struct gpiod_chip *c = chip_open_by_name(entries[i]->d_name);
+      if (c) {
+#if EVGPIO_GPIOD_V == 2
+        struct gpiod_chip_info *info = gpiod_chip_get_info(c);
+        const char *label = info ? gpiod_chip_info_get_label(info) : NULL;
+        bool hit = label && strcmp(label, chipLabel) == 0;
+        if (info) gpiod_chip_info_free(info);
+#else
+        const char *label = gpiod_chip_label(c);
+        bool hit = label && strcmp(label, chipLabel) == 0;
+#endif
+        if (hit)
+          match = c;
+        else
+          gpiod_chip_close(c);
+      }
+    }
+    free(entries[i]);
+  }
+  free(entries);
+  return match;
+}
+
+// ---------------------------------------------------------------------------
+// EventGPIOPin
+// ---------------------------------------------------------------------------
+
+EventGPIOPin::EventGPIOPin(pin_size_t n, const char* chipLabel, int lineOffset,
+                           const char* pinName)
+    : GPIOPin(n, pinName) {
+  _offset = (unsigned int)lineOffset;
+
+  _chip = find_chip_by_label(chipLabel);
+  if (!_chip)
+    throw std::invalid_argument("GPIO chip not found");
+
+#if EVGPIO_GPIOD_V == 1
+  _line = gpiod_chip_get_line(_chip, lineOffset);
+  if (!_line) {
+    gpiod_chip_close(_chip);
+    _chip = NULL;
+    throw std::invalid_argument("GPIO line not found");
+  }
+#else
+  _evbuf = gpiod_edge_event_buffer_new(16);
+#endif
+
+  _edge_ok = requestWithEdges(INPUT);
+  if (!_edge_ok) {
+    log(SysGPIO, LogError,
+        "EventGPIOPin(%s): edge detection unavailable (%s); "
+        "falling back to timeout polling",
+        getName(), strerror(errno));
+    if (!requestPlainInput(INPUT))
+      throw std::invalid_argument("cannot request GPIO line");
+  }
+}
+
+EventGPIOPin::~EventGPIOPin() {
+#if EVGPIO_GPIOD_V == 2
+  if (_line)  gpiod_line_request_release(_line);
+  if (_evbuf) gpiod_edge_event_buffer_free(_evbuf);
+#else
+  if (_line) gpiod_line_release(_line);
+#endif
+  if (_chip) gpiod_chip_close(_chip);
+}
+
+// ---------------------------------------------------------------------------
+// Line (re)configuration.
+//
+// On v2 the three request*() helpers below share everything except the
+// gpiod_line_settings they build: wrap the settings in a line_config, then
+// either request the line (first call, _line still NULL) or reconfigure it
+// in place (every later call, e.g. from setPinMode()). applySettings() holds
+// that shared tail so each helper is just its settings calls plus one call
+// here. v1 has no equivalent config object -- each mode is a distinct
+// gpiod_line_request_*() call -- so it stays three independent bodies below.
+// ---------------------------------------------------------------------------
+
+#if EVGPIO_GPIOD_V == 2
+bool EventGPIOPin::applySettings(struct gpiod_line_settings* settings) {
+  if (!settings) return false;
+
+  struct gpiod_line_config* cfg = gpiod_line_config_new();
+  if (!cfg) {
+    gpiod_line_settings_free(settings);
+    return false;
+  }
+  gpiod_line_config_add_line_settings(cfg, &_offset, 1, settings);
+
+  int rv;
+  if (_line == NULL) {
+    struct gpiod_request_config* rc = gpiod_request_config_new();
+    gpiod_request_config_set_consumer(rc, consumer);
+    _line = gpiod_chip_request_lines(_chip, rc, cfg);
+    gpiod_request_config_free(rc);
+    rv = (_line != NULL) ? 0 : -1;
+  } else {
+    // Reconfigure replaces the config wholesale, which is exactly why edge
+    // detection has to be restated here on every mode change.
+    rv = gpiod_line_request_reconfigure_lines(_line, cfg);
+  }
+
+  gpiod_line_config_free(cfg);
+  gpiod_line_settings_free(settings);
+  return rv == 0;
+}
+#endif
+
+bool EventGPIOPin::requestWithEdges(PinMode m) {
+#if EVGPIO_GPIOD_V == 1
+  int rv;
+  if (m == INPUT_PULLUP) {
+    rv = gpiod_line_request_rising_edge_events_flags(
+        _line, consumer, GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
+  } else if (m == INPUT_PULLDOWN) {
+    rv = gpiod_line_request_rising_edge_events_flags(
+        _line, consumer, GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN);
+  } else {
+    rv = gpiod_line_request_rising_edge_events(_line, consumer);
+  }
+  return rv == 0;
+#else
+  struct gpiod_line_settings* settings = gpiod_line_settings_new();
+  if (!settings) return false;
+  gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+  gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_RISING);
+  if (m == INPUT_PULLUP)
+    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
+  else if (m == INPUT_PULLDOWN)
+    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_DOWN);
+
+  return applySettings(settings);
+#endif
+}
+
+bool EventGPIOPin::requestPlainInput(PinMode m) {
+#if EVGPIO_GPIOD_V == 1
+  int rv;
+  if (m == INPUT_PULLUP) {
+    rv = gpiod_line_request_input_flags(_line, consumer,
+                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
+  } else if (m == INPUT_PULLDOWN) {
+    rv = gpiod_line_request_input_flags(_line, consumer,
+                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN);
+  } else {
+    rv = gpiod_line_request_input(_line, consumer);
+  }
+  return rv == 0;
+#else
+  struct gpiod_line_settings* settings = gpiod_line_settings_new();
+  if (!settings) return false;
+  gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+  if (m == INPUT_PULLUP)
+    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
+  else if (m == INPUT_PULLDOWN)
+    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_DOWN);
+
+  return applySettings(settings);
+#endif
+}
+
+bool EventGPIOPin::requestOutput(PinStatus initial) {
+#if EVGPIO_GPIOD_V == 1
+  return gpiod_line_request_output(_line, consumer, initial) == 0;
+#else
+  struct gpiod_line_settings* settings = gpiod_line_settings_new();
+  if (!settings) return false;
+  gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+  gpiod_line_settings_set_output_value(settings, (gpiod_line_value)initial);
+
+  return applySettings(settings);
+#endif
+}
+
+PinStatus EventGPIOPin::readPinHardware() {
+#if EVGPIO_GPIOD_V == 1
+  // Valid on an event-requested line: libgpiod v1's get-value path handles
+  // LINE_REQUESTED_EVENTS by issuing the values ioctl on the event fd.
+  int res = gpiod_line_get_value(_line);
+#else
+  int res = gpiod_line_request_get_value(_line, _offset);
+#endif
+  if (res < 0) return LOW;
+  return (PinStatus)res;
+}
+
+void EventGPIOPin::writePin(PinStatus s) {
+  if (GPIOPin::getPinMode() != OUTPUT)
+    setPinMode(OUTPUT);
+  GPIOPin::writePin(s);  // update cached status
+
+#if EVGPIO_GPIOD_V == 1
+  gpiod_line_set_value(_line, s);
+#else
+  gpiod_line_request_set_value(_line, _offset, (gpiod_line_value)s);
+#endif
+}
+
+void EventGPIOPin::setPinMode(PinMode m) {
+  GPIOPin::setPinMode(m);  // update cached mode + log
+
+  if (m == OUTPUT) {
+    // Should never happen for DIO1. An output line has no edges to report, so
+    // say so rather than silently keeping a stale descriptor.
+    if (_edge_ok) {
+      log(SysGPIO, LogError,
+          "EventGPIOPin(%s): OUTPUT requested, edge detection disabled",
+          getName());
+      _edge_ok = false;
+    }
+#if EVGPIO_GPIOD_V == 1
+    gpiod_line_release(_line);
+#endif
+    requestOutput(readPinHardware());
+    return;
+  }
+
+  // INPUT / INPUT_PULLUP / INPUT_PULLDOWN.
+  //
+  // RadioLib calls pinMode(irq, INPUT) from SX126x::begin() *after* this pin is
+  // bound. v1 cannot reconfigure in place, and v2's reconfigure replaces the
+  // config wholesale, so edge detection must be restated here or every wake-up
+  // silently degrades to the poll timeout.
+#if EVGPIO_GPIOD_V == 1
+  gpiod_line_release(_line);  // v1 cannot reconfigure in place
+#endif
+
+  _edge_ok = requestWithEdges(m);
+  if (!_edge_ok) {
+    log(SysGPIO, LogError,
+        "EventGPIOPin(%s): edge detection lost on mode change (%s); "
+        "falling back to timeout polling",
+        getName(), strerror(errno));
+    requestPlainInput(m);
+  }
+}
+
+int EventGPIOPin::eventFd() const {
+  if (!_edge_ok || _line == NULL) return -1;
+#if EVGPIO_GPIOD_V == 1
+  return gpiod_line_event_get_fd(_line);
+#else
+  return gpiod_line_request_get_fd(_line);
+#endif
+}
+
+void EventGPIOPin::drainEvents() {
+#if EVGPIO_GPIOD_V == 2
+  if (!_edge_ok || _line == NULL || _evbuf == NULL) return;
+#else
+  if (!_edge_ok || _line == NULL) return;
+#endif
+
+#if EVGPIO_GPIOD_V == 1
+  // Zero timeout keeps this non-blocking: gpiod_line_event_read() on its own
+  // would block once the queue empties.
+  struct timespec zero = {0, 0};
+  struct gpiod_line_event ev;
+  while (gpiod_line_event_wait(_line, &zero) == 1) {
+    if (gpiod_line_event_read(_line, &ev) != 0) break;
+  }
+#else
+  while (gpiod_line_request_wait_edge_events(_line, 0) == 1) {
+    if (gpiod_line_request_read_edge_events(_line, _evbuf, 16) <= 0) break;
+  }
+#endif
+}
+
+#undef consumer
+
+#endif  // ARDULINUX_HARDWARE
