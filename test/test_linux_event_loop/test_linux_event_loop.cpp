@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "LinuxEventLoop.h"
@@ -199,6 +200,60 @@ TEST(LinuxEventLoopWait, CountsOnlyReadableDescriptors) {
 
   a.signal();  // only one of the two becomes readable
   EXPECT_EQ(1, loop.wait(1000));
+}
+
+TEST(LinuxEventLoopWait, BackoffSleepsOnStaleDescriptor) {
+  // Discriminator: proves usleep(EVENT_LOOP_ERROR_BACKOFF_US) actually executes.
+  // Removing that line would fail this test.
+  LinuxEventLoop loop;
+  loop.reset();
+
+  int fd = open("/dev/null", O_RDONLY);
+  ASSERT_GE(fd, 0);
+  loop.registerFd(fd);
+  close(fd);  // stale descriptor
+
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  EXPECT_EQ(0, loop.wait(0));  // zero timeout, but should sleep due to stale descriptor
+
+  clock_gettime(CLOCK_MONOTONIC, &end);
+
+  // Calculate elapsed time in microseconds
+  long elapsed_us = (end.tv_sec - start.tv_sec) * 1000000 +
+                    (end.tv_nsec - start.tv_nsec) / 1000;
+
+  // Assert at least ~500 µs elapsed (generous margin under 1000 µs backoff)
+  EXPECT_GE(elapsed_us, 500);
+}
+
+TEST(LinuxEventLoopWait, FiltersPollResultsNotRaw) {
+  // Discriminator: proves we count only POLLIN, not raw poll() return value.
+  // An implementation returning unfiltered poll() count would return 2 here
+  // (POLLIN on live fd + POLLNVAL on stale fd), failing this assertion.
+  LinuxEventLoop loop;
+  FakePipeFd live;
+
+  loop.reset();
+
+  // Register the live fd first, then create and close a stale one.
+  // This ensures we can control which fd gets what number and avoid reuse.
+  int live_num = live.readFd();
+  loop.registerFd(live_num);
+
+  // Create and close a stale fd. Since we're holding the live fd,
+  // the stale fd number will differ and won't be immediately reused.
+  int stale = open("/dev/null", O_RDONLY);
+  ASSERT_GE(stale, 0);
+  loop.registerFd(stale);
+  close(stale);  // Now stale is closed (POLLNVAL), live is still open
+
+  live.signal();  // Make only the live fd readable
+
+  // poll() would return 2 (POLLIN on live + POLLNVAL on stale).
+  // wait() should return 1 (only the POLLIN count, filtering out POLLNVAL).
+  EXPECT_EQ(1, loop.wait(0));
 }
 
 int main(int argc, char **argv) {
