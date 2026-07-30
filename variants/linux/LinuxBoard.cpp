@@ -6,6 +6,9 @@
 #ifdef ARDULINUX_HARDWARE
 #include "linux/gpio/LinuxGPIOPin.h"
 #endif
+#ifdef ARDULINUX_HARDWARE
+#include "EventGPIOPin.h"
+#endif
 #include "LinuxBoard.h"
 #include "AppInfo.h"
 
@@ -31,6 +34,41 @@ int initGPIOPin(uint8_t pinNum, const std::string gpioChipName, uint8_t line)
     return 1;
   } catch (...) {
     printf("ERROR: cannot claim GPIO line %d on %s for pin %d (unknown exception)\n",
+           (int)line, gpioChipName.c_str(), (int)pinNum);
+    return 1;
+  }
+#else
+  return 0;
+#endif
+}
+
+// Bind the LoRa IRQ line as an EventGPIOPin so the main loop can block on its
+// edge-event descriptor instead of spinning. Returns 0 on success, 1 on
+// failure (same convention as initGPIOPin).
+//
+// Falling back to a plain LinuxGPIOPin is not needed here: EventGPIOPin only
+// throws when the line cannot be acquired at all, and it degrades internally
+// when edge detection specifically is unavailable.
+static int initEventGPIOPin(LinuxEventSource** out, uint8_t pinNum,
+                            const std::string gpioChipName, uint8_t line) {
+#ifdef ARDULINUX_HARDWARE
+  char gpio_name[32];
+  snprintf(gpio_name, sizeof(gpio_name), "GPIO%d", pinNum);
+
+  try {
+    EventGPIOPin* pin = new EventGPIOPin(pinNum, gpioChipName.c_str(), line, gpio_name);
+    pin->setSilent();
+    gpioBind(pin);
+    *out = pin;
+    printf("LoRa IRQ pin %d bound with edge detection: %s\n",
+           (int)pinNum, pin->hasEdgeDetection() ? "yes" : "NO (polling fallback)");
+    return 0;
+  } catch (const std::exception& e) {
+    printf("ERROR: cannot claim IRQ GPIO line %d on %s for pin %d: %s\n",
+           (int)line, gpioChipName.c_str(), (int)pinNum, e.what());
+    return 1;
+  } catch (...) {
+    printf("ERROR: cannot claim IRQ GPIO line %d on %s for pin %d (unknown exception)\n",
            (int)line, gpioChipName.c_str(), (int)pinNum);
     return 1;
   }
@@ -75,7 +113,8 @@ void LinuxBoard::begin() {
     failures += initGPIOPin(config.lora_busy_pin, config.lora_gpiochip, config.lora_busy_pin);
   }
   if (config.lora_irq_pin != RADIOLIB_NC) {
-    failures += initGPIOPin(config.lora_irq_pin, config.lora_gpiochip, config.lora_irq_pin);
+    failures += initEventGPIOPin(&irq_event_source, config.lora_irq_pin,
+                                 config.lora_gpiochip, config.lora_irq_pin);
   }
   if (config.lora_reset_pin != RADIOLIB_NC) {
     failures += initGPIOPin(config.lora_reset_pin, config.lora_gpiochip, config.lora_reset_pin);

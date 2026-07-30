@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <RadioLib.h>
+#include "LinuxEventSource.h"
 
 class LinuxConfig {
 public:
@@ -76,6 +77,15 @@ public:
     exit(0);
   }
 
+  // Wake-up source for the Linux event loop (the LoRa IRQ line), or NULL when
+  // edge detection is unavailable. Typed as the abstract interface so this
+  // header stays free of any libgpiod dependency.
+  LinuxEventSource* irqEventSource() const { return irq_event_source; }
+
+protected:
+  LinuxEventSource* irq_event_source = nullptr;
+
+public:
   LinuxConfig config;
 };
 

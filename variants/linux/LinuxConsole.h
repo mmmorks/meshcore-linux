@@ -29,6 +29,12 @@ public:
   // Absolute path of the control socket that was opened (empty if none).
   const char* socketPath() const { return _sock_path; }
 
+  // Descriptors the Linux event loop polls so a waiting daemon wakes on
+  // console traffic. Any of these may be -1, which the event loop ignores.
+  int serverFd() const { return _server_fd; }   // listening control socket
+  int clientFd() const { return _client_fd; }   // connected client, -1 if none
+  int stdinFd()  const;                         // STDIN_FILENO if a TTY, else -1
+
 private:
   bool tryAccept();
   int  rawReadByte();      // one raw byte from the active input, or -1

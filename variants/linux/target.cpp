@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "target.h"
+#include "LinuxConsole.h"
+#include "LinuxEventLoop.h"
 
 class ArduLinuxHal : public ArduinoHal
 {
@@ -61,4 +63,23 @@ void radio_set_tx_power(uint8_t dbm) {
 mesh::LocalIdentity radio_new_identity() {
   RadioNoiseListener rng(radio);
   return mesh::LocalIdentity(&rng);  // create new random identity
+}
+
+void linux_event_wait() {
+  LinuxEventSource* src = board.irqEventSource();
+
+  // 10 ms is far coarser than any deadline that is not already delivered on
+  // the IRQ descriptor: DIO1 carries both RX-done and TX-done, while CAD retry
+  // is 120-480 ms and noise-floor calibration is 2 s. Without edge detection
+  // there is nothing to wake us, so fall back to a tight 1 ms poll.
+  const bool have_events = (src != NULL && src->eventFd() >= 0);
+  const int  timeout_ms  = have_events ? 10 : 1;
+
+  EventLoop.reset();
+  EventLoop.setEventSource(src);
+  EventLoop.registerFd(Console.serverFd());
+  EventLoop.registerFd(Console.clientFd());
+  EventLoop.registerFd(Console.stdinFd());
+  EventLoop.registerFd(gps_serial.fd());
+  EventLoop.wait(timeout_ms);
 }

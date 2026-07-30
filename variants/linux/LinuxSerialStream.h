@@ -17,6 +17,9 @@ public:
   void end();
   bool isOpen() const { return _fd >= 0; }
 
+  // Descriptor for the Linux event loop; -1 when closed.
+  int fd() const { return _fd; }
+
   int available() override;
   int read() override;
   int peek() override;

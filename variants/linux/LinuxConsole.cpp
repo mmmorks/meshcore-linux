@@ -102,6 +102,10 @@ void LinuxConsole::begin() {
   if (_stdin_tty) set_nonblock(STDIN_FILENO);
 }
 
+int LinuxConsole::stdinFd() const {
+  return _stdin_tty ? STDIN_FILENO : -1;
+}
+
 bool LinuxConsole::tryAccept() {
   if (_server_fd < 0) return false;
   int fd = accept(_server_fd, nullptr, nullptr);
