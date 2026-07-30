@@ -106,7 +106,10 @@ void linux_event_wait() {
   // 9600 baud (~960 B/s) against a ~4 KB tty input buffer, the 10 ms poll
   // ceiling drains NMEA with three orders of magnitude of margin even when
   // gps_active is true and EnvironmentSensorManager::loop() is polled from
-  // the timeout alone.
+  // the timeout alone. DO NOT add EventLoop.registerFd(gps_serial.fd()) back
+  // in, even though it looks like the obviously-correct thing to do for a
+  // node that streams GPS -- it is the single line that reintroduces this
+  // branch's namesake bug in the default configuration.
 
   // Refresh the cached IRQ level immediately before blocking. Packet
   // correctness does not come from the edge-event descriptor above; it comes
