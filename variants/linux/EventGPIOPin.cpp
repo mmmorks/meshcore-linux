@@ -193,7 +193,7 @@ EventGPIOPin::EventGPIOPin(pin_size_t n, const char* chipLabel, int lineOffset,
     log(SysGPIO, LogError,
         "EventGPIOPin(%s): edge detection unavailable (%s); "
         "falling back to timeout polling",
-        getName(), strerror(errno));
+        getName(), strerror(_last_errno));
     if (!requestPlainInput(INPUT)) {
       releaseResources();
       throw std::invalid_argument("cannot request GPIO line");
@@ -234,6 +234,7 @@ bool EventGPIOPin::applySettings(struct gpiod_line_settings* settings) {
 
   struct gpiod_line_config* cfg = gpiod_line_config_new();
   if (!cfg) {
+    _last_errno = errno;
     gpiod_line_settings_free(settings);
     return false;
   }
@@ -244,12 +245,16 @@ bool EventGPIOPin::applySettings(struct gpiod_line_settings* settings) {
     struct gpiod_request_config* rc = gpiod_request_config_new();
     gpiod_request_config_set_consumer(rc, consumer);
     _line = gpiod_chip_request_lines(_chip, rc, cfg);
+    // Capture errno immediately: gpiod_request_config_free() below and the
+    // frees at the end of this function are not guaranteed to preserve it.
+    _last_errno = errno;
     gpiod_request_config_free(rc);
     rv = (_line != NULL) ? 0 : -1;
   } else {
     // Reconfigure replaces the config wholesale, which is exactly why edge
     // detection has to be restated here on every mode change.
     rv = gpiod_line_request_reconfigure_lines(_line, cfg);
+    _last_errno = errno;  // capture before the frees below can clobber it
   }
 
   gpiod_line_config_free(cfg);
@@ -270,6 +275,7 @@ bool EventGPIOPin::requestWithEdges(PinMode m) {
   } else {
     rv = gpiod_line_request_rising_edge_events(_line, consumer);
   }
+  _last_errno = errno;
   return rv == 0;
 #else
   // This is the only place _edge_ok is ever set true (see both call sites),
@@ -283,6 +289,7 @@ bool EventGPIOPin::requestWithEdges(PinMode m) {
   if (!_evbuf) {
     _evbuf = gpiod_edge_event_buffer_new(16);
     if (!_evbuf) {
+      _last_errno = errno;
       log(SysGPIO, LogError,
           "EventGPIOPin(%s): edge-event buffer allocation failed",
           getName());
@@ -291,7 +298,7 @@ bool EventGPIOPin::requestWithEdges(PinMode m) {
   }
 
   struct gpiod_line_settings* settings = gpiod_line_settings_new();
-  if (!settings) return false;
+  if (!settings) { _last_errno = errno; return false; }
   gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
   gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_RISING);
   if (m == INPUT_PULLUP)
@@ -315,10 +322,11 @@ bool EventGPIOPin::requestPlainInput(PinMode m) {
   } else {
     rv = gpiod_line_request_input(_line, consumer);
   }
+  _last_errno = errno;
   return rv == 0;
 #else
   struct gpiod_line_settings* settings = gpiod_line_settings_new();
-  if (!settings) return false;
+  if (!settings) { _last_errno = errno; return false; }
   gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
   if (m == INPUT_PULLUP)
     gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
@@ -331,10 +339,12 @@ bool EventGPIOPin::requestPlainInput(PinMode m) {
 
 bool EventGPIOPin::requestOutput(PinStatus initial) {
 #if EVGPIO_GPIOD_V == 1
-  return gpiod_line_request_output(_line, consumer, initial) == 0;
+  int rv = gpiod_line_request_output(_line, consumer, initial);
+  _last_errno = errno;
+  return rv == 0;
 #else
   struct gpiod_line_settings* settings = gpiod_line_settings_new();
-  if (!settings) return false;
+  if (!settings) { _last_errno = errno; return false; }
   gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
   gpiod_line_settings_set_output_value(settings, (gpiod_line_value)initial);
 
@@ -350,7 +360,22 @@ PinStatus EventGPIOPin::readPinHardware() {
 #else
   int res = gpiod_line_request_get_value(_line, _offset);
 #endif
-  if (res < 0) return LOW;
+  if (res < 0) {
+    // An unrequested line (e.g. both requestWithEdges() and
+    // requestPlainInput() failed on a mode change) reads permanently LOW
+    // here with no other symptom -- silently stops all packet RX. This is
+    // called every event-loop iteration, so latch rather than flood: log the
+    // first occurrence only.
+    static bool warned = false;
+    if (!warned) {
+      log(SysGPIO, LogError,
+          "EventGPIOPin(%s): read failed (%s); reading LOW until this is "
+          "resolved (further occurrences suppressed)",
+          getName(), strerror(errno));
+      warned = true;
+    }
+    return LOW;
+  }
   return (PinStatus)res;
 }
 
@@ -392,7 +417,7 @@ void EventGPIOPin::setPinMode(PinMode m) {
     if (!requestOutput(initial)) {
       log(SysGPIO, LogError,
           "EventGPIOPin(%s): failed to request line as OUTPUT (%s)",
-          getName(), strerror(errno));
+          getName(), strerror(_last_errno));
     }
     return;
   }
@@ -412,7 +437,7 @@ void EventGPIOPin::setPinMode(PinMode m) {
     log(SysGPIO, LogError,
         "EventGPIOPin(%s): edge detection lost on mode change (%s); "
         "falling back to timeout polling",
-        getName(), strerror(errno));
+        getName(), strerror(_last_errno));
     if (!requestPlainInput(m)) {
       // Both the edge-detecting and plain-input requests failed: the line is
       // now unrequested. readPinHardware() maps that to a permanent LOW,
@@ -422,7 +447,7 @@ void EventGPIOPin::setPinMode(PinMode m) {
           "EventGPIOPin(%s): failed to request line as plain INPUT (%s); "
           "line is unrequested, reads will return LOW until the next "
           "setPinMode() call",
-          getName(), strerror(errno));
+          getName(), strerror(_last_errno));
     }
   }
 }

@@ -212,6 +212,35 @@ sudo journalctl -u meshcored -f
 > If you smoke-tested by running directly first, clear any stale state so the
 > service first-boots with the INI defaults: `sudo rm -rf /var/lib/meshcore/*`
 
+### Idle CPU usage
+
+`meshcored` blocks in `poll()` between events instead of spinning: expect
+**well under 1% CPU at idle with edge detection**, and roughly **1-3%** in the
+polling fallback described below (both a long way from the ~100% of one core
+this variant used to burn continuously). Startup logs which mode a bound LoRa
+IRQ pin ended up in:
+
+```
+LoRa IRQ pin 25 bound with edge detection: yes
+```
+
+`NO (polling fallback)` instead of `yes` means the kernel/libgpiod on this
+device couldn't set up edge events for that line, so the daemon falls back to
+a 1 ms poll timeout rather than the normal 10 ms. This is still fully
+functional — packet RX/TX is unaffected — it just costs more CPU because the
+daemon wakes far more often with nothing to do.
+
+If edge detection was available at startup, watch for this later in the logs:
+
+```
+EventGPIOPin(GPIO25): edge detection lost on mode change (...); falling back to timeout polling
+```
+
+Seeing this means the daemon has silently degraded from edge-driven waits to
+timeout polling for the rest of the run (higher CPU, still correct). It is
+not expected in normal operation; if you see it, it is worth reporting along
+with the `(...)` errno text and your libgpiod/kernel version.
+
 ### 5. Reconfiguring after first run
 
 Node name, password, and location can be changed via the serial CLI after first boot:
@@ -272,3 +301,4 @@ sudo systemctl start meshcored
 - **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 5.
 - **No power management**, `board.sleep()` is a no-op; the power-saving loop in `main.cpp` never actually sleeps.
 - **Upstream-sync fragility**, the radio wrapper (`LinuxSX1262Wrapper`) implements the `RadioLibWrapper` interface by hand, so it can drift from upstream in two ways: a new **pure-virtual** method breaks the Linux build (e.g. `setParams()`), and a new **virtual-with-default** method silently no-ops on Linux until overridden (e.g. `set`/`getRxBoostedGainMode()`, which reported and applied the wrong state until added). Mirror `CustomSX1262Wrapper` when syncing.
+- **libgpiod v2 is compile-verified only**, `EventGPIOPin`'s v2 code path (Debian trixie and newer) builds cleanly in CI/`build-docker.sh`, but it has never been exercised at runtime against real hardware — all runtime verification to date has been on libgpiod v1 (Debian bookworm). Treat the v2 path as unproven until someone runs it on a Pi.

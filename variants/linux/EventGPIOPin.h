@@ -83,6 +83,16 @@ private:
 #if EVGPIO_GPIOD_V == 2
   struct gpiod_edge_event_buffer* _evbuf = NULL;
 #endif
+
+  // errno from the most recent failing libgpiod call in
+  // requestWithEdges()/requestPlainInput()/requestOutput() (and, on v2,
+  // applySettings()). Callers log strerror(_last_errno) rather than
+  // strerror(errno): on v2 the request*() helpers run through applySettings(),
+  // whose cleanup (gpiod_line_config_free()/gpiod_line_settings_free()) happens
+  // between the failing call and the log site and can clobber errno first.
+  // Captured immediately after each libgpiod call, at the point closest to
+  // where it can still be trusted.
+  int _last_errno = 0;
 };
 
 #endif  // ARDULINUX_HARDWARE

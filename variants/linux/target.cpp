@@ -77,9 +77,57 @@ void linux_event_wait() {
 
   EventLoop.reset();
   EventLoop.setEventSource(src);
-  EventLoop.registerFd(Console.serverFd());
-  EventLoop.registerFd(Console.clientFd());
-  EventLoop.registerFd(Console.stdinFd());
-  EventLoop.registerFd(gps_serial.fd());
+
+  // Register exactly the descriptor(s) LinuxConsole::rawReadByte() will
+  // actually consume this iteration -- it accepts a new client and reads
+  // stdin only when no client is connected, and otherwise reads only the
+  // connected client. Registering all three unconditionally would leave the
+  // listening socket (and stdin) permanently POLLIN once a client is
+  // attached, since nothing here would ever drain them: that reinstates the
+  // busy loop for as little as one concurrent `meshcorectl`. Keep this in
+  // step with rawReadByte()'s precedence if it ever changes.
+  if (Console.clientFd() < 0) {
+    EventLoop.registerFd(Console.serverFd());
+    EventLoop.registerFd(Console.stdinFd());
+  } else {
+    EventLoop.registerFd(Console.clientFd());
+  }
+
+  // Deliberately NOT registering gps_serial.fd() here. EnvironmentSensorManager
+  // only drains the GPS stream when gps_active is true (initBasicGPS() leaves
+  // it false until an operator runs `gps on`; PERSISTANT_GPS is not defined
+  // for this variant), so a registered-but-undrained GPS descriptor would sit
+  // POLLIN for as long as the module keeps streaming -- which on Linux it
+  // always does: MicroNMEALocationProvider::stop() is a no-op here and
+  // gps_en_pin (when configured) stays high for the whole run. That would
+  // reinstate the 100% CPU spin this event loop exists to remove, for every
+  // node with gps_device set and GPS not actively toggled on -- the
+  // documented default. There is also nothing to gain from waking on it: at
+  // 9600 baud (~960 B/s) against a ~4 KB tty input buffer, the 10 ms poll
+  // ceiling drains NMEA with three orders of magnitude of margin even when
+  // gps_active is true and EnvironmentSensorManager::loop() is polled from
+  // the timeout alone.
+
+  // Refresh the cached IRQ level immediately before blocking. Packet
+  // correctness does not come from the edge-event descriptor above; it comes
+  // from ArduLinux's gpioIdle(), which fires RadioLib's ISR on a LOW->HIGH
+  // transition against a *cached* previous level. Nothing else in the
+  // MeshCore call path refreshes that cache (no delay() calls in
+  // Dispatcher.cpp/Mesh.cpp/MyMesh.cpp, and RadioLib's own
+  // digitalRead(getIrq()) calls live only in blocking paths MeshCore doesn't
+  // use), so the cache is stale from the moment gpioIdle() handles an
+  // interrupt until the next iteration's gpioIdle() call -- today that heals
+  // safely because the 10 ms timeout is comfortably shorter than any packet's
+  // airtime. That margin is a coupling, not a guarantee: raising the timeout
+  // further to cut CPU would silently stop RX rather than merely add latency,
+  // since DIO1 would stay latched HIGH with no further rising edge to recover
+  // on. This line decouples the timeout ceiling from packet airtime for good.
+  // Cost is one ioctl per wake; it is latency-safe, because if the line is
+  // already HIGH here an edge event is already queued and the wait below
+  // returns immediately instead of blocking. Do not remove this as
+  // "redundant" with gpioIdle() -- it is the only thing keeping a longer
+  // timeout safe.
+  if (board.config.lora_irq_pin != RADIOLIB_NC) digitalRead(board.config.lora_irq_pin);
+
   EventLoop.wait(timeout_ms);
 }
