@@ -39,7 +39,16 @@ if [ "${IMAGE}" = "debian:bookworm" ]; then
   CACHE_VOL="mc_pio_cache"
   BUILD_DIR=".pio/build"
 else
+  # Derive a filesystem/volume-name-safe tag from the image reference. Strip
+  # to the part after the last ':' (the tag; also correct for a
+  # registry:port/name:tag reference, since ## takes the longest match), then
+  # drop any remaining path component (e.g. a tagless "myregistry.io/debian"
+  # reference, where the whole string would otherwise land here), then
+  # replace anything that isn't safe in a Docker volume name or directory
+  # name with '_'.
   TAG="${IMAGE##*:}"
+  TAG="${TAG##*/}"
+  TAG="${TAG//[^A-Za-z0-9._-]/_}"
   CACHE_VOL="mc_pio_cache_${TAG}"
   BUILD_DIR=".pio/build-${TAG}"
 fi

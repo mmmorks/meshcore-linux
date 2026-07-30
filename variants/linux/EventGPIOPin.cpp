@@ -183,30 +183,12 @@ EventGPIOPin::EventGPIOPin(pin_size_t n, const char* chipLabel, int lineOffset,
     releaseResources();
     throw std::invalid_argument("GPIO line not found");
   }
-#else
-  _evbuf = gpiod_edge_event_buffer_new(16);
-  if (!_evbuf) {
-    log(SysGPIO, LogError,
-        "EventGPIOPin(%s): edge-event buffer allocation failed; "
-        "falling back to timeout polling",
-        getName());
-  }
 #endif
 
+  // On v2, requestWithEdges() lazily allocates _evbuf and fails if that
+  // allocation fails -- see the comment there for why that (rather than a
+  // check here) is what makes _edge_ok a reliable invariant.
   _edge_ok = requestWithEdges(INPUT);
-#if EVGPIO_GPIOD_V == 2
-  if (_edge_ok && !_evbuf) {
-    // requestWithEdges() armed edge detection on the line, but with no
-    // buffer to drain events into, eventFd() and drainEvents() would
-    // disagree: eventFd() (which only checks _edge_ok) would hand out a
-    // readable descriptor that drainEvents() (which needs _evbuf) refuses to
-    // service. An undrained level-triggered POLLIN makes poll() return
-    // instantly forever -- exactly the busy loop this class exists to
-    // remove. Falling through to the plain-input request below both fixes
-    // the bookkeeping and un-arms edge detection on the line itself.
-    _edge_ok = false;
-  }
-#endif
   if (!_edge_ok) {
     log(SysGPIO, LogError,
         "EventGPIOPin(%s): edge detection unavailable (%s); "
@@ -290,6 +272,24 @@ bool EventGPIOPin::requestWithEdges(PinMode m) {
   }
   return rv == 0;
 #else
+  // This is the only place _edge_ok is ever set true (see both call sites),
+  // so guaranteeing _evbuf here -- and only here -- is what makes "_edge_ok
+  // implies a usable _evbuf" an actual invariant rather than a hopeful
+  // comment: eventFd() and drainEvents() can then both trust _edge_ok alone,
+  // with no separate _evbuf check of their own to fall out of sync. Lazy
+  // (rather than always allocating in the constructor) because this is the
+  // only path that needs it, and it costs nothing to retry the allocation
+  // here if a prior attempt failed.
+  if (!_evbuf) {
+    _evbuf = gpiod_edge_event_buffer_new(16);
+    if (!_evbuf) {
+      log(SysGPIO, LogError,
+          "EventGPIOPin(%s): edge-event buffer allocation failed",
+          getName());
+      return false;
+    }
+  }
+
   struct gpiod_line_settings* settings = gpiod_line_settings_new();
   if (!settings) return false;
   gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
@@ -437,11 +437,11 @@ int EventGPIOPin::eventFd() const {
 }
 
 void EventGPIOPin::drainEvents() {
-  // _edge_ok is the single source of truth eventFd() also uses: the
-  // constructor clears it (v2) when _evbuf failed to allocate, so it is
-  // never true here with a NULL _evbuf. Keeping one flag in sync, rather
-  // than checking _evbuf separately here, is what keeps this function and
-  // eventFd() agreeing on whether the descriptor is serviceable.
+  // _edge_ok is the single source of truth eventFd() also uses. It can only
+  // become true via requestWithEdges(), which on v2 lazily allocates _evbuf
+  // and returns false if that allocation fails -- so _edge_ok true implies a
+  // non-NULL _evbuf here too, not just at eventFd(). No separate _evbuf
+  // check needed; see requestWithEdges() for where that invariant is made.
   if (!_edge_ok || _line == NULL) return;
 
 #if EVGPIO_GPIOD_V == 1
