@@ -180,4 +180,8 @@ void loop() {
     }
 #endif
   }
+
+#ifdef ARDULINUX_PLATFORM
+  linux_event_wait();  // block instead of spinning; see variants/linux/LinuxEventLoop.h
+#endif
 }
