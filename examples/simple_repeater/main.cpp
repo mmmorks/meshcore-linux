@@ -34,10 +34,13 @@ unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled)
 // How long loop() is willing to idle between iterations, for boards that
 // implement MainBoard::idleUntilEvent(). Must stay below the shortest deadline
 // not already delivered by the radio IRQ -- today that is the CAD retry delay
-// (Dispatcher::getCADFailRetryDelay(), 200 ms). Boards with no implementation
-// ignore this entirely and keep busy-looping.
+// (Dispatcher::getCADFailRetryDelay(), 200 ms), so 50 ms keeps 4x margin.
+// Nothing else needs a faster iteration: RX-done and TX-done arrive on the IRQ,
+// and the noise floor is sampled on its own wall-clock schedule inside
+// RadioLibWrapper::loop() rather than once per iteration. Boards with no
+// implementation ignore this entirely and keep busy-looping.
 #ifndef IDLE_MAX_WAIT_MS
-  #define IDLE_MAX_WAIT_MS  10
+  #define IDLE_MAX_WAIT_MS  50
 #endif
 
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)

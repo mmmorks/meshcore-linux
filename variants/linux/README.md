@@ -226,7 +226,7 @@ LoRa IRQ pin 25 bound with edge detection: yes
 
 `NO (polling fallback)` instead of `yes` means the kernel/libgpiod on this
 device couldn't set up edge events for that line, so the daemon falls back to
-a 1 ms poll timeout rather than the normal 10 ms. This is still fully
+a 1 ms poll timeout rather than the normal `IDLE_MAX_WAIT_MS` (50 ms). This is still fully
 functional — packet RX/TX is unaffected — it just costs more CPU because the
 daemon wakes far more often with nothing to do.
 
