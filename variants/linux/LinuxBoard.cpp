@@ -10,6 +10,8 @@
 #include "EventGPIOPin.h"
 #endif
 #include "LinuxBoard.h"
+#include "LinuxConsole.h"
+#include "LinuxEventLoop.h"
 #include "AppInfo.h"
 
 const char *ardulinuxAppName        = "meshcored";
@@ -145,6 +147,75 @@ void LinuxBoard::begin() {
              (int)config.gps_en_pin);
     }
   }
+}
+
+void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
+  LinuxEventSource* src = irqEventSource();
+
+  // Without edge detection nothing can wake us, so the caller's ceiling would
+  // be pure latency: poll tightly instead. Same tradeoff (and same value) as
+  // the delay(1) fallback in ESP32Board::sleep().
+  const bool have_events = (src != NULL && src->eventFd() >= 0);
+  const int  timeout_ms  = have_events ? (int) max_wait_ms : 1;
+
+  EventLoop.reset();
+  EventLoop.setEventSource(src);
+
+  // Register exactly the descriptor(s) LinuxConsole::rawReadByte() will
+  // actually consume this iteration -- it accepts a new client and reads
+  // stdin only when no client is connected, and otherwise reads only the
+  // connected client. Registering all three unconditionally would leave the
+  // listening socket (and stdin) permanently POLLIN once a client is
+  // attached, since nothing here would ever drain them: that reinstates the
+  // busy loop for as little as one concurrent `meshcorectl`. Keep this in
+  // step with rawReadByte()'s precedence if it ever changes.
+  if (Console.clientFd() < 0) {
+    EventLoop.registerFd(Console.serverFd());
+    EventLoop.registerFd(Console.stdinFd());
+  } else {
+    EventLoop.registerFd(Console.clientFd());
+  }
+
+  // Deliberately NOT registering gps_serial.fd() here. EnvironmentSensorManager
+  // only drains the GPS stream when gps_active is true (initBasicGPS() leaves
+  // it false until an operator runs `gps on`; PERSISTANT_GPS is not defined
+  // for this variant), so a registered-but-undrained GPS descriptor would sit
+  // POLLIN for as long as the module keeps streaming -- which on Linux it
+  // always does: MicroNMEALocationProvider::stop() is a no-op here and
+  // gps_en_pin (when configured) stays high for the whole run. That would
+  // reinstate the 100% CPU spin this event loop exists to remove, for every
+  // node with gps_device set and GPS not actively toggled on -- the
+  // documented default. There is also nothing to gain from waking on it: at
+  // 9600 baud (~960 B/s) against a ~4 KB tty input buffer, a poll ceiling in
+  // the tens of ms drains NMEA with three orders of magnitude of margin even
+  // when gps_active is true and EnvironmentSensorManager::loop() is polled
+  // from the timeout alone. DO NOT add EventLoop.registerFd(gps_serial.fd())
+  // back in, even though it looks like the obviously-correct thing to do for
+  // a node that streams GPS -- it is the single line that reintroduces this
+  // branch's namesake bug in the default configuration.
+
+  // Refresh the cached IRQ level immediately before blocking. Packet
+  // correctness does not come from the edge-event descriptor above; it comes
+  // from ArduLinux's gpioIdle(), which fires RadioLib's ISR on a LOW->HIGH
+  // transition against a *cached* previous level. Nothing else in the
+  // MeshCore call path refreshes that cache (no delay() calls in
+  // Dispatcher.cpp/Mesh.cpp/MyMesh.cpp, and RadioLib's own
+  // digitalRead(getIrq()) calls live only in blocking paths MeshCore doesn't
+  // use), so the cache is stale from the moment gpioIdle() handles an
+  // interrupt until the next iteration's gpioIdle() call. Without this line
+  // the safe timeout ceiling would be bounded by packet airtime -- past that,
+  // DIO1 stays latched HIGH with no further rising edge to recover on, and RX
+  // stops silently rather than merely adding latency. This is what lets the
+  // caller choose max_wait_ms freely, and it is the obligation
+  // MainBoard::idleUntilEvent() documents for every implementer.
+  // Cost is one ioctl per wake; it is latency-safe, because if the line is
+  // already HIGH here an edge event is already queued and the wait below
+  // returns immediately instead of blocking. Do not remove this as
+  // "redundant" with gpioIdle() -- it is the only thing keeping a longer
+  // timeout safe.
+  if (config.lora_irq_pin != RADIOLIB_NC) digitalRead(config.lora_irq_pin);
+
+  EventLoop.wait(timeout_ms);
 }
 
 void trim(char *str) {

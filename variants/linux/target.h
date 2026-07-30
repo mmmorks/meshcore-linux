@@ -28,11 +28,6 @@ extern MicroNMEALocationProvider gps_location;
 // Consumed by EnvironmentSensorManager::initBasicGPS() on the Linux build.
 bool linux_gps_present();
 
-// Block until the radio IRQ fires, console or GPS input arrives, or a short
-// timeout elapses. Called at the end of loop() on Linux so the process idles
-// instead of spinning. See variants/linux/LinuxEventLoop.h.
-void linux_event_wait();
-
 #ifdef DISPLAY_CLASS
   extern DISPLAY_CLASS display;
   extern MomentaryButton user_btn;

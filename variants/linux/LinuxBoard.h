@@ -77,6 +77,11 @@ public:
     exit(0);
   }
 
+  // Block on the LoRa IRQ edge descriptor plus whichever console descriptors
+  // will actually be drained this iteration, instead of spinning. Defined in
+  // LinuxBoard.cpp; see variants/linux/LinuxEventLoop.h for the poll wrapper.
+  void idleUntilEvent(uint32_t max_wait_ms) override;
+
   // Wake-up source for the Linux event loop (the LoRa IRQ line), or NULL when
   // edge detection is unavailable. Typed as the abstract interface so this
   // header stays free of any libgpiod dependency.

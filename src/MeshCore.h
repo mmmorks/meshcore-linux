@@ -59,6 +59,30 @@ public:
   virtual void onBootComplete() { /* no op */ }
   virtual uint32_t getIRQGpio() { return -1; } // not supported. Returns DIO1 (SX1262) and DIO0 (SX127x)
   virtual void sleep(uint32_t secs)  { /* no op */ }
+
+  /**
+   * Idle until an event that needs servicing arrives -- the radio IRQ, or any
+   * other descriptor the platform knows the caller will drain this iteration --
+   * or until max_wait_ms elapses, whichever comes first.
+   *
+   * Returning early, or immediately, is ALWAYS correct: loop() re-checks all
+   * state on every iteration, so this is a pure "don't spin" hint and never a
+   * source of scheduling guarantees. Two obligations for implementers:
+   *
+   *  - Do not lose an IRQ that is already asserted on entry. A level-latched
+   *    line (SX1262 DIO1) that went high before the wait began may produce no
+   *    further edge, so check the level first and return immediately if it is
+   *    set. ESP32Board::sleep() does this via gpio_get_level().
+   *  - Do not wait on a descriptor the caller will not drain, or the wait
+   *    returns instantly forever and the loop spins anyway.
+   *
+   * Distinct from sleep(): this keeps peripherals live and is always safe to
+   * call, whereas sleep() is an opt-in deep sleep that may drop them.
+   *
+   * Default no-op: boards that don't implement it keep the historical
+   * busy-loop behaviour.
+  */
+  virtual void idleUntilEvent(uint32_t max_wait_ms) { /* no op */ }
   virtual uint32_t getGpio() { return 0; }
   virtual void setGpio(uint32_t values) {}
   virtual uint8_t getStartupReason() const = 0;

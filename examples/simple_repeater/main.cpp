@@ -31,6 +31,15 @@ static char command[160];
 // For power saving
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
+// How long loop() is willing to idle between iterations, for boards that
+// implement MainBoard::idleUntilEvent(). Must stay below the shortest deadline
+// not already delivered by the radio IRQ -- today that is the CAD retry delay
+// (Dispatcher::getCADFailRetryDelay(), 200 ms). Boards with no implementation
+// ignore this entirely and keep busy-looping.
+#ifndef IDLE_MAX_WAIT_MS
+  #define IDLE_MAX_WAIT_MS  10
+#endif
+
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
 #define USER_BTN_HOLD_OFF_MILLIS 1500
@@ -181,7 +190,9 @@ void loop() {
 #endif
   }
 
-#ifdef ARDULINUX_PLATFORM
-  linux_event_wait();  // block instead of spinning; see variants/linux/LinuxEventLoop.h
-#endif
+  // Idle instead of spinning between iterations. Default implementation is a
+  // no-op, so this is safe on every board; those that implement it block on
+  // the radio IRQ (and any other descriptor they will drain) until it fires or
+  // IDLE_MAX_WAIT_MS elapses.
+  board.idleUntilEvent(IDLE_MAX_WAIT_MS);
 }
