@@ -62,7 +62,9 @@ fi
 
 echo ">> building env '${ENV_NAME}' (version '${FIRMWARE_VERSION}') in ${IMAGE} [linux/arm64] -> ${BUILD_DIR}"
 
-docker run --rm -it \
+# No -it: a TTY is not needed for a batch build, and requesting one makes the
+# script fail outright when stdin is not a terminal (CI, agents, `| tee`).
+docker run --rm \
   --platform linux/arm64 \
   -v "${REPO_DIR}":/src -w /src \
   -v "${CACHE_VOL}":/root/.platformio \
