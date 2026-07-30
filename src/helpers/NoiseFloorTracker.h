@@ -22,6 +22,22 @@
   #define NOISE_TRACKER_MIN_SIGMA_DB  0.5f
 #endif
 
+#ifndef NOISE_TRACKER_MAX_SIGMA_DB
+  // Scale ceiling. Receiver noise spread is set by bandwidth, temperature and
+  // LNA gain state; measured on an SX1262 at 250 kHz it sits around 0.5-0.9 dB,
+  // so 3 dB is generous headroom and anything beyond it is not a noise spread.
+  // This bounds how far floorDbm() can extrapolate above the 0.10 quantile.
+  #define NOISE_TRACKER_MAX_SIGMA_DB  3.0f
+#endif
+
+#ifndef NOISE_TRACKER_SIGMA_LAMBDA
+  // EMA rate for the scale estimate (~50-sample time constant, 5 s at 100 ms
+  // sampling). Slow on purpose: the spread physically changes far more slowly
+  // than the mean, so a transient divergence between the two quantiles must not
+  // be mistaken for the channel getting noisier.
+  #define NOISE_TRACKER_SIGMA_LAMBDA  0.02f
+#endif
+
 #ifndef NOISE_TRACKER_MIN_DBM
   // Same clamp the previous estimator applied: below this is not physically
   // plausible for these receivers and indicates a bad RSSI read.
@@ -57,10 +73,12 @@
 class NoiseFloorTracker {
   float _q10;
   float _q40;
+  float _sigma;
   bool  _init;
 
 public:
-  NoiseFloorTracker() : _q10(0.0f), _q40(0.0f), _init(false) { }
+  NoiseFloorTracker()
+    : _q10(0.0f), _q40(0.0f), _sigma(NOISE_TRACKER_MIN_SIGMA_DB), _init(false) { }
 
   /** Discard all state; the next sample re-seeds. */
   void reset() { _init = false; }
@@ -78,6 +96,7 @@ public:
       // until they separate, so the reported floor is up to ~0.6 dB high for
       // the first few samples.
       _q10 = _q40 = rssi_dbm;
+      _sigma = NOISE_TRACKER_MIN_SIGMA_DB;
       _init = true;
       return;
     }
@@ -92,19 +111,38 @@ public:
     // The two trackers are independent, so a transient can momentarily invert
     // them. sigma() would go negative; keep them ordered instead.
     if (_q40 < _q10) _q40 = _q10;
+
+    // Scale estimate: clamp the raw quantile gap, then adapt to it slowly.
+    //
+    // Taking the gap directly is wrong, and wrong in a way that bites hard. The
+    // two quantiles converge at different speeds by construction (the 0.40
+    // tracker rises 4x faster than the 0.10 tracker), so while both are chasing
+    // a moving ambient level the gap between them measures their differential
+    // lag, not the noise spread. Since floorDbm() extrapolates from it with a
+    // 1.28 multiplier, a sustained run of strong samples inflated the raw gap to
+    // >31 dB in test and drove a live repeater's reported floor from -114 dBm to
+    // -70. Physically the spread cannot do that: it is set by receiver
+    // bandwidth, temperature and LNA gain state, all of which move far more
+    // slowly than the mean. So bound it, and let it adapt on a slow time
+    // constant that a transient cannot outrun.
+    float raw = (_q40 - _q10) / 1.0283f;   // Phi^-1(0.40) - Phi^-1(0.10)
+    if (raw > NOISE_TRACKER_MAX_SIGMA_DB) raw = NOISE_TRACKER_MAX_SIGMA_DB;
+    if (raw < NOISE_TRACKER_MIN_SIGMA_DB) raw = NOISE_TRACKER_MIN_SIGMA_DB;
+    _sigma += NOISE_TRACKER_SIGMA_LAMBDA * (raw - _sigma);
   }
 
   /**
-   * \returns  estimated standard deviation (dB) of the noise-only RSSI, never
-   *           below NOISE_TRACKER_MIN_SIGMA_DB.
+   * \returns  estimated standard deviation (dB) of the noise-only RSSI, always
+   *           within [NOISE_TRACKER_MIN_SIGMA_DB, NOISE_TRACKER_MAX_SIGMA_DB].
    *
-   * Derived from the spacing of two *lower* quantiles, so that a busy channel
-   * cannot inflate it: for a normal distribution,
-   * Phi^-1(0.40) - Phi^-1(0.10) = -0.2533 - (-1.2816) = 1.0283 sigma.
+   * Derived from the spacing of two *lower* quantiles -- both below any
+   * plausible channel occupancy, so a busy channel cannot inflate it -- then
+   * bounded and slewed in addSample(). See the comment there for why the raw
+   * gap must not be used directly.
    */
   float sigma() const {
-    float s = (_q40 - _q10) / 1.0283f;
-    return s < NOISE_TRACKER_MIN_SIGMA_DB ? (float) NOISE_TRACKER_MIN_SIGMA_DB : s;
+    if (!_init) return (float) NOISE_TRACKER_MIN_SIGMA_DB;
+    return _sigma;
   }
 
   /**

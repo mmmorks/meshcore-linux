@@ -111,6 +111,71 @@ TEST(NoiseFloorTracker, SurvivesHeavyInterference) {
   EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 3.0f);
 }
 
+// Regression: dispersed contamination (above) and *runs* of contamination are
+// different problems, and only the second one broke on hardware.
+//
+// A bounded per-sample step limits what one outlier can do, but says nothing
+// about a run of them. At a 100 ms sample interval a single LoRa packet is 20+
+// consecutive samples of signal power, and during such a run the 0.40 quantile
+// climbs 4x faster than the 0.10 quantile (STEP*0.40 vs STEP*0.10). The gap
+// between them therefore widens, so a scale estimate taken straight from that
+// gap measures how far the two trackers have diverged rather than the noise
+// spread -- and floorDbm() multiplies it by 1.28.
+//
+// Deployed to a live repeater this produced a floor of -70 dBm against a true
+// floor of -114, on 27% of readings. Assert on the running maximum, not just
+// the final value: the original test suite only checked where the estimate
+// settled, which is exactly how this got through.
+TEST(NoiseFloorTracker, SurvivesRunsOfInterference) {
+  NoiseFloorTracker nf;
+  Rng rng(8080);
+  feedNoise(nf, rng, 2000);
+  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
+
+  int16_t worst = nf.floorDbm();
+  for (int burst = 0; burst < 30; burst++) {
+    for (int i = 0; i < 25; i++) {           // ~2.5 s of packet at 100 ms/sample
+      nf.addSample(-70.0f);
+      if (nf.floorDbm() > worst) worst = nf.floorDbm();
+    }
+    for (int i = 0; i < 25; i++) {           // quiet gap between packets
+      nf.addSample(NOISE_MEAN + NOISE_SIGMA * rng.normal());
+      if (nf.floorDbm() > worst) worst = nf.floorDbm();
+    }
+  }
+
+  // The estimate may legitimately drift up somewhat -- half these samples
+  // really are loud -- but it must not run away toward the burst level.
+  EXPECT_LT((float)worst, NOISE_MEAN + 6.0f)
+      << "floor ran away to " << worst << " dBm during runs of -70 dBm samples";
+}
+
+TEST(NoiseFloorTracker, ScaleEstimateStaysPhysicallyPlausible) {
+  NoiseFloorTracker nf;
+  Rng rng(1234);
+  feedNoise(nf, rng, 500);
+
+  // A sustained run of strong samples makes the two quantiles diverge, since the
+  // 0.40 tracker chases 4x faster than the 0.10 tracker. sigma() must stay
+  // within a plausible receiver noise spread throughout, because floorDbm()
+  // extrapolates from it -- unbounded, this reached 31.6 dB and dragged the
+  // reported floor up by ~40 dB.
+  float worst_sigma = nf.sigma();
+  int16_t worst_floor = nf.floorDbm();
+  for (int i = 0; i < 1500; i++) {
+    nf.addSample(-70.0f);
+    if (nf.sigma() > worst_sigma) worst_sigma = nf.sigma();
+    if (nf.floorDbm() > worst_floor) worst_floor = nf.floorDbm();
+  }
+  EXPECT_LE(worst_sigma, (float)NOISE_TRACKER_MAX_SIGMA_DB + 0.01f);
+
+  // The 0.10 quantile does legitimately climb toward a genuinely louder ambient,
+  // but bounding sigma bounds how far above it the reported floor can be thrown.
+  EXPECT_LE((float)worst_floor,
+            -70.0f + 1.2816f * (float)NOISE_TRACKER_MAX_SIGMA_DB + 1.0f)
+      << "reported floor overshot the sample level itself";
+}
+
 TEST(NoiseFloorTracker, RecoversAfterInterferenceStops) {
   NoiseFloorTracker nf;
   Rng rng(31337);

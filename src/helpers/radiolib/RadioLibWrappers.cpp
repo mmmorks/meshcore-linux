@@ -129,11 +129,21 @@ void RadioLibWrapper::loop() {
     _next_noise_sample = now + NOISE_SAMPLE_INTERVAL_MS;
   }
 
-  // Deliberately NOT gated on isReceivingPacket(). Robustness comes from the
-  // estimator's bounded update, not from excluding samples, and gating on
-  // channel activity biases the sample population toward quiet moments --
-  // which systematically under-reports the floor exactly when the band is busy
-  // and an accurate one matters most. It also saves an SPI read per sample.
+  // Skip samples taken while the modem is demodulating: RSSI then reports the
+  // strength of the signal being received, not the noise under it, and no
+  // estimator can be robust to that because it is not contamination -- it is a
+  // different quantity. At this sample rate a single LoRa packet is 20+
+  // consecutive readings, so these arrive in runs long enough for the two
+  // quantile trackers to chase them, which is precisely how a live repeater
+  // ended up reporting -70 dBm against a true floor of -114.
+  //
+  // This does bias the sample population toward quieter moments. That bias is
+  // real but second order, and far preferable to averaging in signal power.
+  // Unlike the batch estimator this replaced, a skipped sample no longer
+  // extends a measurement window -- the next sample simply comes 100 ms later
+  // regardless -- so the bias no longer compounds into an unbounded stall.
+  if (isReceivingPacket()) return;
+
   _nf.addSample(getCurrentRSSI());
   _noise_floor = _nf.floorDbm();
 
