@@ -8,8 +8,36 @@
 #define STATE_TX_DONE    4
 #define STATE_INT_READY 16
 
-#define NUM_NOISE_FLOOR_SAMPLES  64
-#define SAMPLING_THRESHOLD  14
+// How often the noise floor is sampled, in wall-clock terms. Sampling is rate
+// limited here rather than taken once per loop() call so the estimate does not
+// depend on how fast the host happens to iterate: an idle Linux daemon blocking
+// on poll() and an MCU spinning flat out must characterise the channel the same
+// way. It also keeps consecutive samples far enough apart to be worth taking --
+// back-to-back GET_RSSI_INST reads are correlated, so they add little
+// information for their SPI cost.
+#ifndef NOISE_SAMPLE_INTERVAL_MS
+  #define NOISE_SAMPLE_INTERVAL_MS  100
+#endif
+
+// Minimum busy-channel margin, as a multiple of the estimated noise sigma. This
+// is what sets the false-alarm rate of the interference check: for normally
+// distributed noise, P(sample > mean + 3.5 sigma) = 2.3e-4 per isChannelActive()
+// call, so a transmit attempt (a handful of calls) defers spuriously about once
+// in a thousand -- comfortably absorbed by the CSMA backoff that follows.
+//
+// Applied as a floor under the operator's configured dB margin, not as a
+// replacement for it: interference_threshold keeps meaning dB, but a margin
+// narrower than the noise itself can no longer produce continuous false busy
+// and trip ERR_EVENT_CAD_TIMEOUT.
+#ifndef NOISE_THRESHOLD_SIGMA_K
+  #define NOISE_THRESHOLD_SIGMA_K  3.5f
+#endif
+
+// One debug line per this many samples (20 * 100 ms = 2 s), matching the log
+// volume of the batch estimator this replaced.
+#ifndef NOISE_LOG_EVERY_N_SAMPLES
+  #define NOISE_LOG_EVERY_N_SAMPLES  20
+#endif
 
 static volatile uint8_t state = STATE_IDLE;
 
@@ -37,9 +65,8 @@ void RadioLibWrapper::begin() {
   _noise_floor = 0;
   _threshold = 0;
 
-  // start average out some samples
-  _num_floor_samples = 0;
-  _floor_sample_sum = 0;
+  _nf.reset();
+  _next_noise_sample = millis();
 }
 
 uint32_t RadioLibWrapper::getRngSeed() {
@@ -56,11 +83,11 @@ void RadioLibWrapper::idle() {
 }
 
 void RadioLibWrapper::triggerNoiseFloorCalibrate(int threshold) {
+  // The estimator now runs continuously, so there is no calibration batch to
+  // start and nothing here is periodic any more -- this only conveys the
+  // operator's interference threshold. Kept on the mesh::Radio interface, and
+  // still called on Dispatcher's 2 s timer, so that no caller has to change.
   _threshold = threshold;
-  if (_num_floor_samples >= NUM_NOISE_FLOOR_SAMPLES) {  // ignore trigger if currently sampling
-    _num_floor_samples = 0;
-    _floor_sample_sum = 0;
-  }
 }
 
 void RadioLibWrapper::doResetAGC() {
@@ -74,32 +101,50 @@ void RadioLibWrapper::resetAGC() {
   doResetAGC();
   state = STATE_IDLE;   // trigger a startReceive()
 
-  // Reset noise floor sampling so it reconverges from scratch.
-  // Without this, a stuck _noise_floor of -120 makes the sampling threshold
-  // too low (-106) to accept normal samples (~-105), self-reinforcing the
-  // stuck value even after the receiver has recovered.
+  // Re-seed the noise floor estimate: the analog frontend just changed, so
+  // everything learned before it is about a different receiver.
+  //
+  // (This used to also work around a self-reinforcing stuck floor: the old
+  // estimator only accepted samples below `floor + 14`, so a floor stuck at
+  // -120 rejected every normal ~-105 sample forever. NoiseFloorTracker has no
+  // estimate-dependent acceptance test, so that failure mode is gone.)
   _noise_floor = 0;
-  _num_floor_samples = 0;
-  _floor_sample_sum = 0;
+  _nf.reset();
 }
 
 void RadioLibWrapper::loop() {
-  if (state == STATE_RX && _num_floor_samples < NUM_NOISE_FLOOR_SAMPLES) {
-    if (!isReceivingPacket()) {
-      int rssi = getCurrentRSSI();
-      if (rssi < _noise_floor + SAMPLING_THRESHOLD) {  // only consider samples below current floor + sampling THRESHOLD
-        _num_floor_samples++;
-        _floor_sample_sum += rssi;
-      }
-    }
-  } else if (_num_floor_samples >= NUM_NOISE_FLOOR_SAMPLES && _floor_sample_sum != 0) {
-    _noise_floor = _floor_sample_sum / NUM_NOISE_FLOOR_SAMPLES;
-    if (_noise_floor < -120) {
-      _noise_floor = -120;    // clamp to lower bound of -120dBi
-    }
-    _floor_sample_sum = 0;
+  // Only sample while actually listening: during TX or standby the RSSI reading
+  // describes nothing about the channel.
+  if (state != STATE_RX) return;
 
-    MESH_DEBUG_PRINTLN("RadioLibWrapper: noise_floor = %d", (int)_noise_floor);
+  uint32_t now = millis();
+  if ((int32_t)(now - _next_noise_sample) < 0) return;   // not due yet
+
+  _next_noise_sample += NOISE_SAMPLE_INTERVAL_MS;
+  if ((int32_t)(now - _next_noise_sample) >= 0) {
+    // More than one interval elapsed -- we were transmitting, or the caller
+    // stopped iterating for a while. Resync rather than catching up, otherwise
+    // the next few iterations would each fire immediately and feed a burst of
+    // correlated samples, which is exactly what the fixed rate exists to avoid.
+    _next_noise_sample = now + NOISE_SAMPLE_INTERVAL_MS;
+  }
+
+  // Deliberately NOT gated on isReceivingPacket(). Robustness comes from the
+  // estimator's bounded update, not from excluding samples, and gating on
+  // channel activity biases the sample population toward quiet moments --
+  // which systematically under-reports the floor exactly when the band is busy
+  // and an accurate one matters most. It also saves an SPI read per sample.
+  _nf.addSample(getCurrentRSSI());
+  _noise_floor = _nf.floorDbm();
+
+  // Rate limit the log rather than printing on every change: the estimate now
+  // updates continuously and jitters by ~1 dB, so "print when it changes" would
+  // emit several lines a second. One line every NOISE_LOG_EVERY_N_SAMPLES keeps
+  // debug output at roughly the volume the 2 s batch estimator produced.
+  if (++_noise_log_ctr >= NOISE_LOG_EVERY_N_SAMPLES) {
+    _noise_log_ctr = 0;
+    MESH_DEBUG_PRINTLN("RadioLibWrapper: noise_floor = %d (sigma %d/10)",
+                       (int)_noise_floor, (int)(_nf.sigma() * 10.0f));
   }
 }
 
@@ -179,9 +224,20 @@ void RadioLibWrapper::onSendFinished() {
 }
 
 bool RadioLibWrapper::isChannelActive() {
-  return _threshold == 0 
-          ? false    // interference check is disabled
-          : getCurrentRSSI() > _noise_floor + _threshold;
+  if (_threshold == 0) return false;   // interference check is disabled
+  if (!_nf.ready()) return false;      // no floor estimate yet, so no basis to judge
+
+  // The operator's configured dB margin still means dB, so existing
+  // interference_threshold settings behave as before. What is new is the floor
+  // under it: a margin narrower than NOISE_THRESHOLD_SIGMA_K sigma would fire on
+  // noise alone, and a channel that reads busy continuously does not protect
+  // anything -- it just delays every packet until getCADFailMaxDuration()
+  // expires and the node transmits regardless.
+  float margin = (float) _threshold;
+  float min_margin = NOISE_THRESHOLD_SIGMA_K * _nf.sigma();
+  if (margin < min_margin) margin = min_margin;
+
+  return getCurrentRSSI() > (float)_noise_floor + margin;
 }
 
 float RadioLibWrapper::getLastRSSI() const {
