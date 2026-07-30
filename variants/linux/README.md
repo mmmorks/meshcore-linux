@@ -52,6 +52,22 @@ Alternatively, build directly with PlatformIO (no version metadata):
 FIRMWARE_VERSION=dev pio run -e linux_repeater
 ```
 
+For a reproducible cross-build in a container (e.g. on a non-Linux dev
+machine), use `./build-docker.sh linux_repeater` from the repo root. It
+defaults to `debian:bookworm`, which ships libgpiod 1.x; set `BASE_IMAGE` to
+build against libgpiod 2.x instead:
+
+```sh
+BASE_IMAGE=debian:trixie ./build-docker.sh linux_repeater
+# binary: .pio/build-trixie/linux_repeater/meshcored (bookworm keeps the
+# default, untagged .pio/build/ path)
+```
+
+`EventGPIOPin`'s libgpiod-major-version code is selected by a preprocessor
+check (`GPIOD_LINE_BULK_MAX_LINES`), so only one of the v1/v2 code paths is
+ever compiled per build — building on both bases at least once before release
+is the only way to catch a break in the untested one.
+
 ## Setup
 
 ### 1. Install the binary

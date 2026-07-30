@@ -10,16 +10,39 @@
 #   ./build-docker.sh                 # builds env "linux_repeater"
 #   ./build-docker.sh linux           # builds a different env
 #   FIRMWARE_VERSION=1.0 ./build-docker.sh
+#   BASE_IMAGE=debian:trixie ./build-docker.sh linux_repeater  # libgpiod v2
 #
-# Output: .pio/build/<env>/meshcored   (written into this repo via the mount)
-# PlatformIO's packages are cached in the "mc_pio_cache" Docker volume so repeat
+# Output: <build-dir>/<env>/meshcored   (written into this repo via the mount)
+# PlatformIO's packages are cached in a "mc_pio_cache*" Docker volume so repeat
 # builds skip the re-download.
+#
+# BASE_IMAGE selects the container's libgpiod major version: bookworm ships
+# libgpiod 1.x, trixie ships 2.x. Default is bookworm, so existing behaviour
+# is unchanged unless BASE_IMAGE is set.
+#
+# PlatformIO's dependency scanner doesn't track system headers like
+# /usr/include/gpiod.h, so reusing one build dir across libgpiod major
+# versions can silently relink objects compiled against the other version's
+# headers. To avoid that, the package cache and build dir are namespaced by
+# BASE_IMAGE: the default (bookworm) keeps the original untagged paths
+# (cache volume "mc_pio_cache", build dir ".pio/build") so existing caches
+# and tooling keep working; any other BASE_IMAGE gets its own
+# "mc_pio_cache_<tag>" volume and ".pio/build-<tag>" dir, e.g. trixie builds
+# land in ".pio/build-trixie/linux_repeater/meshcored".
 set -euo pipefail
 
 ENV_NAME="${1:-linux_repeater}"
 FIRMWARE_VERSION="${FIRMWARE_VERSION:-dev}"
-IMAGE="debian:bookworm"
-CACHE_VOL="mc_pio_cache"
+IMAGE="${BASE_IMAGE:-debian:bookworm}"
+
+if [ "${IMAGE}" = "debian:bookworm" ]; then
+  CACHE_VOL="mc_pio_cache"
+  BUILD_DIR=".pio/build"
+else
+  TAG="${IMAGE##*:}"
+  CACHE_VOL="mc_pio_cache_${TAG}"
+  BUILD_DIR=".pio/build-${TAG}"
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -28,7 +51,7 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-echo ">> building env '${ENV_NAME}' (version '${FIRMWARE_VERSION}') in ${IMAGE} [linux/arm64]"
+echo ">> building env '${ENV_NAME}' (version '${FIRMWARE_VERSION}') in ${IMAGE} [linux/arm64] -> ${BUILD_DIR}"
 
 docker run --rm -it \
   --platform linux/arm64 \
@@ -36,6 +59,7 @@ docker run --rm -it \
   -v "${CACHE_VOL}":/root/.platformio \
   -e "FIRMWARE_VERSION=${FIRMWARE_VERSION}" \
   -e "ENV_NAME=${ENV_NAME}" \
+  -e "PLATFORMIO_BUILD_DIR=${BUILD_DIR}" \
   "${IMAGE}" bash -c '
     set -e
     apt-get update
@@ -48,4 +72,4 @@ docker run --rm -it \
     pio run -e "${ENV_NAME}"
   '
 
-echo ">> done: .pio/build/${ENV_NAME}/meshcored"
+echo ">> done: ${BUILD_DIR}/${ENV_NAME}/meshcored"

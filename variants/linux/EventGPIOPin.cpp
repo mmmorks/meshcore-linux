@@ -29,116 +29,139 @@
 
 static bool chip_is_gpiochip_device(const char *path) {
   char *realname, *sysfsp, devpath[64];
-  struct stat statbuf;
-  bool ret = false;
-  int rv;
+	struct stat statbuf;
+	bool ret = false;
+	int rv;
 
-  rv = lstat(path, &statbuf);
-  if (rv)
-    goto out;
+	rv = lstat(path, &statbuf);
+	if (rv)
+		goto out;
 
-  realname = S_ISLNK(statbuf.st_mode) ? realpath(path, NULL) : strdup(path);
-  if (realname == NULL)
-    goto out;
+	/*
+	 * Is it a symbolic link? We have to resolve it before checking
+	 * the rest.
+	 */
+	realname = S_ISLNK(statbuf.st_mode) ? realpath(path, NULL) :
+					      strdup(path);
+	if (realname == NULL)
+		goto out;
 
-  rv = stat(realname, &statbuf);
-  if (rv)
-    goto out_free_realname;
+	rv = stat(realname, &statbuf);
+	if (rv)
+		goto out_free_realname;
 
-  if (!S_ISCHR(statbuf.st_mode)) {
-    errno = ENOTTY;
-    goto out_free_realname;
-  }
+	/* Is it a character device? */
+	if (!S_ISCHR(statbuf.st_mode)) {
+		errno = ENOTTY;
+		goto out_free_realname;
+	}
 
-  snprintf(devpath, sizeof(devpath), "/sys/dev/char/%u:%u/subsystem",
-           major(statbuf.st_rdev), minor(statbuf.st_rdev));
+	/* Is the device associated with the GPIO subsystem? */
+	snprintf(devpath, sizeof(devpath), "/sys/dev/char/%u:%u/subsystem",
+		 major(statbuf.st_rdev), minor(statbuf.st_rdev));
 
-  sysfsp = realpath(devpath, NULL);
-  if (!sysfsp)
-    goto out_free_realname;
+	sysfsp = realpath(devpath, NULL);
+	if (!sysfsp)
+		goto out_free_realname;
 
-  errno = 0;
+	/*
+	 * In glibc, if any of the underlying readlink() calls fail (which is
+	 * perfectly normal when resolving paths), errno is not cleared.
+	 */
+	errno = 0;
 
-  if (strcmp(sysfsp, "/sys/bus/gpio") != 0) {
-    errno = ENODEV;
-    goto out_free_sysfsp;
-  }
+	if (strcmp(sysfsp, "/sys/bus/gpio") != 0) {
+		/* This is a character device but not the one we're after. */
+		errno = ENODEV;
+		goto out_free_sysfsp;
+	}
 
-  ret = true;
+	ret = true;
 
 out_free_sysfsp:
-  free(sysfsp);
+	free(sysfsp);
 out_free_realname:
-  free(realname);
+	free(realname);
 out:
-  errno = 0;
-  return ret;
+	errno = 0;
+	return ret;
 }
 
-static int chip_dir_filter(const struct dirent *entry) {
-  bool is_chip;
-  char *path;
-  int ret;
+static int chip_dir_filter(const struct dirent *entry)
+{
+	bool is_chip;
+	char *path;
+	int ret;
 
-  ret = asprintf(&path, "/dev/%s", entry->d_name);
-  if (ret < 0)
-    return 0;
+	ret = asprintf(&path, "/dev/%s", entry->d_name);
+	if (ret < 0)
+		return 0;
 
-  is_chip = chip_is_gpiochip_device(path);
-  free(path);
-  return !!is_chip;
+	is_chip = chip_is_gpiochip_device(path);
+	free(path);
+	return !!is_chip;
 }
 
-static struct gpiod_chip *chip_open_by_name(const char *name) {
-  struct gpiod_chip *chip;
-  char *path;
-  int ret;
+static struct gpiod_chip *chip_open_by_name(const char *name)
+{
+	struct gpiod_chip *chip;
+	char *path;
+	int ret;
 
-  ret = asprintf(&path, "/dev/%s", name);
-  if (ret < 0)
-    return NULL;
+	ret = asprintf(&path, "/dev/%s", name);
+	if (ret < 0)
+		return NULL;
 
-  chip = gpiod_chip_open(path);
-  free(path);
+	chip = gpiod_chip_open(path);
+	free(path);
 
-  return chip;
+	return chip;
 }
 
-static struct gpiod_chip *find_chip_by_label(const char *chipLabel) {
-  std::string path = "/dev/";
-  path += chipLabel;
-  if (access(path.c_str(), R_OK) == 0)
-    return chip_open_by_name(chipLabel);
+// Open the gpiod chip whose label matches `chipLabel`.  First tries
+// "/dev/<chipLabel>" as a device basename (covers the gpiochip0 case);
+// falls back to scanning /dev/ and comparing each chip's reported label
+// (covers passing a kernel label like "pinctrl-rp1" or "pinctrl-bcm2835").
+// Caller owns the returned chip; returns NULL if no chip matches.
+static struct gpiod_chip *find_chip_by_label(const char *chipLabel)
+{
+	std::string path = "/dev/";
+	path += chipLabel;
+	if (access(path.c_str(), R_OK) == 0)
+		return chip_open_by_name(chipLabel);
 
-  struct dirent **entries;
-  int num_chips = scandir("/dev/", &entries, chip_dir_filter, alphasort);
-  if (num_chips <= 0)
-    return NULL;
+	struct dirent **entries;
+	int num_chips = scandir("/dev/", &entries, chip_dir_filter, alphasort);
+	if (num_chips <= 0)
+		return NULL;
 
-  struct gpiod_chip *match = NULL;
-  for (int i = 0; i < num_chips; i++) {
-    if (!match) {
-      struct gpiod_chip *c = chip_open_by_name(entries[i]->d_name);
-      if (c) {
+	struct gpiod_chip *match = NULL;
+	for (int i = 0; i < num_chips; i++) {
+		if (!match) {
+			struct gpiod_chip *c = chip_open_by_name(entries[i]->d_name);
+			if (c) {
 #if EVGPIO_GPIOD_V == 2
-        struct gpiod_chip_info *info = gpiod_chip_get_info(c);
-        const char *label = info ? gpiod_chip_info_get_label(info) : NULL;
-        bool hit = label && strcmp(label, chipLabel) == 0;
-        if (info) gpiod_chip_info_free(info);
+				struct gpiod_chip_info *info = gpiod_chip_get_info(c);
+				const char *label = info ? gpiod_chip_info_get_label(info) : NULL;
+				bool hit = label && strcmp(label, chipLabel) == 0;
+				if (info) gpiod_chip_info_free(info);
 #else
-        const char *label = gpiod_chip_label(c);
-        bool hit = label && strcmp(label, chipLabel) == 0;
+				const char *label = gpiod_chip_label(c);
+				bool hit = label && strcmp(label, chipLabel) == 0;
 #endif
-        if (hit)
-          match = c;
-        else
-          gpiod_chip_close(c);
-      }
-    }
-    free(entries[i]);
-  }
-  free(entries);
-  return match;
+				if (hit) {
+					match = c;
+					log(SysGPIO, LogDebug,
+					    "find_chip_by_label(%s): scan matched %s",
+					    chipLabel, entries[i]->d_name);
+				} else
+					gpiod_chip_close(c);
+			}
+		}
+		free(entries[i]);
+	}
+	free(entries);
+	return match;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,33 +180,58 @@ EventGPIOPin::EventGPIOPin(pin_size_t n, const char* chipLabel, int lineOffset,
 #if EVGPIO_GPIOD_V == 1
   _line = gpiod_chip_get_line(_chip, lineOffset);
   if (!_line) {
-    gpiod_chip_close(_chip);
-    _chip = NULL;
+    releaseResources();
     throw std::invalid_argument("GPIO line not found");
   }
 #else
   _evbuf = gpiod_edge_event_buffer_new(16);
+  if (!_evbuf) {
+    log(SysGPIO, LogError,
+        "EventGPIOPin(%s): edge-event buffer allocation failed; "
+        "falling back to timeout polling",
+        getName());
+  }
 #endif
 
   _edge_ok = requestWithEdges(INPUT);
+#if EVGPIO_GPIOD_V == 2
+  if (_edge_ok && !_evbuf) {
+    // requestWithEdges() armed edge detection on the line, but with no
+    // buffer to drain events into, eventFd() and drainEvents() would
+    // disagree: eventFd() (which only checks _edge_ok) would hand out a
+    // readable descriptor that drainEvents() (which needs _evbuf) refuses to
+    // service. An undrained level-triggered POLLIN makes poll() return
+    // instantly forever -- exactly the busy loop this class exists to
+    // remove. Falling through to the plain-input request below both fixes
+    // the bookkeeping and un-arms edge detection on the line itself.
+    _edge_ok = false;
+  }
+#endif
   if (!_edge_ok) {
     log(SysGPIO, LogError,
         "EventGPIOPin(%s): edge detection unavailable (%s); "
         "falling back to timeout polling",
         getName(), strerror(errno));
-    if (!requestPlainInput(INPUT))
+    if (!requestPlainInput(INPUT)) {
+      releaseResources();
       throw std::invalid_argument("cannot request GPIO line");
+    }
   }
 }
 
 EventGPIOPin::~EventGPIOPin() {
+  releaseResources();
+}
+
+void EventGPIOPin::releaseResources() {
 #if EVGPIO_GPIOD_V == 2
-  if (_line)  gpiod_line_request_release(_line);
-  if (_evbuf) gpiod_edge_event_buffer_free(_evbuf);
+  if (_line)  { gpiod_line_request_release(_line); _line = NULL; }
+  if (_evbuf) { gpiod_edge_event_buffer_free(_evbuf); _evbuf = NULL; }
 #else
   if (_line) gpiod_line_release(_line);
+  _line = NULL;
 #endif
-  if (_chip) gpiod_chip_close(_chip);
+  if (_chip) { gpiod_chip_close(_chip); _chip = NULL; }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +378,22 @@ void EventGPIOPin::setPinMode(PinMode m) {
           getName());
       _edge_ok = false;
     }
+    // readPin() returns the cached status without touching hardware: mode is
+    // already OUTPUT (GPIOPin::setPinMode(m) above already updated it), so
+    // refreshState() short-circuits and skips readPinHardware(). Must be read
+    // *before* the v1 release below -- reading after release hits EPERM,
+    // which readPinHardware() maps to LOW, silently discarding the pin's
+    // prior level on every mode change. Mirrors upstream LinuxGPIOPin.cpp's
+    // gpiod_line_request_output(line, consumer, readPin()).
+    PinStatus initial = readPin();
 #if EVGPIO_GPIOD_V == 1
     gpiod_line_release(_line);
 #endif
-    requestOutput(readPinHardware());
+    if (!requestOutput(initial)) {
+      log(SysGPIO, LogError,
+          "EventGPIOPin(%s): failed to request line as OUTPUT (%s)",
+          getName(), strerror(errno));
+    }
     return;
   }
 
@@ -353,7 +413,17 @@ void EventGPIOPin::setPinMode(PinMode m) {
         "EventGPIOPin(%s): edge detection lost on mode change (%s); "
         "falling back to timeout polling",
         getName(), strerror(errno));
-    requestPlainInput(m);
+    if (!requestPlainInput(m)) {
+      // Both the edge-detecting and plain-input requests failed: the line is
+      // now unrequested. readPinHardware() maps that to a permanent LOW,
+      // GPIOPin::callISR() never fires, and packets are silently dropped
+      // rather than merely delayed -- this must not be quiet.
+      log(SysGPIO, LogError,
+          "EventGPIOPin(%s): failed to request line as plain INPUT (%s); "
+          "line is unrequested, reads will return LOW until the next "
+          "setPinMode() call",
+          getName(), strerror(errno));
+    }
   }
 }
 
@@ -367,11 +437,12 @@ int EventGPIOPin::eventFd() const {
 }
 
 void EventGPIOPin::drainEvents() {
-#if EVGPIO_GPIOD_V == 2
-  if (!_edge_ok || _line == NULL || _evbuf == NULL) return;
-#else
+  // _edge_ok is the single source of truth eventFd() also uses: the
+  // constructor clears it (v2) when _evbuf failed to allocate, so it is
+  // never true here with a NULL _evbuf. Keeping one flag in sync, rather
+  // than checking _evbuf separately here, is what keeps this function and
+  // eventFd() agreeing on whether the descriptor is serviceable.
   if (!_edge_ok || _line == NULL) return;
-#endif
 
 #if EVGPIO_GPIOD_V == 1
   // Zero timeout keeps this non-blocking: gpiod_line_event_read() on its own

@@ -61,6 +61,12 @@ private:
   bool requestPlainInput(PinMode m);  // fallback, no edge detection
   bool requestOutput(PinStatus initial);
 
+  // Release the line/chip/event-buffer (whichever are currently held) and
+  // null them out. Shared by the destructor and by the constructor's failure
+  // paths: a constructor that throws never runs the destructor, so every
+  // throw after a partial acquisition must call this itself or leak.
+  void releaseResources();
+
 #if EVGPIO_GPIOD_V == 2
   // Shared tail of requestWithEdges/requestPlainInput/requestOutput: wraps
   // `settings` in a line_config, requests the line (first call) or
