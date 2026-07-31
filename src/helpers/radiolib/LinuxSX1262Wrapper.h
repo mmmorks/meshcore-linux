@@ -3,6 +3,7 @@
 #include "LinuxSX1262.h"
 #include "LinuxRadioWait.h"
 #include "RadioLibWrappers.h"
+#include "SX126xReset.h"
 
 class LinuxSX1262Wrapper : public RadioLibWrapper {
   // How long performChannelScan() will wait for DIO1 before giving up on the
@@ -70,6 +71,34 @@ public:
     // and wholly independent of the GPIO -- so a dead line costs latency and a
     // log line, never a wrong answer, and never a hang.
     return radio->getChannelScanResult();
+  }
+
+  // Full SX126x receiver reset (warm sleep, recalibrate, re-image the configured
+  // band), the same one every other SX126x board gets. Without this override the
+  // base class falls back to a bare sleep(), so `set agc_int` was quietly a
+  // weaker knob on Linux than everywhere else.
+  //
+  // The re-applications afterwards are the Linux-specific part. sx126xResetAGC()
+  // restores DIO2-as-RF-switch, RX boosted gain and the 0x8B5 patch from the
+  // SX126X_* build flags, none of which are defined here -- those settings come
+  // from meshcored.ini instead. Left to the shared helper alone, an AGC reset
+  // would silently drop all three and leave the radio less sensitive, or (where
+  // DIO2 drives the RF switch) mute, until the daemon was restarted.
+  void doResetAGC() override {
+    LinuxSX1262* radio = (LinuxSX1262 *)_radio;
+
+    sx126xResetAGC(radio);
+
+    radio->setDio2AsRfSwitch(board.config.dio2_as_rf_switch);
+    radio->setRxBoostedGainMode(board.config.rx_boosted_gain);
+    radio->applyRegisterPatch();
+  }
+
+  // Cold sleep, matching CustomSX1262Wrapper. The only caller shuts the daemon
+  // down straight afterwards, so there is no configuration worth retaining and
+  // the deeper state is the better one to leave the modem in.
+  void powerOff() override {
+    ((LinuxSX1262 *)_radio)->sleep(false);
   }
 
   bool isReceivingPacket() override {
