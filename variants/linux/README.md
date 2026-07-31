@@ -262,6 +262,10 @@ control CLI (`meshcorectl`):
 - `gps sync` — force a time re-sync from GPS
 - `gps setloc` — save the current GPS fix as the node's advertised location
 - `gps advert none|prefs|share` — control whether location is advertised
+- `gps interval [seconds]` — seconds between location reads (0 = default, 1 s;
+  max 86400). Bare `gps interval` reports the stored value. This also throttles
+  the two `lat …` debug lines the firmware prints on every read, which at the
+  1 s default dominate the journal on a node with a fix.
 
 The daemon needs read access to `gps_device`. USB GPS units are usually owned
 by root or the `dialout` group; the systemd service already runs with the

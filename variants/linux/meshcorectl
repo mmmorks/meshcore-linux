@@ -26,8 +26,9 @@ HISTFILE = os.path.expanduser("~/.meshcorectl_history")
 # Top-level commands (from src/helpers/CommonCLI.cpp).
 TOP = [
     "advert", "advert.zerohop", "board", "clear stats", "clkreboot", "clock",
-    "clock sync", "erase", "get", "gps", "gps advert", "gps off", "gps on",
-    "gps setloc", "gps sync", "log", "log erase", "log start", "log stop",
+    "clock sync", "erase", "get", "gps", "gps advert", "gps interval",
+    "gps off", "gps on", "gps setloc", "gps sync",
+    "log", "log erase", "log start", "log stop",
     "neighbors", "neighbor.remove", "password", "poweroff", "powersaving",
     "powersaving off", "powersaving on", "prefs", "reboot", "region",
     "sensor get", "sensor list", "sensor set", "set", "share", "shutdown",
