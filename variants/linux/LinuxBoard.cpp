@@ -315,6 +315,8 @@ int LinuxConfig::load(const char *filename) {
     else if (strcmp(key, "current_limit") == 0)  current_limit = atof(value);
     else if (strcmp(key, "dio2_as_rf_switch") == 0)  dio2_as_rf_switch = atoi(value) != 0;
     else if (strcmp(key, "rx_boosted_gain") == 0)  rx_boosted_gain = atoi(value) != 0;
+    else if (strcmp(key, "use_regulator_ldo") == 0)  use_regulator_ldo = atoi(value) != 0;
+    else if (strcmp(key, "rx_register_patch") == 0)  rx_register_patch = atoi(value) != 0;
 
     else if (strcmp(key, "lora_irq_pin") == 0)   lora_irq_pin = atoi(value);
     else if (strcmp(key, "lora_reset_pin") == 0) lora_reset_pin = atoi(value);

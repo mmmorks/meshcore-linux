@@ -31,6 +31,13 @@ public:
   bool dio2_as_rf_switch = false;
   bool rx_boosted_gain = true;
 
+  // The MCU variants pick these per board at compile time, via the
+  // SX126X_USE_REGULATOR_LDO and SX126X_REGISTER_PATCH build flags. One binary
+  // here serves every HAT, so they are runtime config instead. Defaults match
+  // the compile-time defaults: DC-DC, no patch.
+  bool use_regulator_ldo = false;
+  bool rx_register_patch = false;
+
   char* spidev = "/dev/spidev0.0";
   char* lora_gpiochip = "gpiochip0";
 

@@ -117,6 +117,8 @@ Key settings:
 | `current_limit` | `140` | Radio over-current protection limit in mA |
 | `dio2_as_rf_switch` | `0` | `1` = use DIO2 to drive the TX/RX RF switch. **Required for the Waveshare Core1262** (without it the radio inits but TX/RX are dead); depends on module wiring |
 | `rx_boosted_gain` | `1` | `1` enables the SX126x RX boosted-gain mode; `0` disables |
+| `use_regulator_ldo` | `0` | `1` powers the radio from the LDO instead of the DC-DC converter. Only for modules built without the DC-DC inductor — on a module that has one this just costs current |
+| `rx_register_patch` | `0` | `1` applies the SX126x RX-sensitivity patch (sets bit 0 of register `0x8B5`). Upstream ships it for the Heltec v4; try it if a HAT receives poorly |
 | `advert_name` | `"Linux Repeater"` | Node name, first-run default only |
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |

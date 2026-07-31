@@ -39,10 +39,12 @@ class LinuxSX1262 : public SX1262 {
       LinuxConfig config = board.config;
 
       Serial.printf("Radio begin %f %f %d %d %f\n", config.lora_freq, config.lora_bw, config.lora_sf, config.lora_cr, config.lora_tcxo);
-      int status = begin(config.lora_freq, config.lora_bw, config.lora_sf, config.lora_cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, config.lora_tx_power, SX126X_PREAMBLE_LENGTH, config.lora_tcxo);
+      MESH_DEBUG_PRINTLN("SX1262 regulator requested: %s", config.use_regulator_ldo ? "LDO" : "DC-DC");
+      int status = begin(config.lora_freq, config.lora_bw, config.lora_sf, config.lora_cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, config.lora_tx_power, SX126X_PREAMBLE_LENGTH, config.lora_tcxo, config.use_regulator_ldo);
       // if radio init fails with -707/-706, try again with tcxo voltage set to 0.0f
       if (status == RADIOLIB_ERR_SPI_CMD_FAILED || status == RADIOLIB_ERR_SPI_CMD_INVALID) {
-        status = begin(config.lora_freq, config.lora_bw, config.lora_sf, config.lora_cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, config.lora_tx_power, SX126X_PREAMBLE_LENGTH, 0.0f);
+        MESH_DEBUG_PRINTLN("SX1262 init failed with error %d, retrying with TCXO at 0.0V", status);
+        status = begin(config.lora_freq, config.lora_bw, config.lora_sf, config.lora_cr, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, config.lora_tx_power, SX126X_PREAMBLE_LENGTH, 0.0f, config.use_regulator_ldo);
       }
       if (status != RADIOLIB_ERR_NONE) {
         Serial.print("ERROR: radio init failed: ");
@@ -58,8 +60,24 @@ class LinuxSX1262 : public SX1262 {
       if (config.lora_rxen_pin != RADIOLIB_NC || config.lora_txen_pin != RADIOLIB_NC) {
         setRfSwitchPins(config.lora_rxen_pin, config.lora_txen_pin);
       }
+      applyRegisterPatch();
+
+      MESH_DEBUG_PRINTLN("SX1262 status=0x%02X device_errors=0x%04X", getStatus(), getDeviceErrors());
 
       return true;
+    }
+
+    // The 0x8B5 RX-sensitivity patch that the MCU variants apply under
+    // SX126X_REGISTER_PATCH (added there for the Heltec v4). A named method
+    // rather than an inline block in std_init() because the AGC reset has to
+    // re-apply it: the calibration in sx126xResetAGC() does not preserve it.
+    void applyRegisterPatch() {
+      if (!board.config.rx_register_patch) return;
+
+      uint8_t r_data = 0;
+      readRegister(0x8B5, &r_data, 1);
+      r_data |= 0x01;
+      writeRegister(0x8B5, &r_data, 1);
     }
 
     int16_t startReceive() override {
