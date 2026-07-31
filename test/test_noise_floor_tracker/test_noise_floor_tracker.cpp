@@ -30,107 +30,139 @@ public:
 const float NOISE_MEAN  = -110.0f;
 const float NOISE_SIGMA = 2.0f;
 
-// Feed `n` noise-only samples.
+// Samples needed to fill the ring completely: the short first sub-window plus a
+// full-length one for every remaining slot.
+const int FULL_WINDOW = NOISE_TRACKER_FIRST_SUB_SAMPLES
+                      + (NOISE_TRACKER_SUB_WINDOWS - 1) * NOISE_TRACKER_SUB_SAMPLES;
+
 void feedNoise(NoiseFloorTracker& nf, Rng& rng, int n,
                float mean = NOISE_MEAN, float sd = NOISE_SIGMA) {
   for (int i = 0; i < n; i++) nf.addSample(mean + sd * rng.normal());
 }
 
-TEST(NoiseFloorTracker, NotReadyUntilFirstSample) {
+// ---------------------------------------------------------------------------
+// Basic contract
+// ---------------------------------------------------------------------------
+
+TEST(NoiseFloorTracker, NotReadyUntilFirstSubWindowCloses) {
   NoiseFloorTracker nf;
+  Rng rng(12345);
   EXPECT_FALSE(nf.ready());
   EXPECT_EQ(0, nf.floorDbm());   // "not calibrated yet"
 
-  nf.addSample(-110.0f);
+  feedNoise(nf, rng, NOISE_TRACKER_FIRST_SUB_SAMPLES - 1);
+  EXPECT_FALSE(nf.ready()) << "must not report a floor from a partial sub-window";
+  EXPECT_EQ(0, nf.floorDbm());
+
+  nf.addSample(NOISE_MEAN);
   EXPECT_TRUE(nf.ready());
   EXPECT_NE(0, nf.floorDbm());
-}
-
-TEST(NoiseFloorTracker, SigmaHoldsAtFloorWhenSeeded) {
-  NoiseFloorTracker nf;
-  nf.addSample(-110.0f);
-  // Both quantiles seeded equal -> zero spread -> sigma must not be 0 or
-  // negative, or any threshold derived from it collapses.
-  EXPECT_FLOAT_EQ(NOISE_TRACKER_MIN_SIGMA_DB, nf.sigma());
 }
 
 TEST(NoiseFloorTracker, ConvergesToNoiseMean) {
   NoiseFloorTracker nf;
   Rng rng(12345);
-  feedNoise(nf, rng, 2000);
+  feedNoise(nf, rng, 5000);
 
-  // floorDbm() reports the estimated *mean* of the noise distribution.
-  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
+  // floorDbm() reports the estimated *mean* of the noise distribution, so the
+  // window minimum must be bias-corrected back up by BIAS_K * sigma.
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
+}
+
+TEST(NoiseFloorTracker, BiasCorrectionHoldsAcrossScales) {
+  // The bias is proportional to sigma, so one coefficient must work for every
+  // plausible noise spread. If BIAS_K were tuned to a single sigma this fails.
+  const float sigmas[] = { 0.5f, 1.0f, 2.0f, 3.0f };
+  for (int i = 0; i < 4; i++) {
+    NoiseFloorTracker nf;
+    Rng rng(900 + i);
+    feedNoise(nf, rng, 6000, NOISE_MEAN, sigmas[i]);
+    EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f + sigmas[i] * 0.5f)
+        << "bias correction wrong at sigma = " << sigmas[i];
+  }
 }
 
 TEST(NoiseFloorTracker, EstimatesScale) {
   NoiseFloorTracker nf;
   Rng rng(999);
-  feedNoise(nf, rng, 2000);
-
-  // Scale recovered from the 0.10/0.40 quantile spacing.
+  feedNoise(nf, rng, 5000);
   EXPECT_NEAR(NOISE_SIGMA, nf.sigma(), 0.8f);
 }
 
 TEST(NoiseFloorTracker, ConvergesWithinAFewSecondsOfSamples) {
   NoiseFloorTracker nf;
   Rng rng(4242);
+  // The short first sub-window exists so a fresh node is usable quickly:
   // 30 samples == 3 s at a 100 ms sampling interval.
-  feedNoise(nf, rng, 30);
+  feedNoise(nf, rng, NOISE_TRACKER_FIRST_SUB_SAMPLES);
+  ASSERT_TRUE(nf.ready());
   EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 3.0f);
 }
 
-TEST(NoiseFloorTracker, SingleStrongBurstBarelyMovesEstimate) {
+TEST(NoiseFloorTracker, ClampsAtMinDbm) {
+  NoiseFloorTracker nf;
+  for (int i = 0; i < 500; i++) nf.addSample(-125.0f);
+  EXPECT_EQ((int16_t)NOISE_TRACKER_MIN_DBM, nf.floorDbm());
+}
+
+TEST(NoiseFloorTracker, ResetDiscardsEverything) {
+  NoiseFloorTracker nf;
+  Rng rng(60606);
+  feedNoise(nf, rng, 5000);
+  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
+
+  nf.reset();
+  EXPECT_FALSE(nf.ready());
+  EXPECT_EQ(0, nf.floorDbm());
+
+  // Re-warms at the new level rather than crawling there from the old one.
+  feedNoise(nf, rng, NOISE_TRACKER_FIRST_SUB_SAMPLES, -80.0f, NOISE_SIGMA);
+  EXPECT_NEAR(-80.0f, (float)nf.floorDbm(), 3.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Robustness to signal. These are the tests the previous suite was too weak to
+// fail, and each one corresponds to something observed on live hardware.
+// ---------------------------------------------------------------------------
+
+TEST(NoiseFloorTracker, SingleStrongBurstDoesNotMoveEstimateAtAll) {
   NoiseFloorTracker nf;
   Rng rng(777);
-  feedNoise(nf, rng, 2000);
+  feedNoise(nf, rng, 5000);
   int16_t before = nf.floorDbm();
 
   nf.addSample(-50.0f);   // 60 dB above the floor
 
-  // Bounded step: one sample can move each quantile by at most STEP * p,
-  // regardless of how far away it is. An averaging estimator would take the
-  // full 60 dB excursion into its sum.
-  EXPECT_LE(abs((int)nf.floorDbm() - (int)before), 1);
+  // A minimum is not merely *resistant* to a high outlier, it is indifferent to
+  // it. The previous quantile estimator allowed 1 dB of movement here.
+  EXPECT_EQ(before, nf.floorDbm());
 }
 
-TEST(NoiseFloorTracker, SurvivesHeavyInterference) {
+TEST(NoiseFloorTracker, SurvivesHeavyDispersedInterference) {
   NoiseFloorTracker nf;
   Rng rng(2026);
-  feedNoise(nf, rng, 2000);
+  feedNoise(nf, rng, 5000);
 
-  // 20% of samples are a loud interferer. Both tracked quantiles (0.10, 0.40)
-  // remain below the 0.80 clean fraction, so neither is contaminated.
-  // For contrast, the arithmetic mean of this mixture is
-  // 0.8*(-110) + 0.2*(-60) = -100 dBm, a 10 dB error.
-  for (int i = 0; i < 4000; i++) {
+  // 20% of samples are a loud interferer. The arithmetic mean of this mixture
+  // is 0.8*(-110) + 0.2*(-60) = -100 dBm, a 10 dB error.
+  for (int i = 0; i < 6000; i++) {
     if (i % 5 == 0) nf.addSample(-60.0f);
     else            nf.addSample(NOISE_MEAN + NOISE_SIGMA * rng.normal());
   }
 
-  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 3.0f);
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
 }
 
-// Regression: dispersed contamination (above) and *runs* of contamination are
-// different problems, and only the second one broke on hardware.
-//
-// A bounded per-sample step limits what one outlier can do, but says nothing
-// about a run of them. At a 100 ms sample interval a single LoRa packet is 20+
-// consecutive samples of signal power, and during such a run the 0.40 quantile
-// climbs 4x faster than the 0.10 quantile (STEP*0.40 vs STEP*0.10). The gap
-// between them therefore widens, so a scale estimate taken straight from that
-// gap measures how far the two trackers have diverged rather than the noise
-// spread -- and floorDbm() multiplies it by 1.28.
-//
-// Deployed to a live repeater this produced a floor of -70 dBm against a true
-// floor of -114, on 27% of readings. Assert on the running maximum, not just
-// the final value: the original test suite only checked where the estimate
-// settled, which is exactly how this got through.
+// Regression: dispersed contamination and *runs* of contamination are different
+// problems, and only the second one broke on hardware. A quantile tracker has
+// essentially zero breakdown point against a run -- it just gets dragged along
+// at its maximum slew rate. A minimum ignores the run entirely, as long as the
+// window still holds one clean sub-window.
 TEST(NoiseFloorTracker, SurvivesRunsOfInterference) {
   NoiseFloorTracker nf;
   Rng rng(8080);
-  feedNoise(nf, rng, 2000);
-  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
+  feedNoise(nf, rng, 5000);
+  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
 
   int16_t worst = nf.floorDbm();
   for (int burst = 0; burst < 30; burst++) {
@@ -144,99 +176,166 @@ TEST(NoiseFloorTracker, SurvivesRunsOfInterference) {
     }
   }
 
-  // The estimate may legitimately drift up somewhat -- half these samples
-  // really are loud -- but it must not run away toward the burst level.
-  EXPECT_LT((float)worst, NOISE_MEAN + 6.0f)
-      << "floor ran away to " << worst << " dBm during runs of -70 dBm samples";
+  EXPECT_LT((float)worst, NOISE_MEAN + 1.5f)
+      << "floor moved to " << worst << " dBm during runs of -70 dBm samples";
 }
 
-TEST(NoiseFloorTracker, ScaleEstimateStaysPhysicallyPlausible) {
-  NoiseFloorTracker nf;
-  Rng rng(1234);
-  feedNoise(nf, rng, 500);
-
-  // A sustained run of strong samples makes the two quantiles diverge, since the
-  // 0.40 tracker chases 4x faster than the 0.10 tracker. sigma() must stay
-  // within a plausible receiver noise spread throughout, because floorDbm()
-  // extrapolates from it -- unbounded, this reached 31.6 dB and dragged the
-  // reported floor up by ~40 dB.
-  float worst_sigma = nf.sigma();
-  int16_t worst_floor = nf.floorDbm();
-  for (int i = 0; i < 1500; i++) {
-    nf.addSample(-70.0f);
-    if (nf.sigma() > worst_sigma) worst_sigma = nf.sigma();
-    if (nf.floorDbm() > worst_floor) worst_floor = nf.floorDbm();
-  }
-  EXPECT_LE(worst_sigma, (float)NOISE_TRACKER_MAX_SIGMA_DB + 0.01f);
-
-  // The 0.10 quantile does legitimately climb toward a genuinely louder ambient,
-  // but bounding sigma bounds how far above it the reported floor can be thrown.
-  EXPECT_LE((float)worst_floor,
-            -70.0f + 1.2816f * (float)NOISE_TRACKER_MAX_SIGMA_DB + 1.0f)
-      << "reported floor overshot the sample level itself";
-}
-
-TEST(NoiseFloorTracker, RecoversAfterInterferenceStops) {
+// The specific failure measured on a live repeater: excursions with a median
+// duration of 30 s and a maximum of 67 s, during which the previous estimator
+// crawled upward at exactly its own slew limit and reported a meaningless
+// intermediate value. The window is sized so that an excursion of this length
+// cannot contaminate every sub-window.
+TEST(NoiseFloorTracker, SurvivesSustainedInterferenceShorterThanTheWindow) {
   NoiseFloorTracker nf;
   Rng rng(31337);
-  feedNoise(nf, rng, 500);
+  feedNoise(nf, rng, 5000);
+  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
 
-  for (int i = 0; i < 2000; i++) {           // heavy interference
-    if (i % 5 == 0) nf.addSample(-60.0f);
-    else            nf.addSample(NOISE_MEAN + NOISE_SIGMA * rng.normal());
+  int16_t worst = nf.floorDbm();
+  for (int i = 0; i < 670; i++) {            // 67 s at 100 ms/sample
+    nf.addSample(-70.0f);
+    if (nf.floorDbm() > worst) worst = nf.floorDbm();
   }
-  feedNoise(nf, rng, 2000);                  // clean again
 
-  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
+  EXPECT_LT((float)worst, NOISE_MEAN + 1.5f)
+      << "a 67 s interferer moved the floor to " << worst << " dBm";
+
+  // ...and it is still correct once the interferer stops.
+  feedNoise(nf, rng, 200);
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
+}
+
+// The other side of the same boundary: interference that outlasts the entire
+// window IS the floor, and must be reported as such. Robustness must not mean
+// blindness -- a node parked next to a permanent emitter needs to know.
+TEST(NoiseFloorTracker, TracksInterferenceThatOutlastsTheWindow) {
+  NoiseFloorTracker nf;
+  Rng rng(5150);
+  feedNoise(nf, rng, 5000);
+  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
+
+  // Every sub-window in the ring must be replaced before the estimate can rise,
+  // and the scale estimate then has to re-converge on the new population, so
+  // this deliberately takes longer than one window.
+  for (int i = 0; i < FULL_WINDOW + 1500; i++) {
+    nf.addSample(-70.0f + 0.5f * rng.normal());
+  }
+  EXPECT_NEAR(-70.0f, (float)nf.floorDbm(), 2.0f);
 }
 
 TEST(NoiseFloorTracker, TracksARealFloorChange) {
   NoiseFloorTracker nf;
   Rng rng(5150);
-  feedNoise(nf, rng, 2000);
-  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
+  feedNoise(nf, rng, 5000);
+  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
 
-  // Ambient genuinely rises by 15 dB and stays there. The estimator must follow
-  // it -- being robust to bursts must not mean being blind to the environment.
-  feedNoise(nf, rng, 4000, -95.0f, NOISE_SIGMA);
-
+  // Ambient genuinely rises by 15 dB and stays there.
+  feedNoise(nf, rng, FULL_WINDOW + 500, -95.0f, NOISE_SIGMA);
   EXPECT_NEAR(-95.0f, (float)nf.floorDbm(), 1.5f);
 }
 
-TEST(NoiseFloorTracker, ClampsAtMinDbm) {
+// The estimator's asymmetry is deliberate: it must rise slowly (a high reading
+// might be signal) but fall fast (a low reading can only be noise). Rising takes
+// a full window as contaminated sub-windows age out; falling takes one
+// sub-window, a 12x difference.
+TEST(NoiseFloorTracker, FallsFastWhenTheFloorGenuinelyDrops) {
   NoiseFloorTracker nf;
-  for (int i = 0; i < 500; i++) nf.addSample(-140.0f);
-  EXPECT_EQ((int16_t)NOISE_TRACKER_MIN_DBM, nf.floorDbm());
+  Rng rng(2468);
+  feedNoise(nf, rng, 5000, -95.0f, NOISE_SIGMA);
+  ASSERT_NEAR(-95.0f, (float)nf.floorDbm(), 1.5f);
+
+  // 30 samples == 3 s. Most of the 15 dB drop must already be reflected, which
+  // is why the in-progress sub-window counts toward the window statistic rather
+  // than only being read once it closes. It is not yet exact: the estimate is
+  // drawn from few samples of the new level, so the bias correction -- sized for
+  // a full window -- still over-corrects slightly.
+  feedNoise(nf, rng, 30, NOISE_MEAN, NOISE_SIGMA);
+  EXPECT_LT((float)nf.floorDbm(), -105.0f);
+
+  // One full sub-window in, it is converged.
+  feedNoise(nf, rng, NOISE_TRACKER_SUB_SAMPLES, NOISE_MEAN, NOISE_SIGMA);
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 2.0f);
 }
 
-TEST(NoiseFloorTracker, KeepsQuantilesOrdered) {
+// ---------------------------------------------------------------------------
+// Weaknesses specific to a minimum-based estimator. These bound them rather
+// than pretend they are absent.
+// ---------------------------------------------------------------------------
+
+TEST(NoiseFloorTracker, ImplausiblyLowReadingIsDiscarded) {
   NoiseFloorTracker nf;
-  nf.addSample(-110.0f);          // seeds q10 == q40 == -110
+  Rng rng(1357);
+  feedNoise(nf, rng, 5000);
+  int16_t before = nf.floorDbm();
 
-  // One low sample opens a gap: q10 -= 0.18, q40 -= 0.12.
-  nf.addSample(-120.0f);
-  // A sample landing *between* the two quantiles closes the gap from both
-  // sides (q10 += 0.02, q40 -= 0.12) and can invert their order. sigma() would
-  // go negative without the clamp in addSample().
-  for (int i = 0; i < 10; i++) nf.addSample(-110.15f);
+  nf.addSample(-200.0f);   // a bad SPI read, not a quiet channel
 
-  EXPECT_GE(nf.sigma(), (float)NOISE_TRACKER_MIN_SIGMA_DB);
-  EXPECT_LE(nf.floorDbm(), 0);    // still a plausible dBm, not NaN-derived
+  // Without the input guard this would pin the window minimum for a full 180 s,
+  // and clamping the output at MIN_DBM would disguise it as a plausible floor.
+  EXPECT_EQ(before, nf.floorDbm());
 }
 
-TEST(NoiseFloorTracker, ResetReseedsAtNewLevel) {
+TEST(NoiseFloorTracker, WorstCaseValidLowReadingHasNoEffect) {
   NoiseFloorTracker nf;
-  Rng rng(60606);
-  feedNoise(nf, rng, 2000);
-  ASSERT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.5f);
+  Rng rng(2469);
+  feedNoise(nf, rng, 5000);
+  int16_t before = nf.floorDbm();
 
-  nf.reset();
-  EXPECT_FALSE(nf.ready());
-  EXPECT_EQ(0, nf.floorDbm());
+  // The lowest reading the input guard still accepts, 25 dB below the floor.
+  // Tracking the *second* smallest of each sub-window rather than the smallest
+  // makes an isolated low sample irrelevant: it becomes the first smallest and
+  // is never the value stored. This is the whole reason for the order
+  // statistic -- a plain minimum would have taken the full 25 dB and held it
+  // for a 180 s window.
+  nf.addSample(NOISE_TRACKER_MIN_VALID_DBM);
+  EXPECT_EQ(before, nf.floorDbm());
 
-  // Re-seeds at the new level rather than crawling there from the old one.
-  feedNoise(nf, rng, 30, -80.0f, NOISE_SIGMA);
-  EXPECT_NEAR(-80.0f, (float)nf.floorDbm(), 3.0f);
+  // Two in the same sub-window can move it, but it still ages out.
+  nf.addSample(NOISE_TRACKER_MIN_VALID_DBM);
+  feedNoise(nf, rng, FULL_WINDOW + 400);
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Scale estimate
+// ---------------------------------------------------------------------------
+
+TEST(NoiseFloorTracker, SigmaHoldsAtFloorBeforeAnyData) {
+  NoiseFloorTracker nf;
+  EXPECT_FLOAT_EQ(NOISE_TRACKER_MIN_SIGMA_DB, nf.sigma());
+}
+
+// Regression: sigma used to be taken from the gap between two quantile
+// trackers, which under a sustained run measured how far the two had diverged
+// rather than the noise spread. Unbounded it reached 31.6 dB in test and drove
+// a live repeater's reported floor from -114 dBm to -70. It is now measured
+// only from samples near the floor, so signal cannot enter it at all.
+TEST(NoiseFloorTracker, SigmaIsUnaffectedByASustainedInterferer) {
+  NoiseFloorTracker nf;
+  Rng rng(1234);
+  feedNoise(nf, rng, 5000);
+  float quiet_sigma = nf.sigma();
+  ASSERT_NEAR(NOISE_SIGMA, quiet_sigma, 0.8f);
+
+  float worst = quiet_sigma;
+  for (int i = 0; i < 1500; i++) {
+    nf.addSample(-70.0f);
+    if (nf.sigma() > worst) worst = nf.sigma();
+  }
+  EXPECT_NEAR(quiet_sigma, worst, 0.3f)
+      << "interference widened the estimated noise spread to " << worst << " dB";
+}
+
+TEST(NoiseFloorTracker, SigmaStaysWithinPhysicalBounds) {
+  NoiseFloorTracker nf;
+  Rng rng(4321);
+  // Wildly over-dispersed input: sigma must still report something a receiver
+  // could plausibly have, because the reported floor extrapolates from it.
+  for (int i = 0; i < 5000; i++) {
+    nf.addSample(NOISE_MEAN + 40.0f * rng.normal());
+  }
+  EXPECT_LE(nf.sigma(), (float)NOISE_TRACKER_MAX_SIGMA_DB + 0.01f);
+  EXPECT_GE(nf.sigma(), (float)NOISE_TRACKER_MIN_SIGMA_DB - 0.01f);
 }
 
 }  // namespace

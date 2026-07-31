@@ -7,158 +7,270 @@
 // a link error on the C++11/14 toolchains some MeshCore targets build with.
 // Each is overridable per-platform via build_flags.
 
-#ifndef NOISE_TRACKER_STEP_DB
-  // dB the estimate moves per sample. Larger tracks faster and jitters more.
-  // At 0.2, a freshly seeded estimate descends toward the true 0.10 quantile at
-  // ~0.08 dB/sample, so it is usable within ~3 s at a 100 ms sample interval --
-  // comparable to the ~2.5 s the 64-sample batch estimator took.
-  #define NOISE_TRACKER_STEP_DB  0.2f
+#ifndef NOISE_TRACKER_SUB_SAMPLES
+  // Samples per sub-window (15 s at a 100 ms sample interval). This is the
+  // resolution at which the estimate can rise when the floor genuinely rises.
+  #define NOISE_TRACKER_SUB_SAMPLES  150
+#endif
+
+#ifndef NOISE_TRACKER_FIRST_SUB_SAMPLES
+  // The first sub-window is short so a fresh node has a usable floor in ~3 s
+  // rather than 15 s. It lands in the ring alongside full-length sub-windows;
+  // a minimum over fewer samples is biased high, and since the window estimate
+  // takes the minimum across the ring, a high entry is simply never selected.
+  #define NOISE_TRACKER_FIRST_SUB_SAMPLES  30
+#endif
+
+#ifndef NOISE_TRACKER_SUB_WINDOWS
+  // Ring depth. Total window = SUB_WINDOWS * SUB_SAMPLES = 1800 samples = 180 s.
+  // This is the estimator's robustness budget: any interference burst shorter
+  // than the window leaves clean samples in it. Sized against measurement --
+  // the longest excursion observed on a live repeater over 20 h was 67 s, so
+  // 180 s carries ~2.7x margin. Costs one float each.
+  #define NOISE_TRACKER_SUB_WINDOWS  12
 #endif
 
 #ifndef NOISE_TRACKER_MIN_SIGMA_DB
-  // Scale floor. Stops a freshly seeded tracker (where both quantiles start
-  // equal) from reporting a zero-width noise distribution, which would collapse
-  // any threshold derived from sigma().
+  // Scale floor. Stops a freshly seeded tracker from reporting a zero-width
+  // noise distribution, which would collapse any threshold derived from sigma().
   #define NOISE_TRACKER_MIN_SIGMA_DB  0.5f
 #endif
 
 #ifndef NOISE_TRACKER_MAX_SIGMA_DB
   // Scale ceiling. Receiver noise spread is set by bandwidth, temperature and
-  // LNA gain state; measured on an SX1262 at 250 kHz it sits around 0.5-0.9 dB,
-  // so 3 dB is generous headroom and anything beyond it is not a noise spread.
-  // This bounds how far floorDbm() can extrapolate above the 0.10 quantile.
+  // LNA gain state; measured on a live SX1262 at 250 kHz the median sits at
+  // 0.6-0.9 dB, so 3 dB is generous headroom and anything beyond it is not a
+  // noise spread.
   #define NOISE_TRACKER_MAX_SIGMA_DB  3.0f
 #endif
 
 #ifndef NOISE_TRACKER_SIGMA_LAMBDA
   // EMA rate for the scale estimate (~50-sample time constant, 5 s at 100 ms
   // sampling). Slow on purpose: the spread physically changes far more slowly
-  // than the mean, so a transient divergence between the two quantiles must not
-  // be mistaken for the channel getting noisier.
+  // than the mean.
   #define NOISE_TRACKER_SIGMA_LAMBDA  0.02f
 #endif
 
+#ifndef NOISE_TRACKER_SIGMA_GATE_DB
+  // Samples above floor + max(this, 4*sigma) are excluded from the scale
+  // estimate. Signal energy must not widen the estimated noise spread, and at
+  // >=4 sigma the censoring bias on genuine noise samples is negligible.
+  #define NOISE_TRACKER_SIGMA_GATE_DB  6.0f
+#endif
+
 #ifndef NOISE_TRACKER_MIN_DBM
-  // Same clamp the previous estimator applied: below this is not physically
-  // plausible for these receivers and indicates a bad RSSI read.
+  // Same clamp the original estimator applied: below this is not physically
+  // plausible for these receivers.
   #define NOISE_TRACKER_MIN_DBM  (-120)
+#endif
+
+#ifndef NOISE_TRACKER_MIN_VALID_DBM
+  // Readings below this are discarded as bad reads rather than clamped. The
+  // output clamp alone is not enough protection for a minimum-based estimator:
+  // one spurious -200 dBm read would pin the window minimum for a full 180 s,
+  // and clamping the *output* to MIN_DBM would hide that as a plausible-looking
+  // stuck floor.
+  #define NOISE_TRACKER_MIN_VALID_DBM  (-135.0f)
+#endif
+
+// Bias correction, indexed by how many sub-windows have completed (1..N).
+//
+// The k-th smallest of a window sits below the distribution mean, so it must be
+// corrected back up: mean ~= window_value + k * sigma. The coefficient depends
+// only on how many samples were minimised over -- it is independent of sigma,
+// as it must be, since the bias is proportional to it.
+//
+// Determined by simulating this exact algorithm rather than from the asymptotic
+// extreme-value formula, which is not accurate at these window sizes. Indexing
+// by occupancy rather than using one constant matters during warm-up: a partly
+// filled ring has been minimised over fewer samples, so its value is closer to
+// the mean, and applying the full-window coefficient would over-correct by up
+// to 0.9 dB at sigma = 2. That error reads *high*, which is the direction that
+// loses detections, so it is worth a 12-entry table to remove.
+#ifndef NOISE_TRACKER_BIAS_TABLE
+  #define NOISE_TRACKER_BIAS_TABLE { \
+    2.375f, 2.502f, 2.579f, 2.632f, 2.674f, 2.708f, \
+    2.737f, 2.761f, 2.783f, 2.802f, 2.819f, 2.835f }
 #endif
 
 /**
  * \brief  Robust noise-floor estimator for a stream of RSSI readings.
  *
- * Tracks two low quantiles of the observed RSSI distribution by stochastic
- * approximation (Robbins-Monro on the pinball loss), yielding both a location
- * and a scale estimate for the noise-only part of the signal.
+ * Estimates the noise floor from a low order statistic of the RSSI readings
+ * over a sliding window, bias-corrected back to the distribution mean (Martin's
+ * minimum statistics, IEEE Trans. Speech & Audio Processing, 2001).
  *
- * Why quantiles rather than an average: every sample that contains signal is an
- * outlier, and outliers bias an average upward -- which raises any
- * busy-channel threshold derived from it and loses detections, the expensive
- * error. An average has a breakdown point of 1/N, so a single strong burst
- * corrupts the estimate. Here each update moves the estimate by at most
- * NOISE_TRACKER_STEP_DB no matter how distant the sample, so bursts cannot drag
- * it. That bounded step IS the robustness argument -- do not "improve" it into
- * a step proportional to the residual.
+ * The method rests on one asymmetry that holds for any radio: signal only ever
+ * ADDS power. The lowest readings in a window are therefore noise-only samples
+ * by construction -- no activity gate, no outlier rejection, and no assumption
+ * that interference is a minority of the samples.
  *
- * Both tracked quantiles (0.10 and 0.40) sit below any plausible channel
- * occupancy, so neither is reachable by signal energy. That is what removes the
- * need for a transmit/receive activity gate to keep the samples clean, and with
- * it the selection bias such a gate imposes.
+ * The statistic is the SECOND smallest reading of each sub-window, not the
+ * smallest. That single step is what makes the method safe here: the minimum is
+ * by construction the most outlier-sensitive statistic there is, so one spurious
+ * low reading would pin the floor for a whole window. The second smallest is
+ * indifferent to any isolated low sample while being no more reachable by signal
+ * than the first. It also lets the estimator work on raw readings -- an earlier
+ * revision pre-smoothed with an EMA to blunt low outliers, which cost 4.7 dB of
+ * upward bias under 20% dispersed interference because the smoothed sequence
+ * never settled to the true floor between bursts.
+ *
+ * That last point is why this replaced a quantile tracker. Quantile estimators
+ * are robust to *contamination* (a minority of samples drawn from another
+ * distribution) but have essentially zero breakdown point against *runs*: a
+ * sustained interferer simply drags the estimate along at its maximum slew
+ * rate. On a live repeater this produced hour-long stretches reporting a value
+ * that was neither the noise floor nor the interference level, only how far the
+ * tracker had crawled. Minimum statistics does not chase -- it selects -- so
+ * its breakdown point against a run is (U-1)/U of the window length.
+ *
+ * The estimate falls instantly when the floor genuinely falls, and rises only
+ * as contaminated sub-windows age out. That asymmetry is deliberate and is the
+ * correct one for a noise floor: real increases are rare and slow, spurious
+ * ones are common and fast. Reading low is also the safe direction -- it makes
+ * a busy-channel check fire slightly early (absorbed by CSMA backoff) rather
+ * than late (a lost detection, the expensive error).
  *
  * Deliberately free of any clock, radio, or Arduino dependency: the caller
  * decides when to sample, which keeps the estimator unit-testable on the host
- * and keeps its behaviour independent of how often the main loop happens to
- * run.
+ * and its behaviour independent of how often the main loop happens to run.
  */
 class NoiseFloorTracker {
-  float _q10;
-  float _q40;
-  float _sigma;
-  bool  _init;
+  float    _lo0, _lo1;                           // two smallest of current sub-window
+  uint16_t _sub_count;                           // samples into current sub-window
+  uint16_t _sub_target;                          // samples needed to close it
+  float    _mins[NOISE_TRACKER_SUB_WINDOWS];     // ring of completed sub-window statistics
+  uint8_t  _head;                                // next ring slot to write
+  uint8_t  _valid;                               // completed sub-windows, saturating at ring size
+  float    _dev;                                 // mean excess of noise samples over windowValue()
+  float    _sigma;
+
+  // Sentinel for "no sample yet". Any real dBm reading is far below it, so
+  // comparisons need no special case.
+  static float sentinel() { return 1.0e30f; }
+
+  /** Bias coefficient for the current ring occupancy (_valid >= 1). */
+  float biasK() const {
+    static const float k[NOISE_TRACKER_SUB_WINDOWS] = NOISE_TRACKER_BIAS_TABLE;
+    uint8_t i = _valid > 0 ? (uint8_t)(_valid - 1) : 0;
+    if (i >= NOISE_TRACKER_SUB_WINDOWS) i = NOISE_TRACKER_SUB_WINDOWS - 1;
+    return k[i];
+  }
+
+  /** Lowest sub-window statistic across the window, including the in-progress
+      sub-window so a genuine drop in the floor starts showing immediately
+      rather than waiting for that sub-window to close. */
+  float windowValue() const {
+    float m = sentinel();
+    for (uint8_t i = 0; i < _valid; i++) {
+      if (_mins[i] < m) m = _mins[i];
+    }
+    if (_lo1 < m) m = _lo1;   // sentinel until the in-progress window has 2 samples
+    return m;
+  }
+
+  /** Bias-corrected floor as a float. Undefined before the first sub-window. */
+  float floorEstimate() const {
+    return windowValue() + biasK() * _sigma;
+  }
 
 public:
-  NoiseFloorTracker()
-    : _q10(0.0f), _q40(0.0f), _sigma(NOISE_TRACKER_MIN_SIGMA_DB), _init(false) { }
+  NoiseFloorTracker() { reset(); }
 
-  /** Discard all state; the next sample re-seeds. */
-  void reset() { _init = false; }
+  /** Discard all state; the estimator re-warms from the next sample. */
+  void reset() {
+    _lo0 = _lo1 = sentinel();
+    _sub_count = 0;
+    _sub_target = NOISE_TRACKER_FIRST_SUB_SAMPLES;
+    _head = 0;
+    _valid = 0;
+    _sigma = NOISE_TRACKER_MIN_SIGMA_DB;
+    _dev = NOISE_TRACKER_MIN_SIGMA_DB * biasK();   // consistent with _sigma; needs _valid set
+    for (uint8_t i = 0; i < NOISE_TRACKER_SUB_WINDOWS; i++) _mins[i] = sentinel();
+  }
 
-  /** True once at least one sample has been taken since construction/reset. */
-  bool ready() const { return _init; }
+  /** True once at least one sub-window has closed and floorDbm() is meaningful. */
+  bool ready() const { return _valid > 0; }
 
   /**
-   * Feed one RSSI reading, in dBm. Call at a steady rate -- the estimator's
-   * time constants are expressed in samples, so a varying rate varies them.
+   * Feed one RSSI reading, in dBm. Call at a steady rate -- the window length
+   * is expressed in samples, so a varying rate varies the time it spans.
+   *
+   * Safe to call during packet reception. Samples that contain signal only
+   * raise the sequence, and a low order statistic ignores them; that is what
+   * removed the activity gate this estimator used to need, and with it the bias
+   * toward quiet moments the gate imposed.
    */
   void addSample(float rssi_dbm) {
-    if (!_init) {
-      // Seed both quantiles at the first reading. sigma() holds at its floor
-      // until they separate, so the reported floor is up to ~0.6 dB high for
-      // the first few samples.
-      _q10 = _q40 = rssi_dbm;
-      _sigma = NOISE_TRACKER_MIN_SIGMA_DB;
-      _init = true;
-      return;
+    if (rssi_dbm < NOISE_TRACKER_MIN_VALID_DBM) return;   // bad read, not a quiet channel
+
+    // Keep the two smallest readings of this sub-window, _lo0 <= _lo1.
+    if (rssi_dbm < _lo0)      { _lo1 = _lo0; _lo0 = rssi_dbm; }
+    else if (rssi_dbm < _lo1) { _lo1 = rssi_dbm; }
+
+    if (++_sub_count >= _sub_target) {
+      _mins[_head] = _lo1;
+      _head = (uint8_t)((_head + 1) % NOISE_TRACKER_SUB_WINDOWS);
+      if (_valid < NOISE_TRACKER_SUB_WINDOWS) _valid++;
+      _lo0 = _lo1 = sentinel();
+      _sub_count = 0;
+      _sub_target = NOISE_TRACKER_SUB_SAMPLES;   // only the first one is short
     }
 
-    // Robbins-Monro quantile update: theta += step * (p - 1{x <= theta}).
-    // Equilibrium is where P(x <= theta) == p.
-    _q10 += (rssi_dbm > _q10) ?  NOISE_TRACKER_STEP_DB * 0.10f
-                              : -NOISE_TRACKER_STEP_DB * 0.90f;
-    _q40 += (rssi_dbm > _q40) ?  NOISE_TRACKER_STEP_DB * 0.40f
-                              : -NOISE_TRACKER_STEP_DB * 0.60f;
-
-    // The two trackers are independent, so a transient can momentarily invert
-    // them. sigma() would go negative; keep them ordered instead.
-    if (_q40 < _q10) _q40 = _q10;
-
-    // Scale estimate: clamp the raw quantile gap, then adapt to it slowly.
-    //
-    // Taking the gap directly is wrong, and wrong in a way that bites hard. The
-    // two quantiles converge at different speeds by construction (the 0.40
-    // tracker rises 4x faster than the 0.10 tracker), so while both are chasing
-    // a moving ambient level the gap between them measures their differential
-    // lag, not the noise spread. Since floorDbm() extrapolates from it with a
-    // 1.28 multiplier, a sustained run of strong samples inflated the raw gap to
-    // >31 dB in test and drove a live repeater's reported floor from -114 dBm to
-    // -70. Physically the spread cannot do that: it is set by receiver
-    // bandwidth, temperature and LNA gain state, all of which move far more
-    // slowly than the mean. So bound it, and let it adapt on a slow time
-    // constant that a transient cannot outrun.
-    float raw = (_q40 - _q10) / 1.0283f;   // Phi^-1(0.40) - Phi^-1(0.10)
-    if (raw > NOISE_TRACKER_MAX_SIGMA_DB) raw = NOISE_TRACKER_MAX_SIGMA_DB;
-    if (raw < NOISE_TRACKER_MIN_SIGMA_DB) raw = NOISE_TRACKER_MIN_SIGMA_DB;
-    _sigma += NOISE_TRACKER_SIGMA_LAMBDA * (raw - _sigma);
+    updateScale(rssi_dbm);
   }
 
   /**
    * \returns  estimated standard deviation (dB) of the noise-only RSSI, always
    *           within [NOISE_TRACKER_MIN_SIGMA_DB, NOISE_TRACKER_MAX_SIGMA_DB].
    *
-   * Derived from the spacing of two *lower* quantiles -- both below any
-   * plausible channel occupancy, so a busy channel cannot inflate it -- then
-   * bounded and slewed in addSample(). See the comment there for why the raw
-   * gap must not be used directly.
+   * Measured as the mean amount by which noise samples exceed the window
+   * statistic. That gap is exactly what the bias table predicts -- biasK() *
+   * sigma -- so dividing by biasK() inverts it. Samples well above the floor
+   * are censored out, so channel occupancy cannot widen it.
+   *
+   * Anchoring to windowValue() rather than to the floor estimate is deliberate.
+   * The floor is derived from sigma, so measuring spread about it closes a
+   * positive feedback loop: a floor reading Delta too high makes the mean
+   * deviation ~Delta, which inflates sigma, which raises the floor further. It
+   * is bounded by MAX_SIGMA rather than divergent, but it degrades exactly when
+   * the estimate is already in transition. windowValue() is sigma-independent,
+   * so no such loop exists.
    */
-  float sigma() const {
-    if (!_init) return (float) NOISE_TRACKER_MIN_SIGMA_DB;
-    return _sigma;
-  }
+  float sigma() const { return _sigma; }
 
   /**
    * \returns  estimated *mean* noise floor in whole dBm, clamped at
-   *           NOISE_TRACKER_MIN_DBM, or 0 before the first sample.
+   *           NOISE_TRACKER_MIN_DBM, or 0 before the first sub-window closes.
    *
-   * The mean rather than the raw 0.10 quantile, so the reported value stays
-   * comparable with the trimmed-mean estimator this replaced (and therefore
-   * with other MeshCore nodes and historical telemetry). Since
-   * q10 == mean - 1.2816 sigma, the mean is recovered by adding it back.
+   * The mean rather than the raw window statistic, so the reported value stays
+   * comparable with the estimators this replaced (and therefore with other
+   * MeshCore nodes and historical telemetry).
    */
   int16_t floorDbm() const {
-    if (!_init) return 0;   // "not calibrated yet", as the previous estimator reported
-    float mean = _q10 + 1.2816f * sigma();
+    if (_valid == 0) return 0;   // "not calibrated yet", as previous estimators reported
+    float f = floorEstimate();
     // Round half away from zero without pulling in libm.
-    int v = (int) (mean < 0.0f ? mean - 0.5f : mean + 0.5f);
+    int v = (int) (f < 0.0f ? f - 0.5f : f + 0.5f);
     return v < NOISE_TRACKER_MIN_DBM ? (int16_t) NOISE_TRACKER_MIN_DBM : (int16_t) v;
+  }
+
+private:
+  /** Update the scale estimate from samples that are plausibly noise-only. */
+  void updateScale(float rssi_dbm) {
+    if (_valid == 0) return;    // no window statistic to measure against yet
+
+    float gate = NOISE_TRACKER_SIGMA_GATE_DB;
+    if (4.0f * _sigma > gate) gate = 4.0f * _sigma;
+    if (rssi_dbm >= floorEstimate() + gate) return;   // signal or interferer, not noise
+
+    float d = rssi_dbm - windowValue();
+    if (d < 0.0f) d = 0.0f;     // below the window statistic only by sampling noise
+    _dev += NOISE_TRACKER_SIGMA_LAMBDA * (d - _dev);
+
+    float s = _dev / biasK();
+    if (s > NOISE_TRACKER_MAX_SIGMA_DB) s = NOISE_TRACKER_MAX_SIGMA_DB;
+    if (s < NOISE_TRACKER_MIN_SIGMA_DB) s = NOISE_TRACKER_MIN_SIGMA_DB;
+    _sigma = s;
   }
 };
