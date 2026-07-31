@@ -102,15 +102,23 @@ void RadioLibWrapper::resetAGC() {
   doResetAGC();
   state = STATE_IDLE;   // trigger a startReceive()
 
-  // Re-seed the noise floor estimate: the analog frontend just changed, so
-  // everything learned before it is about a different receiver.
+  // Deliberately does NOT reset the noise floor estimate.
   //
-  // (This used to also work around a self-reinforcing stuck floor: the old
-  // estimator only accepted samples below `floor + 14`, so a floor stuck at
-  // -120 rejected every normal ~-105 sample forever. NoiseFloorTracker has no
-  // estimate-dependent acceptance test, so that failure mode is gone.)
-  _noise_floor = 0;
-  _nf.reset();
+  // It used to, on the reasoning that the analog frontend had just changed so
+  // everything learned before it was about a different receiver. Measured on a
+  // live repeater that was strictly harmful: reset() re-seeds from a single
+  // sample, and the guard meant to keep that sample clean cannot do its job
+  // here. resetAGC() has just been through sleep() -> startReceive(), which
+  // clears the modem's IRQ flags, so a packet already in the air is joined
+  // mid-symbol -- its preamble and header are long past and neither will ever
+  // set again for that packet. isReceivingPacket() therefore reports "idle"
+  // precisely when it is most wrong, and stays wrong for the rest of the
+  // packet. 20 of 257 re-seeds over 20 h landed on signal that way, throwing
+  // the reported floor to -85..-95 dBm against a true floor of -114.
+  //
+  // Nothing is lost by keeping the estimate: an AGC reset does not move the
+  // noise floor by anything like the estimator's tracking range, and if it
+  // genuinely did, the estimator follows real floor changes on its own.
 }
 
 void RadioLibWrapper::loop() {
@@ -130,21 +138,22 @@ void RadioLibWrapper::loop() {
     _next_noise_sample = now + NOISE_SAMPLE_INTERVAL_MS;
   }
 
-  // Skip samples taken while the modem is demodulating: RSSI then reports the
-  // strength of the signal being received, not the noise under it, and no
-  // estimator can be robust to that because it is not contamination -- it is a
-  // different quantity. At this sample rate a single LoRa packet is 20+
-  // consecutive readings, so these arrive in runs long enough for the two
-  // quantile trackers to chase them, which is precisely how a live repeater
-  // ended up reporting -70 dBm against a true floor of -114.
+  // Sampled unconditionally, including mid-packet. NoiseFloorTracker estimates
+  // the floor as a window minimum, and signal only ever adds power, so readings
+  // taken during reception are discarded by construction rather than needing to
+  // be gated out. Two things go away with the gate:
   //
-  // This does bias the sample population toward quieter moments. That bias is
-  // real but second order, and far preferable to averaging in signal power.
-  // Unlike the batch estimator this replaced, a skipped sample no longer
-  // extends a measurement window -- the next sample simply comes 100 ms later
-  // regardless -- so the bias no longer compounds into an unbounded stall.
-  if (isReceivingPacket()) return;
-
+  //  - the selection bias it imposed, by restricting the sample population to
+  //    moments the modem considered quiet;
+  //  - a dependency on isReceivingPacket(), which is not a pure read. It drives
+  //    a timeout state machine and calls clearIrqFlags(), so polling it at
+  //    10 Hz from the noise sampler would have this path participating in
+  //    packet detection. Sampling the noise floor must not perturb reception.
+  //
+  // The gate was also a liability in its own right: before the IRQ-timeout fix
+  // in CustomSX1262::isReceiving(), a latched PREAMBLE_DETECTED that never
+  // completed into a packet held it true until the next startReceive(),
+  // silently suspending noise sampling for seconds at a time.
   _nf.addSample(getCurrentRSSI());
   _noise_floor = _nf.floorDbm();
 
