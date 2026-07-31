@@ -13,6 +13,9 @@ public:
     ((LinuxSX1262 *)_radio)->setBandwidth(bw);
     ((LinuxSX1262 *)_radio)->setCodingRate(cr);
     updatePreamble(sf);
+    PacketMillis pm = calcMaxPacketMillis(sf, bw, cr, preambleLengthForSF(sf));
+    ((LinuxSX1262 *)_radio)->setPreambleMillis(pm.preambleMillis);
+    ((LinuxSX1262 *)_radio)->setMaxPayloadMillis(pm.payloadMillis);
   }
 
   bool isReceivingPacket() override {
