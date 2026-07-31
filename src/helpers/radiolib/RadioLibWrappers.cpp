@@ -310,7 +310,7 @@ float RadioLibWrapper::packetScoreInt(float snr, int sf, int packet_len) {
 
 PacketMillis RadioLibWrapper::calcMaxPacketMillis(uint8_t sf, float bw, uint8_t cr, uint8_t preambleSymbols) {
   // based on RadioLib's calculateTimeOnAir()
-  uint32_t tsym_us = ((uint32_t)10000 << sf) / (bw * 10);
+  uint32_t tsym_us = symbolMicros(sf, bw);
   uint32_t sfCoeff1_x4 = (sf == 5 || sf == 6) ? 25 : 17; // 6.25 : 4.25, semtech magic numbers to account for sync word + sfd
 
   // preamble + syncword + sfd + header

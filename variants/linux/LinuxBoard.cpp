@@ -12,6 +12,7 @@
 #include "LinuxBoard.h"
 #include "LinuxConsole.h"
 #include "LinuxEventLoop.h"
+#include "LinuxRadioWait.h"
 #include "AppInfo.h"
 
 const char *ardulinuxAppName        = "meshcored";
@@ -216,6 +217,36 @@ void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   if (config.lora_irq_pin != RADIOLIB_NC) digitalRead(config.lora_irq_pin);
 
   EventLoop.wait(timeout_ms);
+}
+
+namespace {
+
+// Samples the LoRa IRQ line for waitForIrqAsserted().
+//
+// digitalRead() rather than a bare level read, and that is deliberate: in
+// ardulinux it runs GPIOPin::readPin() -> refreshState(), which reads the
+// hardware, updates the cached level and fires the attached ISR on the
+// configured edge. Sampling the line here therefore also keeps that cache
+// coherent while the main loop is parked inside a scan, for exactly the reason
+// idleUntilEvent() reads the pin before blocking.
+class RadioIrqLevel : public LinuxIrqLevel {
+public:
+  explicit RadioIrqLevel(uint32_t pin) : _pin(pin) { }
+  bool irqAsserted() override { return digitalRead(_pin) == HIGH; }
+
+private:
+  uint32_t _pin;
+};
+
+}  // namespace
+
+bool LinuxBoard::waitForRadioIrq(uint32_t timeout_ms) {
+  // Nothing to wait on. Callers read the operation's result over SPI anyway, so
+  // this costs them the wait, not the answer.
+  if (config.lora_irq_pin == RADIOLIB_NC) return false;
+
+  RadioIrqLevel level(config.lora_irq_pin);
+  return waitForIrqAsserted(level, irqEventSource(), EventLoop, timeout_ms);
 }
 
 void trim(char *str) {

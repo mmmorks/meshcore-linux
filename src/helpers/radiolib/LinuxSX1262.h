@@ -2,6 +2,10 @@
 
 #include <RadioLib.h>
 #include "MeshCore.h"
+// For the LinuxBoard definition behind `board` below. Reached transitively via
+// target.h today, but named here so this header does not depend on include
+// order -- LinuxSX1262Wrapper.h calls methods on it.
+#include "LinuxBoard.h"
 
 #define SX126X_PREAMBLE_LENGTH 16
 

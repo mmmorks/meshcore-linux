@@ -241,6 +241,49 @@ timeout polling for the rest of the run (higher CPU, still correct). It is
 not expected in normal operation; if you see it, it is worth reporting along
 with the `(...)` errno text and your libgpiod/kernel version.
 
+### Channel Activity Detection (`set cad on`)
+
+Off by default. When enabled, the radio runs a hardware CAD scan immediately
+before each transmit and defers if it detects a LoRa signal.
+
+```
+set cad on      # or: set cad off
+get cad
+```
+
+The change takes effect within 2 seconds — no restart needed.
+
+CAD complements `int.thresh` rather than replacing it, and either, both, or
+neither may be active:
+
+- **`int.thresh`** compares RSSI against the measured noise floor. It sees any
+  energy, including non-LoRa interference, but cannot see a signal below the
+  noise floor.
+- **`cad`** correlates against the LoRa preamble, so it detects a real LoRa
+  transmission *below* the noise floor where RSSI is blind — but ignores
+  non-LoRa energy entirely.
+
+Enabling `int.thresh` alongside `cad` also reduces how often the scan runs: the
+RSSI check is evaluated first, and a busy verdict there skips the scan.
+
+**On Linux the scan does not spin.** RadioLib's own `scanChannel()` busy-waits
+on the DIO1 line with no timeout, which would burn a core for the length of
+every scan and — because `EventGPIOPin` deliberately reads LOW when a GPIO read
+fails — would turn a degraded line into a hung daemon. This variant instead
+sleeps on the IRQ edge descriptor with a deadline derived from the active SF and
+bandwidth, then reads the result over SPI regardless of whether the line
+reported. A line that stops reporting costs latency and a log line, not
+correctness.
+
+**Cost at high spreading factors.** A CAD scan takes about four symbol times,
+which grows quickly with SF: roughly 20 ms at SF8/62.5 kHz, but around 265 ms at
+SF12/62.5 kHz. Transmit attempts retry every 200 ms while the channel reads
+busy, so at SF12 a node holding a queued packet on a contended channel spends
+over half of that window inside a scan — and the modem is in standby, **not
+listening**, for the duration. That is inherent to CAD-before-TX rather than
+specific to this implementation, but it is worth knowing before enabling it on a
+high-SF preset.
+
 ### 5. Reconfiguring after first run
 
 Node name, password, and location can be changed via the serial CLI after first boot:

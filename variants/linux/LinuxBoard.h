@@ -82,6 +82,16 @@ public:
   // LinuxBoard.cpp; see variants/linux/LinuxEventLoop.h for the poll wrapper.
   void idleUntilEvent(uint32_t max_wait_ms) override;
 
+  // Sleep until the LoRa IRQ line goes high or timeout_ms elapses, returning
+  // true if it went high. The narrow sibling of idleUntilEvent(): same event
+  // source, same fallback, but it watches only the radio and is driven by a
+  // caller that has just armed a specific operation and needs its completion.
+  //
+  // Used for hardware CAD, where RadioLib's own scanChannel() would otherwise
+  // busy-spin on the line with no deadline. Returns false immediately when no
+  // IRQ pin is configured; the caller reads the result over SPI either way.
+  bool waitForRadioIrq(uint32_t timeout_ms);
+
   // Wake-up source for the Linux event loop (the LoRa IRQ line), or NULL when
   // edge detection is unavailable. Typed as the abstract interface so this
   // header stays free of any libgpiod dependency.
