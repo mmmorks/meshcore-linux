@@ -37,7 +37,7 @@ MicroNMEALocationProvider gps_location(gps_serial, &rtc_clock, -1, -1, NULL);
 EnvironmentSensorManager sensors(gps_location);
 
 bool linux_gps_present() {
-  return gps_serial.isOpen();
+  return gps_serial.isPresent();
 }
 
 #ifdef DISPLAY_CLASS
@@ -48,9 +48,9 @@ bool linux_gps_present() {
 bool radio_init() {
   rtc_clock.begin();
 
-  if (board.config.gps_device && board.config.gps_device[0] != '\0') {
-    gps_serial.begin(board.config.gps_device, board.config.gps_baud);
-  }
+  // begin() dispatches on the device string, so the empty-means-disabled test
+  // lives inside it rather than here.
+  gps_serial.begin(board.config.gps_device, board.config.gps_baud);
 
   // Rebuild the radio on a Module carrying the configured pins. Assigning over
   // the object rather than replacing it is deliberate and required: radio_driver
