@@ -15,18 +15,23 @@ class LinuxSX1262Wrapper : public RadioLibWrapper {
   // belt-and-braces value rather than a live one.
   uint32_t _cad_timeout_ms = 550;
 
+  // _radio is held as the base mesh::Radio, so every use here needs the
+  // downcast. It is always a LinuxSX1262 -- the constructor takes one by
+  // reference -- so this is a naming convenience, not a checked conversion.
+  LinuxSX1262* r() const { return (LinuxSX1262 *)_radio; }
+
 public:
   LinuxSX1262Wrapper(LinuxSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
 
   void setParams(float freq, float bw, uint8_t sf, uint8_t cr) override {
-    ((LinuxSX1262 *)_radio)->setFrequency(freq);
-    ((LinuxSX1262 *)_radio)->setSpreadingFactor(sf);
-    ((LinuxSX1262 *)_radio)->setBandwidth(bw);
-    ((LinuxSX1262 *)_radio)->setCodingRate(cr);
+    r()->setFrequency(freq);
+    r()->setSpreadingFactor(sf);
+    r()->setBandwidth(bw);
+    r()->setCodingRate(cr);
     updatePreamble(sf);
     PacketMillis pm = calcMaxPacketMillis(sf, bw, cr, preambleLengthForSF(sf));
-    ((LinuxSX1262 *)_radio)->setPreambleMillis(pm.preambleMillis);
-    ((LinuxSX1262 *)_radio)->setMaxPayloadMillis(pm.payloadMillis);
+    r()->setPreambleMillis(pm.preambleMillis);
+    r()->setMaxPayloadMillis(pm.payloadMillis);
     _cad_timeout_ms = cadTimeoutMillis(symbolMicros(sf, bw));
   }
 
@@ -46,14 +51,12 @@ public:
   // packet can arrive during the scan and there is nothing for the loop to
   // overlap with.
   int16_t performChannelScan() override {
-    LinuxSX1262* radio = (LinuxSX1262 *)_radio;
-
     // Same configuration scanChannel() used: 4 symbols, exit to STDBY_RC, and
     // DIO1 mapped to CAD_DONE | CAD_DETECTED. CAD_DONE being in that mask is
     // what the wait below depends on -- the line rises however the scan
     // resolves, so a free channel arrives as an edge and not as a timeout.
     // startChannelScan() also clears the IRQ status, so DIO1 is low on entry.
-    int16_t state = radio->startChannelScan();
+    int16_t state = r()->startChannelScan();
     if (state != RADIOLIB_ERR_NONE) {
       MESH_DEBUG_PRINTLN("LinuxSX1262Wrapper: startChannelScan() failed (%d)", state);
       return state;   // isChannelActive() reads anything but CHANNEL_FREE as busy
@@ -70,7 +73,7 @@ public:
     // goes over SPI to the modem's IRQ status register, which is authoritative
     // and wholly independent of the GPIO -- so a dead line costs latency and a
     // log line, never a wrong answer, and never a hang.
-    return radio->getChannelScanResult();
+    return r()->getChannelScanResult();
   }
 
   // Full SX126x receiver reset (warm sleep, recalibrate, re-image the configured
@@ -85,41 +88,38 @@ public:
   // would silently drop all three and leave the radio less sensitive, or (where
   // DIO2 drives the RF switch) mute, until the daemon was restarted.
   void doResetAGC() override {
-    LinuxSX1262* radio = (LinuxSX1262 *)_radio;
+    sx126xResetAGC(r());
 
-    sx126xResetAGC(radio);
-
-    radio->setDio2AsRfSwitch(board.config.dio2_as_rf_switch);
-    radio->setRxBoostedGainMode(board.config.rx_boosted_gain);
-    radio->applyRegisterPatch();
+    r()->setDio2AsRfSwitch(board.config.dio2_as_rf_switch);
+    r()->setRxBoostedGainMode(board.config.rx_boosted_gain);
+    r()->applyRegisterPatch();
   }
 
   // Cold sleep, matching CustomSX1262Wrapper. The only caller shuts the daemon
   // down straight afterwards, so there is no configuration worth retaining and
   // the deeper state is the better one to leave the modem in.
   void powerOff() override {
-    ((LinuxSX1262 *)_radio)->sleep(false);
+    r()->sleep(false);
   }
 
   bool isReceivingPacket() override {
-    return ((LinuxSX1262 *)_radio)->isReceiving();
+    return r()->isReceiving();
   }
   float getCurrentRSSI() override {
-    return ((LinuxSX1262 *)_radio)->getRSSI(false);
+    return r()->getRSSI(false);
   }
-  float getLastRSSI() const override { return ((LinuxSX1262 *)_radio)->getRSSI(); }
-  float getLastSNR() const override { return ((LinuxSX1262 *)_radio)->getSNR(); }
+  float getLastRSSI() const override { return r()->getRSSI(); }
+  float getLastSNR() const override { return r()->getSNR(); }
 
   float packetScore(float snr, int packet_len) override {
-    int sf = ((LinuxSX1262 *)_radio)->spreadingFactor;
-    return packetScoreInt(snr, sf, packet_len);
+    return packetScoreInt(snr, r()->spreadingFactor, packet_len);
   }
-  uint8_t getSpreadingFactor() const override { return ((LinuxSX1262 *)_radio)->spreadingFactor; }
+  uint8_t getSpreadingFactor() const override { return r()->spreadingFactor; }
 
   bool setRxBoostedGainMode(bool en) override {
-    return ((LinuxSX1262 *)_radio)->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
+    return r()->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
   }
   bool getRxBoostedGainMode() const override {
-    return ((LinuxSX1262 *)_radio)->getRxBoostedGainMode();
+    return r()->getRxBoostedGainMode();
   }
 };
