@@ -52,32 +52,19 @@ class LinuxSX1262 : public CustomSX1262 {
       setCRC(1);
 
       setCurrentLimit(config.current_limit);
-      setDio2AsRfSwitch(config.dio2_as_rf_switch);
-      setRxBoostedGainMode(config.rx_boosted_gain);
+      sx126xApplyRxSettings(this, rxSettings());
       if (config.lora_rxen_pin != RADIOLIB_NC || config.lora_txen_pin != RADIOLIB_NC) {
         setRfSwitchPins(config.lora_rxen_pin, config.lora_txen_pin);
       }
-      applyRegisterPatch();
 
       MESH_DEBUG_PRINTLN("SX1262 status=0x%02X device_errors=0x%04X", getStatus(), getDeviceErrors());
 
       return true;
     }
 
-    // The 0x8B5 RX-sensitivity patch that the MCU variants apply under
-    // SX126X_REGISTER_PATCH (added there for the Heltec v4).
-    void applyRegisterPatch() {
-      if (!board.config.rx_register_patch) return;
-
-      uint8_t r_data = 0;
-      readRegister(0x8B5, &r_data, 1);
-      r_data |= 0x01;
-      writeRegister(0x8B5, &r_data, 1);
-    }
-
-    // The post-calibration RX settings for this node, as configured in
-    // meshcored.ini. Handed to sx126xResetAGC(), which applies them where the
-    // MCU variants get their SX126X_* build flags.
+    // The RX settings for this node, as configured in meshcored.ini. Applied at
+    // init and re-applied after every AGC reset, both via sx126xApplyRxSettings()
+    // -- which is where the MCU variants instead read their SX126X_* build flags.
     SX126xRxSettings rxSettings() const {
       SX126xRxSettings s;
       s.dio2_as_rf_switch = board.config.dio2_as_rf_switch;

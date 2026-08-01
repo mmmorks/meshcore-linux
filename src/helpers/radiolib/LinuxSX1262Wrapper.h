@@ -8,12 +8,12 @@
 class LinuxSX1262Wrapper : public RadioLibWrapper {
   // How long performChannelScan() will wait for DIO1 before giving up on the
   // line and reading the result over SPI. Set from the active SF/BW by
-  // setParams(); the default only covers the window before the first call,
-  // where it must exceed the slowest scan a MeshCore preset produces (SF12 at
-  // 62.5 kHz, 544 ms). CAD cannot actually run in that window -- _cad_enabled
-  // stays false until Dispatcher::loop() first pushes it -- so this is a
-  // belt-and-braces value rather than a live one.
-  uint32_t _cad_timeout_ms = 550;
+  // setParams(); the initial value covers only the window before the first
+  // call, so it is seeded from the slowest scan a MeshCore preset can produce
+  // (SF12 at 62.5 kHz) rather than a hand-checked constant. CAD cannot actually
+  // run in that window -- _cad_enabled stays false until Dispatcher::loop()
+  // first pushes it -- so this is belt-and-braces rather than a live value.
+  uint32_t _cad_timeout_ms = cadTimeoutMillis(symbolMicros(12, 62.5f));
 
   // _radio is held as the base mesh::Radio, so every use here needs the
   // downcast. It is always a LinuxSX1262 -- the constructor takes one by

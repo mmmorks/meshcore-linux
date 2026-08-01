@@ -14,6 +14,24 @@ struct SX126xRxSettings {
   bool register_patch    = false;   // 0x8B5 RX-sensitivity patch
 };
 
+// The RX-sensitivity patch upstream added for the Heltec v4. Undocumented by
+// Semtech, hence the bare register number.
+inline void sx126xApplyRegisterPatch(SX126x* radio) {
+  uint8_t r_data = 0;
+  radio->readRegister(0x8B5, &r_data, 1);
+  r_data |= 0x01;
+  radio->writeRegister(0x8B5, &r_data, 1);
+}
+
+// Apply the RX settings calibration does not preserve. Both initial
+// configuration and every later AGC reset go through here, so a setting added
+// to SX126xRxSettings reaches both rather than having to be remembered twice.
+inline void sx126xApplyRxSettings(SX126x* radio, const SX126xRxSettings& rx) {
+  radio->setDio2AsRfSwitch(rx.dio2_as_rf_switch);
+  radio->setRxBoostedGainMode(rx.rx_boosted_gain);
+  if (rx.register_patch) sx126xApplyRegisterPatch(radio);
+}
+
 // Full receiver reset for all SX126x-family chips (SX1262, SX1268, LLCC68, STM32WLx).
 // Warm sleep powers down analog, Calibrate(0x7F) refreshes ADC/PLL/image calibration,
 // then re-applies RX settings that calibration may reset.
@@ -41,14 +59,7 @@ inline void sx126xResetAGC(SX126x* radio, const SX126xRxSettings* rx = NULL) {
   radio->calibrateImage(radio->freqMHz);
 
   if (rx) {
-    radio->setDio2AsRfSwitch(rx->dio2_as_rf_switch);
-    radio->setRxBoostedGainMode(rx->rx_boosted_gain);
-    if (rx->register_patch) {
-      uint8_t r_data = 0;
-      radio->readRegister(0x8B5, &r_data, 1);
-      r_data |= 0x01;
-      radio->writeRegister(0x8B5, &r_data, 1);
-    }
+    sx126xApplyRxSettings(radio, *rx);
     return;
   }
 
@@ -59,9 +70,6 @@ inline void sx126xResetAGC(SX126x* radio, const SX126xRxSettings* rx = NULL) {
   radio->setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN);
 #endif
 #ifdef SX126X_REGISTER_PATCH
-  uint8_t r_data = 0;
-  radio->readRegister(0x8B5, &r_data, 1);
-  r_data |= 0x01;
-  radio->writeRegister(0x8B5, &r_data, 1);
+  sx126xApplyRegisterPatch(radio);
 #endif
 }

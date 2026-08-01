@@ -381,10 +381,10 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "gps interval", 12) == 0) {
       // Seconds between location reads. 0 means "use the firmware default"
       // (1 s), matching how applyGpsPrefs() interprets a zero pref.
-      char secs_str[12];
       if (strlen(command) == 12) {
         sprintf(reply, "> %u", (unsigned) _prefs->gps_interval);
       } else {
+        char secs_str[12];
         uint32_t secs = _atoi(&command[13]);
         if (secs > 86400) secs = 86400;   // cap at 24 hours
         sprintf(secs_str, "%u", (unsigned) secs);

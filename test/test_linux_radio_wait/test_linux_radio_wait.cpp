@@ -241,13 +241,6 @@ TEST(CadTimeoutMillis, GrowsWithSymbolTime) {
   EXPECT_GT(cadTimeoutMillis(525128), 4000u);
 }
 
-TEST(CadTimeoutMillis, StaysUnderTheWrapperDefault) {
-  // LinuxSX1262Wrapper seeds _cad_timeout_ms with 550 ms for the window before
-  // the first setParams(). That default is only safe while it covers the
-  // slowest scan a MeshCore preset produces (SF12 at 62.5 kHz).
-  EXPECT_LE(cadTimeoutMillis(65536), 550u);
-}
-
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -21,3 +21,7 @@ platformio.local.ini
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Superpowers process artifacts (brainstorm/spec/plan). Kept out of the fork
+# tree; see f38d0e3e.
+docs/superpowers/
