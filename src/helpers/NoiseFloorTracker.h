@@ -151,7 +151,16 @@ class NoiseFloorTracker {
 
   /** Bias coefficient for the current ring occupancy (_valid >= 1). */
   float biasK() const {
-    static const float k[NOISE_TRACKER_SUB_WINDOWS] = NOISE_TRACKER_BIAS_TABLE;
+    // Unsized on purpose, so sizeof measures the table rather than the constant
+    // it is supposed to match. Both tunables are documented as independently
+    // overridable via build_flags, and a table shorter than the ring is the
+    // dangerous mismatch: an explicit bound would zero-fill the tail in silence,
+    // so biasK() would return 0 at exactly the occupancies that matter most and
+    // the floor would read ~2.8 dB low -- the direction that loses detections.
+    static const float k[] = NOISE_TRACKER_BIAS_TABLE;
+    static_assert(sizeof(k) / sizeof(k[0]) == NOISE_TRACKER_SUB_WINDOWS,
+                  "NOISE_TRACKER_BIAS_TABLE must have exactly "
+                  "NOISE_TRACKER_SUB_WINDOWS entries: override both or neither");
     uint8_t i = _valid > 0 ? (uint8_t)(_valid - 1) : 0;
     if (i >= NOISE_TRACKER_SUB_WINDOWS) i = NOISE_TRACKER_SUB_WINDOWS - 1;
     return k[i];
