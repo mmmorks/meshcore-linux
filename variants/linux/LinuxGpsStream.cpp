@@ -92,6 +92,7 @@ static const char WATCH_CMD[] = "?WATCH={\"enable\":true,\"nmea\":true}\n";
 static const uint32_t RETRY_MIN_MS     = 1000;
 static const uint32_t RETRY_MAX_MS     = 30000;
 static const uint32_t CONNECT_LIMIT_MS = 5000;
+static const uint32_t READ_GAP_MS      = 5000;
 
 bool LinuxGpsStream::begin(const char* device, int baud) {
   end();  // idempotent
@@ -201,8 +202,24 @@ void LinuxGpsStream::dropConnection() {
 }
 
 void LinuxGpsStream::serviceGpsd() {
+  uint32_t now = millis();
+
+  // EnvironmentSensorManager drains this stream only while gps_active is true,
+  // so a `gps off` stops the reads entirely. A tty tolerates that -- undrained
+  // bytes just age out of the kernel buffer -- but a socket does not: the
+  // receive window fills and gpsd drops clients it cannot write to. Dropping it
+  // ourselves is both the polite move and the one that stops `gps on` from
+  // replaying a backlog of stale NMEA as though it were current.
+  if (_state == GPSD_READY && _last_read_ms != 0 &&
+      (uint32_t)(now - _last_read_ms) > READ_GAP_MS) {
+    dropConnection();
+    _retry_at_ms = now;      // deliberate: a fresh start, not a failure to back off from
+    _retry_delay_ms = 0;
+  }
+  _last_read_ms = now;
+
   if (_state == GPSD_IDLE) {
-    if ((int32_t)(millis() - _retry_at_ms) >= 0) startConnect();
+    if ((int32_t)(now - _retry_at_ms) >= 0) startConnect();
     return;
   }
   if (_state == GPSD_CONNECTING) finishConnect();
