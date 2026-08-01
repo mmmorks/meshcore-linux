@@ -3,6 +3,7 @@
 #include <RadioLib.h>
 #include "MeshCore.h"
 #include "CustomSX1262.h"
+#include "SX126xReset.h"
 // For the LinuxBoard definition behind `board` below. Reached transitively via
 // target.h today, but named here so this header does not depend on include
 // order -- LinuxSX1262Wrapper.h calls methods on it.
@@ -64,9 +65,7 @@ class LinuxSX1262 : public CustomSX1262 {
     }
 
     // The 0x8B5 RX-sensitivity patch that the MCU variants apply under
-    // SX126X_REGISTER_PATCH (added there for the Heltec v4). A named method
-    // rather than an inline block in std_init() because the AGC reset has to
-    // re-apply it: the calibration in sx126xResetAGC() does not preserve it.
+    // SX126X_REGISTER_PATCH (added there for the Heltec v4).
     void applyRegisterPatch() {
       if (!board.config.rx_register_patch) return;
 
@@ -74,5 +73,16 @@ class LinuxSX1262 : public CustomSX1262 {
       readRegister(0x8B5, &r_data, 1);
       r_data |= 0x01;
       writeRegister(0x8B5, &r_data, 1);
+    }
+
+    // The post-calibration RX settings for this node, as configured in
+    // meshcored.ini. Handed to sx126xResetAGC(), which applies them where the
+    // MCU variants get their SX126X_* build flags.
+    SX126xRxSettings rxSettings() const {
+      SX126xRxSettings s;
+      s.dio2_as_rf_switch = board.config.dio2_as_rf_switch;
+      s.rx_boosted_gain   = board.config.rx_boosted_gain;
+      s.register_patch    = board.config.rx_register_patch;
+      return s;
     }
 };

@@ -81,18 +81,15 @@ public:
   // base class falls back to a bare sleep(), so `set agc_int` was quietly a
   // weaker knob on Linux than everywhere else.
   //
-  // The re-applications afterwards are the Linux-specific part. sx126xResetAGC()
-  // restores DIO2-as-RF-switch, RX boosted gain and the 0x8B5 patch from the
-  // SX126X_* build flags, none of which are defined here -- those settings come
-  // from meshcored.ini instead. Left to the shared helper alone, an AGC reset
-  // would silently drop all three and leave the radio less sensitive, or (where
-  // DIO2 drives the RF switch) mute, until the daemon was restarted.
+  // The settings argument is the Linux-specific part: recalibration drops
+  // DIO2-as-RF-switch, RX boosted gain and the 0x8B5 patch, and the shared
+  // helper restores them from the SX126X_* build flags, none of which are
+  // defined here -- those come from meshcored.ini. Handing it the runtime values
+  // makes it restore the right ones, rather than restoring the wrong ones for
+  // this caller to redo afterwards.
   void doResetAGC() override {
-    sx126xResetAGC(r());
-
-    r()->setDio2AsRfSwitch(board.config.dio2_as_rf_switch);
-    r()->setRxBoostedGainMode(board.config.rx_boosted_gain);
-    r()->applyRegisterPatch();
+    SX126xRxSettings rx = r()->rxSettings();
+    sx126xResetAGC(r(), &rx);
   }
 
   // Cold sleep, matching CustomSX1262Wrapper. The only caller shuts the daemon
