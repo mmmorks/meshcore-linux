@@ -149,8 +149,8 @@ Key settings:
 | `advert_name` | `"Linux Repeater"` | Node name, first-run default only |
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
-| `gps_device` | *(empty)* | Path to a serial NMEA GPS device (e.g. `/dev/ttyACM0`). Empty disables GPS. |
-| `gps_baud` | `9600` | Baud rate for `gps_device`. One of 4800/9600/19200/38400/57600/115200. |
+| `gps_device` | *(empty)* | Where to read NMEA from. A serial device path (e.g. `/dev/ttyACM0`), or `gpsd://[host][:port]` to read from a gpsd instance (default `127.0.0.1:2947`). Empty disables GPS. |
+| `gps_baud` | `9600` | Baud rate for a serial `gps_device`. One of 4800/9600/19200/38400/57600/115200. Ignored when `gps_device` names gpsd — gpsd owns the port and its baud rate. |
 | `gps_en_pin` | `-1` | GPIO line held HIGH to wake a GPS module that boots in standby (e.g. the L76K STANDBY line on the Waveshare LoRaWAN/GNSS HAT). `-1` = none. |
 
 ### 3. Enable SPI and GPIO access
@@ -399,6 +399,85 @@ Some GPS modules boot into standby and stay silent until an enable/standby line
 is driven high. The L76K on the Waveshare LoRaWAN/GNSS HAT is one such module —
 set `gps_en_pin` to that GPIO (STANDBY is on GPIO 4 for that HAT) and the daemon
 holds it high on start so the module wakes and streams NMEA.
+
+#### Reading GPS from gpsd
+
+By default the daemon opens the GPS device itself and holds it for its whole
+life, which locks out anything else that wants the receiver — in particular
+`gpsd`, and through it `chrony`. On a Linux node that matters more than it does
+on an MCU, because the node's clock is the whole host's clock, and a node with
+no network and no RTC otherwise boots with a bogus one.
+
+Point `gps_device` at gpsd instead and the device becomes gpsd's:
+
+```ini
+gps_device = gpsd://        # 127.0.0.1:2947
+gps_en_pin = 4              # still needed; see below
+```
+
+Then, on the host:
+
+```sh
+sudo apt install gpsd gpsd-clients chrony
+```
+
+`/etc/default/gpsd`:
+
+```sh
+DEVICES="/dev/ttyS0"
+GPSD_OPTIONS="-n"
+```
+
+`-n` is required. chrony's SHM refclock is not a gpsd socket client, so without
+it gpsd stops reading the receiver whenever meshcored disconnects, and chrony
+sees nothing.
+
+`/etc/chrony/chrony.conf`:
+
+```
+refclock SHM 0 refid GPS offset 0.0 delay 0.2
+```
+
+Verify with `chronyc sources` (a `GPS` line) and `meshcorectl gps` (fix and
+satellite count, as before).
+
+The daemon reconnects to gpsd on its own, with backoff, so start order does not
+matter and restarting gpsd underneath a running node is safe. It also drops the
+connection while GPS is switched off and reconnects on `gps on`, so gpsd is
+never left holding a client that has stopped reading.
+
+With a gpsd source the daemon no longer tries to set the system clock at all —
+chrony owns it. That is deliberate beyond tidiness: the other caller of the same
+path is `clock sync` / `time <epoch>`, which carries a timestamp from a remote
+mesh peer, and on a general-purpose host that should never be able to move the
+clock.
+
+#### PPS is not available on the Waveshare LoRaWAN/GNSS HAT
+
+Investigated and closed — do not re-investigate. The L76K does emit a
+pulse-per-second signal, but on the SX126X XXXM LoRaWAN/GNSS HAT it is **not
+routed to a Raspberry Pi header GPIO**. The schematic takes L76K pin 5 (`1PPS`,
+net `PPS`) through R19 to indicator LED `L_PPS1` and no further; no `PPS` net
+appears in the Raspberry Interface block. Confirmed empirically: 20 s of
+`gpiomon` across all 14 free header GPIOs (2, 3, 5, 6, 12, 13, 17, 19, 22–27)
+with a 21-satellite fix produced zero edges.
+
+So there is no stratum-1 PPS refclock to be had on this board, and NMEA via
+gpsd (above) is the only route to GNSS timekeeping. On a HAT that *does* route
+PPS, add `dtoverlay=pps-gpio,gpiopin=<N>` and
+`refclock PPS /dev/pps0 refid PPS lock NMEA` — but PPS is a precision layer on
+top of gpsd, never a replacement for it, because it says when a second begins
+and not which second it is.
+
+Two related notes about this HAT, both easy to get wrong:
+
+- `gps_en_pin = 4` is load-bearing. R13 (marked `NC/0R`) is fitted, so driving
+  GPIO 4 low stops NMEA dead. The pin reads high when undriven only because of
+  the SoC's own default pull-up on GPIO 0–8, which is not something to rely on.
+- Switch **S1** drives the same transistor in parallel with GPIO 4. If the GPS
+  will not sleep, that switch is why. `FORCE_ON` is pushbutton K1, not a GPIO —
+  GPIO 17 is unconnected here, despite `DEV_FORCE 17` in Waveshare's sample code
+  for the standalone L76X module.
 
 There are two levels of reset:
 
