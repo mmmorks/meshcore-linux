@@ -51,7 +51,16 @@ public:
   int   gps_baud   = 9600;
   int   gps_en_pin = -1;
 
-  int load(const char *filename);
+  // Outcome of parsing meshcored.ini. Two failure kinds, kept apart because
+  // they deserve opposite responses (see LinuxBoard::begin()): a value the
+  // operator wrote that could not be honoured, versus a key nothing consumes.
+  struct LoadResult {
+    bool opened       = false;  // false: the file could not be read at all
+    int  bad_values   = 0;      // values that failed validation
+    int  unknown_keys = 0;      // keys nothing consumes; ignored
+  };
+
+  LoadResult load(const char *filename);
 };
 
 class LinuxBoard : public mesh::MainBoard {

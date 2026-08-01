@@ -94,7 +94,30 @@ sudo nano /etc/meshcored/meshcored.ini
 The config file has two roles:
 
 - **Hardware config** (always read on every startup): SPI device, GPIO pin numbers, LoRa radio parameters.
-- **First-run node defaults**: `advert_name`, `admin_password`, `lat`, `lon`. On the first boot these are saved to the node's persisted prefs (`prefs.json`). After that, use the serial CLI to change them (`set name`, `set password`, etc.), the INI values are no longer consulted for these fields.
+- **First-run node defaults**: `advert_name`, `admin_password`, `lat`, `lon`. On the first boot these are saved to the node's persisted prefs (`prefs.json`). After that, use the CLI to change them (`set name`, `set password`, etc.), the INI values are no longer consulted for these fields.
+
+> **The config is validated.** Every problem is named on its own `ERROR:` line,
+> and the two kinds are treated differently:
+>
+> | Problem | Response |
+> |---------|----------|
+> | **Invalid value** — a GPIO pin outside `0..255`, non-numeric, or empty | **Fatal.** There is no sensible fallback for which GPIO drives the radio, so the daemon refuses to start rather than run the hardware differently from how you configured it. |
+> | **Unrecognised key** — e.g. `lora_frequency` for `lora_freq` | **Warning**, key ignored, startup continues. It may be a key from a newer build, so this must not take a working repeater off the air. |
+> | **File unreadable / missing** | **Warning**, built-in defaults used. The radio will then fail to start, since no pins are configured. |
+>
+> **Read the warnings after editing the INI.** An ignored key does not merely
+> fail to apply: because the radio parameters here are *first-run defaults*, the
+> built-in default is persisted to `prefs.json` on the first boot and correcting
+> the INI afterwards has no effect (step 6 covers resetting prefs). Comments
+> (`#`, `;`), blank lines and `[section]` headers are ignored as before.
+>
+> ```
+> ERROR: meshcored.ini: unknown key 'lora_frequency' (ignored)
+> WARNING: 1 unrecognised key(s) in /etc/meshcored/meshcored.ini ...
+>
+> ERROR: meshcored.ini: lora_irq_pin = '260' is not a valid GPIO pin (expected 0..255)
+> FATAL: 1 invalid value(s) in /etc/meshcored/meshcored.ini ...
+> ```
 
 Key settings:
 
