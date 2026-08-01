@@ -212,7 +212,7 @@ void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   // reinstates the busy loop for as little as one concurrent `meshcorectl`.
   Console.registerPollFds(EventLoop);
 
-  // The GPS descriptor is deliberately absent, and LinuxSerialStream exposes no
+  // The GPS descriptor is deliberately absent, and LinuxGpsStream exposes no
   // accessor for it so it cannot be added here by reflex. EnvironmentSensorManager
   // drains that stream only while gps_active is true, but the module streams
   // regardless, so registering it would leave a descriptor nothing drains sitting

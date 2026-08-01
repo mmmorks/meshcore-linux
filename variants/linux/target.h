@@ -7,7 +7,7 @@
 #include <helpers/radiolib/CustomSX1276Wrapper.h>
 #include <helpers/sensors/EnvironmentSensorManager.h>
 #include <helpers/sensors/MicroNMEALocationProvider.h>
-#include "LinuxSerialStream.h"
+#include "LinuxGpsStream.h"
 #ifdef DISPLAY_CLASS
   #include <helpers/ui/SSD1306Display.h>
   #include <helpers/ui/MomentaryButton.h>
@@ -21,7 +21,7 @@ extern LinuxBoard board;
 extern WRAPPER_CLASS radio_driver;
 extern LinuxRTCClock rtc_clock;
 extern EnvironmentSensorManager sensors;
-extern LinuxSerialStream gps_serial;
+extern LinuxGpsStream gps_serial;
 extern MicroNMEALocationProvider gps_location;
 
 // True if a serial GPS device was configured and successfully opened.

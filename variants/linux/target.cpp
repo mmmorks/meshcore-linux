@@ -32,7 +32,7 @@ RADIO_CLASS radio = radio_module;
 WRAPPER_CLASS radio_driver(radio, board);
 
 LinuxRTCClock rtc_clock;
-LinuxSerialStream gps_serial;
+LinuxGpsStream gps_serial;
 MicroNMEALocationProvider gps_location(gps_serial, &rtc_clock, -1, -1, NULL);
 EnvironmentSensorManager sensors(gps_location);
 
