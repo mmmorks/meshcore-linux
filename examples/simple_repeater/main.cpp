@@ -40,9 +40,19 @@ static char ethernet_command[160];
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
 // How long loop() is willing to idle between iterations, for boards that
-// implement MainBoard::idleUntilEvent(). Must stay below the shortest deadline
-// not already delivered by the radio IRQ -- today that is the CAD retry delay
-// (Dispatcher::getCADFailRetryDelay(), 200 ms), so 50 ms keeps 4x margin.
+// implement MainBoard::idleUntilEvent().
+//
+// The bound is the shortest deadline not already delivered by the radio IRQ,
+// and there are two. Dispatcher::getCADFailRetryDelay() is 200 ms, which 50 ms
+// clears with 4x margin. The delayed-inbound queue is the tighter one: its
+// delay is randomised per packet but floored at exactly 50 ms, because
+// checkRecv() processes anything below that immediately rather than queueing
+// it. So a queued inbound packet can be serviced up to one full iteration late.
+//
+// That is latency, not error. The delay being quantised is a randomised
+// collision-spreading interval, and nodes do not wake in step with one another,
+// so rounding it up adds jitter to a quantity that is already jitter -- it
+// cannot bunch two nodes onto the same slot the way a synchronised delay would.
 // Nothing else needs a faster iteration: RX-done and TX-done arrive on the IRQ,
 // and the noise floor is sampled on its own wall-clock schedule inside
 // RadioLibWrapper::loop() rather than once per iteration. Boards with no
