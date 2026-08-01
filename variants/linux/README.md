@@ -87,7 +87,7 @@ Two ready-made templates are provided in `variants/linux/`:
 | Template | Hardware |
 |----------|----------|
 | `meshcored.ini.pow-sx1262` | RPi Zero 2W + PoW SX1262 HAT |
-| `meshcored.ini.waveshare` | RPi 3/4/5 + Waveshare SX1262 LoRa HAT |
+| `meshcored.ini.waveshare` | RPi 3/4/5 + Waveshare SX1262 LoRa HAT (also the LoRaWAN/GNSS variant — its GNSS lines are commented in the template) |
 
 ```sh
 # Pick the template that matches your hardware (install -D creates /etc/meshcored):
@@ -390,10 +390,14 @@ control CLI (`meshcorectl`):
   the two `lat …` debug lines the firmware prints on every read, which at the
   1 s default dominate the journal on a node with a fix.
 
-The daemon needs read access to `gps_device`. USB GPS units are usually owned
-by root or the `dialout` group; the systemd service already runs with the
-privileges it needs for SPI/GPIO. For an unprivileged run, add the user to the
-device's group or install a udev rule granting access.
+With a **serial** `gps_device` the daemon needs read access to it. USB GPS units
+are usually owned by root or the `dialout` group; the systemd service already
+runs with the privileges it needs for SPI/GPIO. For an unprivileged run, add the
+user to the device's group or install a udev rule granting access.
+
+A **`gpsd://`** source needs none of that — the daemon talks to a local socket
+and never opens the device, so it does not need `dialout` (or any other) access
+to the serial port. gpsd holds it instead.
 
 Some GPS modules boot into standby and stay silent until an enable/standby line
 is driven high. The L76K on the Waveshare LoRaWAN/GNSS HAT is one such module —
@@ -539,4 +543,5 @@ sudo systemctl start meshcored
 - **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 6.
 - **No power management**, `board.sleep()` is a no-op; the power-saving loop in `main.cpp` never actually sleeps.
 - **Upstream-sync fragility**, the radio wrapper (`LinuxSX1262Wrapper`) implements the `RadioLibWrapper` interface by hand, so it can drift from upstream in two ways: a new **pure-virtual** method breaks the Linux build (e.g. `setParams()`), and a new **virtual-with-default** method silently no-ops on Linux until overridden (e.g. `set`/`getRxBoostedGainMode()`, which reported and applied the wrong state until added). Mirror `CustomSX1262Wrapper` when syncing.
+- **A `gpsd://` host cannot be a bare IPv6 literal**, because `host:port` cannot be split from one unambiguously. Such a value is rejected as an invalid `gps_device` (the daemon refuses to start rather than silently misparsing it); use a hostname, an IPv4 address, or leave it at the `127.0.0.1` default, which is what a local gpsd needs anyway.
 - **libgpiod v2 is compile-verified only**, `EventGPIOPin`'s v2 code path (Debian trixie and newer) builds cleanly in CI/`build-docker.sh`, but it has never been exercised at runtime against real hardware — all runtime verification to date has been on libgpiod v1 (Debian bookworm). Treat the v2 path as unproven until someone runs it on a Pi.

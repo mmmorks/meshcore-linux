@@ -17,6 +17,21 @@ lora_tx_power = 22
 # DIO2 drives the TX/RX RF switch on the Waveshare Core1262
 dio2_as_rf_switch = 1
 
+# GNSS, on the LoRaWAN/GNSS variant of this HAT only (the plain LoRa HAT has no
+# receiver -- leave all three commented there). The L76K's NMEA is on the Pi's
+# own UART, so /dev/ttyS0 needs the serial console off and enable_uart=1 set.
+#
+# gps_en_pin is not optional on this board: GPIO 4 reaches the L76K STANDBY line
+# through R13, and driving it low stops NMEA. Slide switch S1 is wired in
+# parallel with it -- if the GPS never sleeps, that switch is why.
+#
+# gps_device = /dev/ttyS0     # meshcored owns the UART
+# gps_device = gpsd://        # or gpsd owns it, which also lets chrony
+#                             #   discipline the host clock from GNSS.
+#                             #   See "Reading GPS from gpsd" in README.md.
+# gps_baud = 9600             # serial only; gpsd owns the baud rate itself
+# gps_en_pin = 4
+
 # First-run node defaults (ignored after first boot; use CLI to change):
 advert_name = Waveshare Linux Repeater
 admin_password = changeme
