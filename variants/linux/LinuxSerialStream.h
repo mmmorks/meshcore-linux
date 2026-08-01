@@ -17,9 +17,6 @@ public:
   void end();
   bool isOpen() const { return _fd >= 0; }
 
-  // Descriptor for the Linux event loop; -1 when closed.
-  int fd() const { return _fd; }
-
   size_t write(uint8_t c) override;
   using Print::write;
 

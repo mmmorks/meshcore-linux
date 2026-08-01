@@ -162,38 +162,20 @@ void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   EventLoop.reset();
   EventLoop.setEventSource(src);
 
-  // Register exactly the descriptor(s) LinuxConsole::rawReadByte() will
-  // actually consume this iteration -- it accepts a new client and reads
-  // stdin only when no client is connected, and otherwise reads only the
-  // connected client. Registering all three unconditionally would leave the
-  // listening socket (and stdin) permanently POLLIN once a client is
-  // attached, since nothing here would ever drain them: that reinstates the
-  // busy loop for as little as one concurrent `meshcorectl`. Keep this in
-  // step with rawReadByte()'s precedence if it ever changes.
-  if (Console.clientFd() < 0) {
-    EventLoop.registerFd(Console.serverFd());
-    EventLoop.registerFd(Console.stdinFd());
-  } else {
-    EventLoop.registerFd(Console.clientFd());
-  }
+  // Exactly the descriptor(s) LinuxConsole::rawReadByte() will actually consume
+  // this iteration. The console owns that choice because it owns the precedence
+  // -- registering one it will not drain leaves it permanently POLLIN and
+  // reinstates the busy loop for as little as one concurrent `meshcorectl`.
+  Console.registerPollFds(EventLoop);
 
-  // Deliberately NOT registering gps_serial.fd() here. EnvironmentSensorManager
-  // only drains the GPS stream when gps_active is true (initBasicGPS() leaves
-  // it false until an operator runs `gps on`; PERSISTANT_GPS is not defined
-  // for this variant), so a registered-but-undrained GPS descriptor would sit
-  // POLLIN for as long as the module keeps streaming -- which on Linux it
-  // always does: MicroNMEALocationProvider::stop() is a no-op here and
-  // gps_en_pin (when configured) stays high for the whole run. That would
-  // reinstate the 100% CPU spin this event loop exists to remove, for every
-  // node with gps_device set and GPS not actively toggled on -- the
-  // documented default. There is also nothing to gain from waking on it: at
-  // 9600 baud (~960 B/s) against a ~4 KB tty input buffer, a poll ceiling in
-  // the tens of ms drains NMEA with three orders of magnitude of margin even
-  // when gps_active is true and EnvironmentSensorManager::loop() is polled
-  // from the timeout alone. DO NOT add EventLoop.registerFd(gps_serial.fd())
-  // back in, even though it looks like the obviously-correct thing to do for
-  // a node that streams GPS -- it is the single line that reintroduces this
-  // branch's namesake bug in the default configuration.
+  // The GPS descriptor is deliberately absent, and LinuxSerialStream exposes no
+  // accessor for it so it cannot be added here by reflex. EnvironmentSensorManager
+  // drains that stream only while gps_active is true, but the module streams
+  // regardless, so registering it would leave a descriptor nothing drains sitting
+  // POLLIN -- the 100% CPU spin this event loop exists to remove, on every node
+  // with gps_device set and GPS not toggled on. Nothing is lost: at 9600 baud
+  // against a ~4 KB tty buffer, draining NMEA off the poll timeout alone has
+  // three orders of magnitude of margin.
 
   // Refresh the cached IRQ level immediately before blocking. Packet
   // correctness does not come from the edge-event descriptor above; it comes

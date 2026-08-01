@@ -1,5 +1,7 @@
 #include "LinuxConsole.h"
 
+#include "LinuxEventLoop.h"
+
 #include <Arduino.h>
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +138,18 @@ int LinuxConsole::read() {
   int c = PeekableStream::read();
   if (c == '\n') c = '\r';  // normalise Enter so the CLI's '\r' check fires
   return c;
+}
+
+void LinuxConsole::registerPollFds(LinuxEventLoop& loop) const {
+  // Mirrors rawReadByte()'s precedence exactly: with a client attached it reads
+  // only that client, so registering the listening socket and stdin as well
+  // would leave both permanently POLLIN with nothing to drain them.
+  if (_client_fd < 0) {
+    loop.registerFd(_server_fd);
+    loop.registerFd(stdinFd());
+  } else {
+    loop.registerFd(_client_fd);
+  }
 }
 
 void LinuxConsole::writeByte(uint8_t c) {

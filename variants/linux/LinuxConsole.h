@@ -1,6 +1,8 @@
 #pragma once
 #include "PeekableStream.h"
 
+class LinuxEventLoop;
+
 // Control console for the ArduLinux (Linux) build.
 //
 // On Linux the Arduino `Serial` object is an output-only stub (its read() always
@@ -24,23 +26,26 @@ public:
   size_t write(uint8_t c) override;
   using Print::write;
 
-  // Absolute path of the control socket that was opened (empty if none).
-  const char* socketPath() const { return _sock_path; }
-
-  // Descriptors the Linux event loop polls so a waiting daemon wakes on
-  // console traffic. Any of these may be -1, which the event loop ignores.
-  int serverFd() const { return _server_fd; }   // listening control socket
-  int clientFd() const { return _client_fd; }   // connected client, -1 if none
-  int stdinFd()  const;                         // STDIN_FILENO if a TTY, else -1
+  // Register the descriptors rawReadByte() will actually consume on its next
+  // call, so a waiting daemon wakes on console traffic and on nothing else.
+  //
+  // This lives here rather than in the caller because it has to track
+  // rawReadByte()'s precedence exactly: a registered descriptor that nothing
+  // drains stays POLLIN forever, which turns the blocking wait back into the
+  // busy loop LinuxEventLoop exists to remove. Keeping both in one class makes
+  // that agreement structural instead of a comment in another file.
+  void registerPollFds(LinuxEventLoop& loop) const;
 
 protected:
   // One raw byte from the active input, or -1. Prefers a live control-socket
-  // client, else accepts a pending one, else stdin.
+  // client, else accepts a pending one, else stdin -- the precedence
+  // registerPollFds() mirrors.
   int rawReadByte() override;
 
 private:
   bool tryAccept();
   void writeByte(uint8_t c);
+  int  stdinFd() const;    // STDIN_FILENO if a TTY, else -1
 
   int  _server_fd = -1;    // listening Unix socket
   int  _client_fd = -1;    // currently connected control client, or -1
