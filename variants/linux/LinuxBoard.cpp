@@ -14,6 +14,7 @@
 #include "LinuxConsole.h"
 #include "LinuxEventLoop.h"
 #include "LinuxRadioWait.h"
+#include "LinuxGpsStream.h"
 #include "AppInfo.h"
 
 // Still hardcoded -- see "Known Gaps" in variants/linux/README.md -- but named,
@@ -139,6 +140,15 @@ void LinuxBoard::begin() {
            "       how it was configured. Fix the listed line(s) and restart.\n",
            cfg.bad_values, CONFIG_PATH);
     exit(1);
+  }
+
+  // Not fatal, but not silent either: gpsd owns the serial port and its baud
+  // rate, so a gps_baud beside a gpsd:// device does nothing. Saying so beats
+  // leaving the operator to wonder why changing it has no effect.
+  if (config.gps_baud != 9600 &&
+      LinuxGpsStream::parseDevice(config.gps_device).transport == LinuxGpsStream::GPSD_SOCKET) {
+    printf("WARNING: gps_baud is set but gps_device names gpsd, which owns the\n"
+           "         serial port and its baud rate. The value has no effect here.\n");
   }
 
   printf("SPI begin %s\n", config.spidev);
@@ -413,7 +423,19 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
     else if (strcmp(key, "admin_password") == 0) admin_password = safe_copy(value, 100);
     else if (strcmp(key, "lat") == 0)            lat = atof(value);
     else if (strcmp(key, "lon") == 0)            lon = atof(value);
-    else if (strcmp(key, "gps_device") == 0)  gps_device = safe_copy(value, 64);
+    else if (strcmp(key, "gps_device") == 0)  {
+      // Validate here rather than at open time: bad_values makes begin() refuse
+      // to start, which is the right answer for a device string the operator
+      // wrote and we cannot honour. Discovering it later would instead look
+      // like an absent GPS.
+      if (LinuxGpsStream::parseDevice(value).valid) {
+        gps_device = safe_copy(value, 64);
+      } else {
+        printf("ERROR: meshcored.ini: gps_device '%s' is not a device path or a "
+               "usable gpsd:// URL\n", value);
+        result.bad_values++;
+      }
+    }
     else if (strcmp(key, "gps_baud") == 0)    gps_baud = atoi(value);
     else if (strcmp(key, "gps_en_pin") == 0)  { if (parse_pin(key, value, -1, &pin, &result.bad_values)) gps_en_pin = (int) pin; }
 
