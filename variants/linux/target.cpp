@@ -52,6 +52,10 @@ bool radio_init() {
   // lives inside it rather than here.
   gps_serial.begin(board.config.gps_device, board.config.gps_baud);
 
+  // Has to follow begin(), which is what establishes the transport.
+  rtc_clock.setExternallyDisciplined(
+      gps_serial.transport() == LinuxGpsStream::GPSD_SOCKET);
+
   // Rebuild the radio on a Module carrying the configured pins. Assigning over
   // the object rather than replacing it is deliberate and required: radio_driver
   // holds a reference to `radio`, so the address has to stay put. Only the

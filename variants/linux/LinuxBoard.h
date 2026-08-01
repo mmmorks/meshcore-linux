@@ -128,16 +128,39 @@ class LinuxRTCClock : public mesh::RTCClock {
   // for the life of the daemon.
   bool _settime_warned = false;
 
+  // Set when the host clock is disciplined by something else (chrony, fed by
+  // gpsd). Then this is not merely futile but wrong to attempt.
+  bool _externally_disciplined = false;
+
 public:
   LinuxRTCClock() { }
   void begin() {
   }
+
+  // Declare that the host clock belongs to another daemon. Both callers of
+  // setCurrentTime() take their timestamp from somewhere we should not be
+  // acting on in that case: GPS time sync duplicates what chrony already does
+  // better, and `clock sync` / `time <epoch>` carry a value supplied by a
+  // REMOTE MESH PEER. Refusing here makes "a LoRa peer cannot retime this
+  // host" true by configuration rather than by the accident of the shipped
+  // unit happening to lack CAP_SYS_TIME.
+  void setExternallyDisciplined(bool yes) { _externally_disciplined = yes; }
   uint32_t getCurrentTime() override {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec;
   }
   void setCurrentTime(uint32_t time) override {
+    if (_externally_disciplined) {
+      if (!_settime_warned) {
+        _settime_warned = true;
+        printf("NOTE: not setting the system clock -- gps_device names gpsd, so\n"
+               "      chrony owns the clock. GPS and mesh time sync are ignored\n"
+               "      here by design; getCurrentTime() still reads the host clock.\n");
+      }
+      return;
+    }
+
     struct timeval tv;
     tv.tv_sec = time;
     tv.tv_usec = 0;
