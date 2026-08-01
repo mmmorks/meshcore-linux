@@ -260,15 +260,21 @@ private:
   void updateScale(float rssi_dbm) {
     if (_valid == 0) return;    // no window statistic to measure against yet
 
+    // One ring scan serves both uses below -- floorEstimate() is windowValue()
+    // plus the bias term, and the deviation is measured against windowValue()
+    // itself. Reading it once also makes the two impossible to drift apart.
+    const float wv = windowValue();
+    const float k  = biasK();
+
     float gate = NOISE_TRACKER_SIGMA_GATE_DB;
     if (4.0f * _sigma > gate) gate = 4.0f * _sigma;
-    if (rssi_dbm >= floorEstimate() + gate) return;   // signal or interferer, not noise
+    if (rssi_dbm >= wv + k * _sigma + gate) return;   // signal or interferer, not noise
 
-    float d = rssi_dbm - windowValue();
+    float d = rssi_dbm - wv;
     if (d < 0.0f) d = 0.0f;     // below the window statistic only by sampling noise
     _dev += NOISE_TRACKER_SIGMA_LAMBDA * (d - _dev);
 
-    float s = _dev / biasK();
+    float s = _dev / k;
     if (s > NOISE_TRACKER_MAX_SIGMA_DB) s = NOISE_TRACKER_MAX_SIGMA_DB;
     if (s < NOISE_TRACKER_MIN_SIGMA_DB) s = NOISE_TRACKER_MIN_SIGMA_DB;
     _sigma = s;
