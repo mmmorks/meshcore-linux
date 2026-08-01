@@ -61,7 +61,7 @@ bool LinuxSerialStream::begin(const char* path, int baud) {
 
 void LinuxSerialStream::end() {
   if (_fd >= 0) { close(_fd); _fd = -1; }
-  _peek = -1;
+  clearPeek();
 }
 
 int LinuxSerialStream::rawReadByte() {
@@ -70,22 +70,6 @@ int LinuxSerialStream::rawReadByte() {
   ssize_t n = ::read(_fd, &b, 1);
   if (n == 1) return b;
   return -1;  // n == 0 (no data) or -1/EAGAIN
-}
-
-int LinuxSerialStream::available() {
-  if (_peek >= 0) return 1;
-  _peek = rawReadByte();
-  return _peek >= 0 ? 1 : 0;
-}
-
-int LinuxSerialStream::read() {
-  if (_peek >= 0) { int b = _peek; _peek = -1; return b; }
-  return rawReadByte();
-}
-
-int LinuxSerialStream::peek() {
-  if (_peek < 0) _peek = rawReadByte();
-  return _peek;
 }
 
 size_t LinuxSerialStream::write(uint8_t c) {

@@ -1,5 +1,5 @@
 #pragma once
-#include <Stream.h>
+#include "PeekableStream.h"
 
 // Serial-device Stream for the ArduLinux (Linux) build.
 //
@@ -8,7 +8,7 @@
 // termios (raw mode, configured baud, non-blocking) and presents it as an
 // Arduino Stream so the shared MicroNMEALocationProvider can read/write NMEA
 // through it unchanged. Modelled on LinuxConsole's fd wrapping.
-class LinuxSerialStream : public Stream {
+class LinuxSerialStream : public PeekableStream {
 public:
   // Open `path` at `baud`. Returns true on success. On failure, logs the
   // device and errno and leaves the stream closed (isOpen() == false).
@@ -20,15 +20,12 @@ public:
   // Descriptor for the Linux event loop; -1 when closed.
   int fd() const { return _fd; }
 
-  int available() override;
-  int read() override;
-  int peek() override;
   size_t write(uint8_t c) override;
   using Print::write;
 
-private:
-  int rawReadByte();   // one raw byte from the fd, or -1
+protected:
+  int rawReadByte() override;   // one raw byte from the fd, or -1
 
-  int _fd   = -1;
-  int _peek = -1;      // one-byte lookahead, or -1
+private:
+  int _fd = -1;
 };

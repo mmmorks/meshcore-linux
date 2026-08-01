@@ -132,20 +132,8 @@ int LinuxConsole::rawReadByte() {
   return -1;
 }
 
-int LinuxConsole::available() {
-  if (_peek < 0) _peek = rawReadByte();
-  return _peek >= 0 ? 1 : 0;
-}
-
-int LinuxConsole::peek() {
-  if (_peek < 0) _peek = rawReadByte();
-  return _peek;
-}
-
 int LinuxConsole::read() {
-  int c;
-  if (_peek >= 0) { c = _peek; _peek = -1; }
-  else            { c = rawReadByte(); }
+  int c = PeekableStream::read();
   if (c == '\n') c = '\r';  // normalise Enter so the CLI's '\r' check fires
   return c;
 }

@@ -1,5 +1,5 @@
 #pragma once
-#include <Stream.h>
+#include "PeekableStream.h"
 
 // Control console for the ArduLinux (Linux) build.
 //
@@ -14,15 +14,13 @@
 // Command echo and replies are written back to the connected socket client, or
 // to stdout when driven from stdin. A socket client always takes priority over
 // stdin. This class is Linux-only; other platforms keep using hardware Serial.
-class LinuxConsole : public Stream {
+class LinuxConsole : public PeekableStream {
 public:
   // Open the control socket and, if stdin is a TTY, put it in raw non-blocking
   // mode. Call once from setup(). Never blocks.
   void begin();
 
-  int available() override;
-  int read() override;
-  int peek() override;
+  int read() override;     // PeekableStream::read() plus newline normalisation
   size_t write(uint8_t c) override;
   using Print::write;
 
@@ -35,15 +33,18 @@ public:
   int clientFd() const { return _client_fd; }   // connected client, -1 if none
   int stdinFd()  const;                         // STDIN_FILENO if a TTY, else -1
 
+protected:
+  // One raw byte from the active input, or -1. Prefers a live control-socket
+  // client, else accepts a pending one, else stdin.
+  int rawReadByte() override;
+
 private:
   bool tryAccept();
-  int  rawReadByte();      // one raw byte from the active input, or -1
   void writeByte(uint8_t c);
 
   int  _server_fd = -1;    // listening Unix socket
   int  _client_fd = -1;    // currently connected control client, or -1
   bool _stdin_tty = false;
-  int  _peek = -1;         // one-byte lookahead (raw, pre-newline-normalisation)
   char _sock_path[108] = {0};  // sockaddr_un.sun_path capacity
 };
 
