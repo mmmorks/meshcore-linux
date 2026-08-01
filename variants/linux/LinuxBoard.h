@@ -5,6 +5,8 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 #include <RadioLib.h>
 #include "LinuxEventSource.h"
 
@@ -121,6 +123,11 @@ public:
 };
 
 class LinuxRTCClock : public mesh::RTCClock {
+  // Latches the first settimeofday() failure. The callers are on timers (GPS
+  // time sync, the mesh clock correction), so an unlatched report would repeat
+  // for the life of the daemon.
+  bool _settime_warned = false;
+
 public:
   LinuxRTCClock() { }
   void begin() {
@@ -134,6 +141,20 @@ public:
     struct timeval tv;
     tv.tv_sec = time;
     tv.tv_usec = 0;
-    settimeofday(&tv, NULL);
+    if (settimeofday(&tv, NULL) == 0) return;
+
+    // Unlike an MCU, this is the whole host's clock, and setting it needs
+    // CAP_SYS_TIME. The shipped unit runs as an unprivileged `meshcore` user
+    // with NoNewPrivileges=yes, so it does not have it and this always fails --
+    // `clock sync` and GPS time sync would otherwise report success and do
+    // nothing at all. Not fatal: the host's clock is NTP's job on a Linux box,
+    // and getCurrentTime() reads it correctly either way.
+    if (!_settime_warned) {
+      _settime_warned = true;
+      printf("WARNING: cannot set the system clock (%s); mesh/GPS time sync will\n"
+             "         not take effect. This is expected under the shipped systemd\n"
+             "         unit (unprivileged, no CAP_SYS_TIME) -- keep the host on NTP.\n",
+             strerror(errno));
+    }
   }
 };
