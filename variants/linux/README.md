@@ -74,7 +74,11 @@ is the only way to catch a break in the untested one.
 
 ```sh
 sudo install -m 755 .pio/build/linux_repeater/meshcored /usr/bin/meshcored
+sudo install -m 755 variants/linux/meshcorectl /usr/bin/meshcorectl
 ```
+
+`meshcorectl` is the client for the node's CLI — see [step 5](#5-talk-to-the-running-node-meshcorectl). Install it now; once `meshcored`
+is running as a service it is the only way to reach the CLI.
 
 ### 2. Create the config file
 
@@ -202,7 +206,7 @@ back in. To use it immediately in one shell, prefix the command with
 | Flag | Description |
 |------|-------------|
 | `-d`, `--fsdir=DIR` | Directory to use as the VFS root, where all data is persisted. Default: `~/.local/share/meshcored/default` |
-| `-e`, `--erase` | Recursively wipe the VFS root, then start. This is a **full reset**: it also removes the node identity, so the node comes back with a new Repeater ID (see step 5). Never put this in the systemd unit. |
+| `-e`, `--erase` | Recursively wipe the VFS root, then start. This is a **full reset**: it also removes the node identity, so the node comes back with a new Repeater ID (see step 6). Never put this in the systemd unit. |
 | `--usage`, `-?` / `--help` | Short usage / full option list |
 | `-V`, `--version` | Print the firmware version |
 
@@ -236,6 +240,57 @@ sudo journalctl -u meshcored -f
 > owned by `meshcore:meshcore` before startup, so you don't need to pre-create it.
 > If you smoke-tested by running directly first, clear any stale state so the
 > service first-boots with the INI defaults: `sudo rm -rf /var/lib/meshcore/*`
+
+### 5. Talk to the running node (`meshcorectl`)
+
+Everything the MeshCore docs describe as the "serial CLI" — `set`, `get`,
+`prefs`, `advert`, `neighbors`, the `gps` commands — is reached here through
+`meshcorectl`.
+
+On an MCU the CLI is a two-way UART. On Linux the Arduino `Serial` object is
+output-only (its `read()` always returns -1), so there is nothing to type into:
+`meshcored` prints to stdout and listens for commands on a **Unix-domain control
+socket** instead. The first writable path of these wins, and startup logs which
+one it picked:
+
+| Order | Path |
+|-------|------|
+| 1 | `$MESHCORED_CONTROL_SOCKET`, if set |
+| 2 | `/run/meshcored/meshcored.sock` (created by the unit's `RuntimeDirectory=`) |
+| 3 | `$XDG_RUNTIME_DIR/meshcored.sock` |
+| 4 | `/tmp/meshcored.sock` |
+
+The socket is mode `0660`, owned by the user running the daemon, so reaching it
+means being that user, being in its group (`meshcore` for the packaged service),
+or being root:
+
+```sh
+sudo meshcorectl                    # interactive REPL
+sg meshcore -c meshcorectl          # or via the group
+```
+
+Three ways to drive it:
+
+```sh
+meshcorectl                         # REPL: line editing, history, Tab completion
+meshcorectl set name my-repeater    # one-shot: send one command, print reply, exit
+printf 'prefs\nneighbors\n' | meshcorectl    # piped: one command per line
+```
+
+The REPL is self-contained (no `socat`/`rlwrap` needed): arrow-key editing,
+Ctrl-R search, Tab completion of known commands, and history in
+`~/.meshcorectl_history`. `MESHCORED_CONTROL_SOCKET` overrides the path for the
+client exactly as it does for the daemon, which is how you reach a node that is
+not the packaged service.
+
+Only **one client at a time** is served; a second connection waits until the
+first disconnects. If you prefer raw tools, `sudo socat - UNIX-CONNECT:/run/meshcored/meshcored.sock`
+works too.
+
+**Running in a foreground terminal** — `meshcored` with no service behind it —
+you can skip the socket entirely and type commands straight into its stdin; the
+console reads the terminal directly (raw mode, echoing as you type). A connected
+socket client always takes priority over stdin while it is attached.
 
 ### Idle CPU usage
 
@@ -309,7 +364,7 @@ listening**, for the duration. That is inherent to CAD-before-TX rather than
 specific to this implementation, but it is worth knowing before enabling it on a
 high-SF preset.
 
-### 5. Reconfiguring after first run
+### 6. Reconfiguring after first run
 
 Node name, password, and location can be changed via the serial CLI after first boot:
 
@@ -375,7 +430,7 @@ sudo systemctl start meshcored
 
 - **Config path is hardcoded**, meshcored always loads `/etc/meshcored/meshcored.ini`; there is no flag to point it elsewhere. (The data *path* is separate and configurable: it is the ArduLinux VFS root, set with `--fsdir`.)
 - **Only repeater firmware**, there is no `linux_companion` target yet; companion radio support (BLE/serial interface to a phone app) is not implemented for Linux.
-- **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 5.
+- **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 6.
 - **No power management**, `board.sleep()` is a no-op; the power-saving loop in `main.cpp` never actually sleeps.
 - **Upstream-sync fragility**, the radio wrapper (`LinuxSX1262Wrapper`) implements the `RadioLibWrapper` interface by hand, so it can drift from upstream in two ways: a new **pure-virtual** method breaks the Linux build (e.g. `setParams()`), and a new **virtual-with-default** method silently no-ops on Linux until overridden (e.g. `set`/`getRxBoostedGainMode()`, which reported and applied the wrong state until added). Mirror `CustomSX1262Wrapper` when syncing.
 - **libgpiod v2 is compile-verified only**, `EventGPIOPin`'s v2 code path (Debian trixie and newer) builds cleanly in CI/`build-docker.sh`, but it has never been exercised at runtime against real hardware — all runtime verification to date has been on libgpiod v1 (Debian bookworm). Treat the v2 path as unproven until someone runs it on a Pi.
