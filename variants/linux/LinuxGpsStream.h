@@ -10,6 +10,26 @@
 // Modelled on LinuxConsole's fd wrapping.
 class LinuxGpsStream : public PeekableStream {
 public:
+  enum Transport { NONE, SERIAL, GPSD };
+
+  // Parsed gps_device value. Public because both begin() and the ini
+  // validation in LinuxBoard need to ask "is this string usable?" -- the
+  // validator has to answer before any device is opened.
+  struct Target {
+    Transport transport = NONE;
+    char      host[64]  = "";   // GPSD only
+    int       port      = 0;    // GPSD only
+    bool      valid     = false;
+  };
+
+  // Parse a gps_device value. Never touches hardware.
+  //   ""                       -> NONE   (GPS disabled), valid
+  //   "gpsd://[host][:port]"   -> GPSD,  defaults 127.0.0.1:2947
+  //   anything else            -> SERIAL (a /dev path)
+  // valid == false means the operator wrote a gpsd:// URL that cannot be
+  // honoured; the caller counts it as a bad value and refuses to start.
+  static Target parseDevice(const char* device);
+
   // Open `path` at `baud`. Returns true on success. On failure, logs the
   // device and errno and leaves the stream closed (isOpen() == false).
   // Non-fatal: callers proceed without GPS.

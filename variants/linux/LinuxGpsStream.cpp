@@ -5,6 +5,60 @@
 #include <termios.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+
+static const char GPSD_SCHEME[] = "gpsd://";
+static const char GPSD_DEFAULT_HOST[] = "127.0.0.1";
+static const int  GPSD_DEFAULT_PORT = 2947;
+
+LinuxGpsStream::Target LinuxGpsStream::parseDevice(const char* device) {
+  Target t;
+
+  if (device == NULL || device[0] == '\0') {
+    t.transport = NONE;
+    t.valid = true;
+    return t;
+  }
+
+  if (strncmp(device, GPSD_SCHEME, sizeof(GPSD_SCHEME) - 1) != 0) {
+    t.transport = SERIAL;
+    t.valid = true;
+    return t;
+  }
+
+  t.transport = GPSD;
+  const char* rest = device + sizeof(GPSD_SCHEME) - 1;
+
+  // Split host from port on the single permitted ':'. More than one means an
+  // IPv6 literal (or a typo); either way host:port cannot be recovered
+  // unambiguously, so reject rather than guess.
+  const char* colon = strchr(rest, ':');
+  size_t host_len = colon ? (size_t)(colon - rest) : strlen(rest);
+
+  if (colon != NULL) {
+    if (strchr(colon + 1, ':') != NULL) return t;   // invalid: multiple colons
+    const char* p = colon + 1;
+    if (*p == '\0') return t;                        // invalid: "host:"
+    char* endp = NULL;
+    long port = strtol(p, &endp, 10);
+    if (endp == NULL || *endp != '\0') return t;     // invalid: non-numeric
+    if (port < 1 || port > 65535) return t;          // invalid: out of range
+    t.port = (int) port;
+  } else {
+    t.port = GPSD_DEFAULT_PORT;
+  }
+
+  if (host_len >= sizeof(t.host)) return t;          // invalid: host too long
+  if (host_len == 0) {
+    strcpy(t.host, GPSD_DEFAULT_HOST);
+  } else {
+    memcpy(t.host, rest, host_len);
+    t.host[host_len] = '\0';
+  }
+
+  t.valid = true;
+  return t;
+}
 
 // Map an integer baud to the matching termios Bxxxx constant.
 // Unknown values log and fall back to B9600.
