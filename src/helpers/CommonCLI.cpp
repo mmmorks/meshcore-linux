@@ -378,14 +378,22 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       } else {
         strcpy(reply, "error");
       }
-    } else if (memcmp(command, "gps interval", 12) == 0) {
+    } else if (memcmp(command, "gps interval", 12) == 0
+               && (command[12] == 0 || command[12] == ' ')) {
       // Seconds between location reads. 0 means "use the firmware default"
       // (1 s), matching how applyGpsPrefs() interprets a zero pref.
-      if (strlen(command) == 12) {
+      //
+      // The prefix match needs the delimiter check: without it "gps intervalX"
+      // matches here and then parses command[13] -- past the 'X' -- as the
+      // argument, so a mistyped command silently sets the interval to 0 instead
+      // of falling through to the generic "gps" handler and being rejected.
+      const char* arg = &command[12];
+      while (*arg == ' ') arg++;
+      if (*arg == 0) {   // bare `gps interval` (or only trailing spaces): report
         sprintf(reply, "> %u", (unsigned) _prefs->gps_interval);
       } else {
         char secs_str[12];
-        uint32_t secs = _atoi(&command[13]);
+        uint32_t secs = _atoi(arg);
         if (secs > 86400) secs = 86400;   // cap at 24 hours
         sprintf(secs_str, "%u", (unsigned) secs);
         if (_sensors->setSettingValue("gps_interval", secs_str)) {
