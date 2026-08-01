@@ -435,11 +435,38 @@ sees nothing.
 `/etc/chrony/chrony.conf`:
 
 ```
-refclock SHM 0 refid GPS offset 0.0 delay 0.2
+refclock SHM 0 refid GPS offset 0.307 delay 0.2
 ```
 
-Verify with `chronyc sources` (a `GPS` line) and `meshcorectl gps` (fix and
-satellite count, as before).
+The `offset` is not optional and it is board-specific. NMEA without PPS arrives
+some way after the second it describes, so the refclock reads consistently late;
+left uncorrected, chrony marks it a **falseticker** (`#x` in `chronyc sources`)
+and ignores it entirely. `0.307` is what this HAT measured — start at `0.0`,
+read the steady-state figure from `chronyc sources`, and put it in as a positive
+number:
+
+```sh
+chronyc sources        # e.g. "#x GPS  ...  +307ms[ +307ms]"  ->  offset 0.307
+```
+
+The value is systematic, not noise (std dev was ~5 ms over the sample), so one
+constant fixes it. Note the sign: a *positive* offset cancels a positive
+reported error. Getting it backwards doubles the error instead.
+
+Verify with `chronyc sources` (a `GPS` line that is no longer `#x`) and
+`meshcorectl gps` (fix and satellite count, as before).
+
+With a network present chrony will usually still prefer a good NTP server —
+NMEA-only GPS is worth about ±100 ms against a stratum-1 peer's ±30 ms, so being
+listed as `#-` rather than `#*` is correct, not broken. To prove GPS really can
+hold the clock alone, take the network sources away:
+
+```sh
+sudo chronyc offline    # refclocks are unaffected
+# ~4 minutes later, once the NTP peers age out:
+chronyc tracking        # Reference ID : 47505300 (GPS), Stratum : 1
+sudo chronyc online
+```
 
 The daemon reconnects to gpsd on its own, with backoff, so start order does not
 matter and restarting gpsd underneath a running node is safe. It also drops the
