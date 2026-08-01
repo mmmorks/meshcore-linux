@@ -57,8 +57,13 @@ protected:
   void      setPinMode(PinMode m) override;
 
 private:
-  bool requestWithEdges(PinMode m);   // input + rising-edge detection
-  bool requestPlainInput(PinMode m);  // fallback, no edge detection
+  // Request the line as an input, with or without rising-edge detection. The
+  // two differ by one setting on v2 and by which gpiod_line_request_* family is
+  // called on v1, so they share one body; the named wrappers below keep the
+  // call sites (and the invariants documented against them) reading the same.
+  bool requestInput(PinMode m, bool with_edges);
+  bool requestWithEdges(PinMode m)  { return requestInput(m, true); }
+  bool requestPlainInput(PinMode m) { return requestInput(m, false); }
   bool requestOutput(PinStatus initial);
 
   // Release the line/chip/event-buffer (whichever are currently held) and
@@ -80,6 +85,12 @@ private:
   struct gpiod_chip* _chip   = NULL;
   unsigned int       _offset = 0;
   bool               _edge_ok = false;
+
+  // Latches the first readPinHardware() failure so the log is not flooded from
+  // a path called every event-loop iteration. Per-instance rather than a
+  // function-local static: a static would let one pin's failure suppress
+  // another's first report entirely.
+  bool               _read_warned = false;
 #if EVGPIO_GPIOD_V == 2
   struct gpiod_edge_event_buffer* _evbuf = NULL;
 #endif

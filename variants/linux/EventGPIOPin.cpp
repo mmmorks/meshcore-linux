@@ -219,13 +219,13 @@ void EventGPIOPin::releaseResources() {
 // ---------------------------------------------------------------------------
 // Line (re)configuration.
 //
-// On v2 the three request*() helpers below share everything except the
+// On v2 the request*() helpers below share everything except the
 // gpiod_line_settings they build: wrap the settings in a line_config, then
 // either request the line (first call, _line still NULL) or reconfigure it
 // in place (every later call, e.g. from setPinMode()). applySettings() holds
 // that shared tail so each helper is just its settings calls plus one call
 // here. v1 has no equivalent config object -- each mode is a distinct
-// gpiod_line_request_*() call -- so it stays three independent bodies below.
+// gpiod_line_request_*() call -- so its branches stay separate below.
 // ---------------------------------------------------------------------------
 
 #if EVGPIO_GPIOD_V == 2
@@ -263,30 +263,30 @@ bool EventGPIOPin::applySettings(struct gpiod_line_settings* settings) {
 }
 #endif
 
-bool EventGPIOPin::requestWithEdges(PinMode m) {
+bool EventGPIOPin::requestInput(PinMode m, bool with_edges) {
 #if EVGPIO_GPIOD_V == 1
-  int rv;
-  if (m == INPUT_PULLUP) {
-    rv = gpiod_line_request_rising_edge_events_flags(
-        _line, consumer, GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
-  } else if (m == INPUT_PULLDOWN) {
-    rv = gpiod_line_request_rising_edge_events_flags(
-        _line, consumer, GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN);
-  } else {
-    rv = gpiod_line_request_rising_edge_events(_line, consumer);
-  }
+  // The flagless entry points libgpiod v1 offers -- gpiod_line_request_input()
+  // and gpiod_line_request_rising_edge_events() -- are defined as their _flags
+  // counterparts called with 0, so passing 0 here covers plain INPUT exactly.
+  int flags = 0;
+  if (m == INPUT_PULLUP)        flags = GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP;
+  else if (m == INPUT_PULLDOWN) flags = GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN;
+
+  int rv = with_edges
+      ? gpiod_line_request_rising_edge_events_flags(_line, consumer, flags)
+      : gpiod_line_request_input_flags(_line, consumer, flags);
   _last_errno = errno;
   return rv == 0;
 #else
-  // This is the only place _edge_ok is ever set true (see both call sites),
-  // so guaranteeing _evbuf here -- and only here -- is what makes "_edge_ok
-  // implies a usable _evbuf" an actual invariant rather than a hopeful
-  // comment: eventFd() and drainEvents() can then both trust _edge_ok alone,
-  // with no separate _evbuf check of their own to fall out of sync. Lazy
-  // (rather than always allocating in the constructor) because this is the
-  // only path that needs it, and it costs nothing to retry the allocation
+  // The edge-detecting path is the only place _edge_ok is ever set true (see
+  // both call sites), so guaranteeing _evbuf here -- and only here -- is what
+  // makes "_edge_ok implies a usable _evbuf" an actual invariant rather than a
+  // hopeful comment: eventFd() and drainEvents() can then both trust _edge_ok
+  // alone, with no separate _evbuf check of their own to fall out of sync.
+  // Lazy (rather than always allocating in the constructor) because this is
+  // the only path that needs it, and it costs nothing to retry the allocation
   // here if a prior attempt failed.
-  if (!_evbuf) {
+  if (with_edges && !_evbuf) {
     _evbuf = gpiod_edge_event_buffer_new(16);
     if (!_evbuf) {
       _last_errno = errno;
@@ -300,34 +300,8 @@ bool EventGPIOPin::requestWithEdges(PinMode m) {
   struct gpiod_line_settings* settings = gpiod_line_settings_new();
   if (!settings) { _last_errno = errno; return false; }
   gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
-  gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_RISING);
-  if (m == INPUT_PULLUP)
-    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
-  else if (m == INPUT_PULLDOWN)
-    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_DOWN);
-
-  return applySettings(settings);
-#endif
-}
-
-bool EventGPIOPin::requestPlainInput(PinMode m) {
-#if EVGPIO_GPIOD_V == 1
-  int rv;
-  if (m == INPUT_PULLUP) {
-    rv = gpiod_line_request_input_flags(_line, consumer,
-                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
-  } else if (m == INPUT_PULLDOWN) {
-    rv = gpiod_line_request_input_flags(_line, consumer,
-                                        GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN);
-  } else {
-    rv = gpiod_line_request_input(_line, consumer);
-  }
-  _last_errno = errno;
-  return rv == 0;
-#else
-  struct gpiod_line_settings* settings = gpiod_line_settings_new();
-  if (!settings) { _last_errno = errno; return false; }
-  gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+  if (with_edges)
+    gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_RISING);
   if (m == INPUT_PULLUP)
     gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
   else if (m == INPUT_PULLDOWN)
@@ -366,13 +340,12 @@ PinStatus EventGPIOPin::readPinHardware() {
     // here with no other symptom -- silently stops all packet RX. This is
     // called every event-loop iteration, so latch rather than flood: log the
     // first occurrence only.
-    static bool warned = false;
-    if (!warned) {
+    if (!_read_warned) {
       log(SysGPIO, LogError,
           "EventGPIOPin(%s): read failed (%s); reading LOW until this is "
           "resolved (further occurrences suppressed)",
           getName(), strerror(errno));
-      warned = true;
+      _read_warned = true;
     }
     return LOW;
   }
