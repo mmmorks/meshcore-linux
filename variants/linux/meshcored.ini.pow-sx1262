@@ -15,6 +15,13 @@ lora_cr = 8
 lora_tcxo = 1.8
 lora_tx_power = 22
 
+# This HAT has no onboard GPS. If one is added (e.g. a USB receiver fed to a
+# local gpsd), see gps_device/gps_baud/gps_en_pin in meshcored.ini.waveshare
+# and "Disciplining the host clock from GNSS" in README.md. defer_clock
+# overrides whether meshcored sets the system clock from GPS/mesh time sync;
+# unset (default) follows gps_device's transport.
+# defer_clock = true
+
 # First-run node defaults (ignored after first boot; use CLI to change):
 advert_name = PoW Linux Repeater
 admin_password = changeme
