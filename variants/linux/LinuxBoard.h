@@ -40,18 +40,26 @@ public:
   bool use_regulator_ldo = false;
   bool rx_register_patch = false;
 
-  char* spidev = "/dev/spidev0.0";
-  char* lora_gpiochip = "gpiochip0";
+  const char* spidev = "/dev/spidev0.0";
+  const char* lora_gpiochip = "gpiochip0";
 
   float lora_tcxo = 1.8f;
 
-  char *advert_name = "Linux Repeater";
-  char *admin_password = "password";
+  const char *advert_name = "Linux Repeater";
+  const char *admin_password = "password";
   float lat = 0.0f;
   float lon = 0.0f;
-  char *gps_device = "";
+  const char *gps_device = "";
   int   gps_baud   = 9600;
   int   gps_en_pin = -1;
+
+  // Transport-derived by default (see the setExternallyDisciplined() call in
+  // target.cpp): -1 leaves that default alone. An explicit `defer_clock =
+  // true/false` in meshcored.ini pins it to 1/0 regardless of gps_device's
+  // transport -- needed because gpsd is not the only way this process can end
+  // up racing something else that owns the clock (e.g. a serial gps_device
+  // plus CAP_SYS_TIME), and the transport string alone cannot see that.
+  int8_t defer_clock = -1;
 
   // Outcome of parsing meshcored.ini. Two failure kinds, kept apart because
   // they deserve opposite responses (see LinuxBoard::begin()): a value the
@@ -91,8 +99,17 @@ public:
     exit(0);
   }
 
+  // The ardulinux core's global ::reboot() (cores/ardulinux/main.cpp) re-execs
+  // this same process via execv(), with --erase stripped from argv so a
+  // reboot cannot re-trigger a filesystem wipe. exit(0) here would be wrong:
+  // the shipped systemd unit uses Restart=on-failure, not Restart=always, so
+  // a clean exit is a stop, not a restart -- and both the `reboot` and
+  // `clkreboot` CLI commands reach this from an authenticated remote admin
+  // over the mesh (CommonCLI::handleCommand), so that would take an
+  // unattended repeater off-air. Qualified as ::reboot() to resolve to the
+  // global one and not recurse into this member of the same name.
   void reboot() override {
-    exit(0);
+    ::reboot();
   }
 
   // Block on the LoRa IRQ edge descriptor plus whichever console descriptors
@@ -154,9 +171,10 @@ public:
     if (_externally_disciplined) {
       if (!_settime_warned) {
         _settime_warned = true;
-        printf("NOTE: not setting the system clock -- gps_device names gpsd, so\n"
-               "      chrony owns the clock. GPS and mesh time sync are ignored\n"
-               "      here by design; getCurrentTime() still reads the host clock.\n");
+        printf("NOTE: not setting the system clock -- another clock source owns it\n"
+               "      (gps_device names gpsd, or defer_clock = true in meshcored.ini).\n"
+               "      GPS and mesh time sync are ignored here by design; getCurrentTime()\n"
+               "      still reads the host clock.\n");
       }
       return;
     }
@@ -164,7 +182,16 @@ public:
     struct timeval tv;
     tv.tv_sec = time;
     tv.tv_usec = 0;
-    if (settimeofday(&tv, NULL) == 0) return;
+    if (settimeofday(&tv, NULL) == 0) {
+      // Deliberately not deduped like the messages below: this line's whole
+      // value is showing *every* time GPS/mesh sync steps the clock, so a
+      // clock fighting something else outside the gpsd case above -- a
+      // serial gps_device plus CAP_SYS_TIME, see defer_clock in
+      // meshcored.ini -- is visible in the journal instead of silently
+      // winning or losing against it.
+      printf("NOTE: system clock set to %u by mesh/GPS time sync.\n", (unsigned) time);
+      return;
+    }
 
     // Unlike an MCU, this is the whole host's clock, and setting it needs
     // CAP_SYS_TIME. The shipped unit runs as an unprivileged `meshcore` user

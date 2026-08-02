@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <errno.h>
+#include <climits>
 #include <exception>
 #ifdef ARDULINUX_HARDWARE
 #include "linux/gpio/LinuxGPIOPin.h"
@@ -90,6 +92,10 @@ void ardulinuxSetup() {
 }
 
 void LinuxBoard::begin() {
+  // Only NORMAL applies here -- this board never wakes from a radio IRQ or
+  // deep sleep the way an MCU variant can, so nothing else ever sets this.
+  startup_reason = BD_STARTUP_NORMAL;
+
 #ifndef ARDULINUX_HARDWARE
   printf("FATAL: meshcored was built without libgpiod support; all GPIO/I2C\n"
          "       operations would be simulated and the radio cannot be driven.\n"
@@ -232,7 +238,11 @@ void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   // be pure latency: poll tightly instead. Same tradeoff (and same value) as
   // the delay(1) fallback in ESP32Board::sleep().
   const bool have_events = (src != NULL && src->eventFd() >= 0);
-  const int  timeout_ms  = have_events ? (int) max_wait_ms : 1;
+  // poll(2) (which EventLoop.wait() below calls into) treats a negative
+  // timeout as "block forever". max_wait_ms > INT_MAX would cast negative and
+  // silently turn a bounded wait into an infinite one, so clamp instead.
+  const uint32_t wait_ms    = max_wait_ms > (uint32_t) INT_MAX ? (uint32_t) INT_MAX : max_wait_ms;
+  const int      timeout_ms = have_events ? (int) wait_ms : 1;
 
   EventLoop.reset();
   EventLoop.setEventSource(src);
@@ -325,7 +335,10 @@ static char *trim(char *str) {
   return str;
 }
 
-static char *safe_copy(char *value, size_t maxlen) {
+// *ok reports whether `retval` is a malloc() this function made (and so is
+// safe to free() later) as opposed to the literal fallback below -- assign_string()
+// below needs that distinction to avoid ever handing a string literal to free().
+static char *safe_copy(char *value, size_t maxlen, bool *ok) {
   char *retval;
   size_t length = strlen(value) + 1;
   if (length > maxlen) length = maxlen;
@@ -336,10 +349,12 @@ static char *safe_copy(char *value, size_t maxlen) {
     // the daemon dereferences. An empty string is the one answer that is both
     // safe and visibly wrong. (Same char*-from-literal the field defaults use.)
     printf("ERROR: meshcored.ini: out of memory copying a value; using \"\"\n");
+    *ok = false;
     return (char *) "";
   }
   strncpy(retval, value, length - 1);
   retval[length - 1] = '\0';
+  *ok = true;
   return retval;
 }
 
@@ -365,6 +380,99 @@ static bool parse_pin(const char *key, const char *value, long lo, long *out, in
   return true;
 }
 
+// Parse a float config value. atof() silently stops at the first
+// non-numeric character (`lora_freq = 868,5` -> 868.0) and returns 0.0 for
+// anything that parses as nothing at all (`lora_freq = abc` -> 0.0) with no
+// diagnostic either way -- exactly the silent-misconfiguration class
+// LinuxBoard::begin()'s FATAL branch exists to rule out.
+static bool parse_float(const char *key, const char *value, float *out, int *bad_values) {
+  char *end = NULL;
+  float v = strtof(value, &end);
+  if (end == value || *end != '\0') {
+    printf("ERROR: meshcored.ini: %s = '%s' is not a valid number\n", key, value);
+    (*bad_values)++;
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+// Parse a bounded integer config value. Shares parse_pin()'s rationale: `lo`
+// and `hi` are the field's own type width (e.g. -128..127 for an int8_t), so
+// a value atoi() would otherwise truncate into something silently different
+// -- `lora_tx_power = 300` becoming 44 -- is caught here instead.
+static bool parse_int(const char *key, const char *value, long lo, long hi, long *out, int *bad_values) {
+  char *end = NULL;
+  long v = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || v < lo || v > hi) {
+    printf("ERROR: meshcored.ini: %s = '%s' is not a valid integer (expected %ld..%ld)\n",
+           key, value, lo, hi);
+    (*bad_values)++;
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+// Parse a boolean config value. The bug this replaces: `atoi(value) != 0`
+// treats anything not starting with a digit as false, so
+// `dio2_as_rf_switch = true` -- the spelling every other bool in this file
+// invites -- silently becomes false, with the DIO2 RF switch left unset and
+// TX dead on boards that need it. Accept the spellings the shipped
+// meshcored.ini.* templates use and reject everything else as a bad value.
+static bool parse_bool(const char *key, const char *value, bool *out, int *bad_values) {
+  if (strcasecmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+      strcasecmp(value, "on") == 0 || strcasecmp(value, "yes") == 0) {
+    *out = true;
+    return true;
+  }
+  if (strcasecmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+      strcasecmp(value, "off") == 0 || strcasecmp(value, "no") == 0) {
+    *out = false;
+    return true;
+  }
+  printf("ERROR: meshcored.ini: %s = '%s' is not a valid boolean "
+         "(expected 1/0, true/false, on/off, yes/no)\n", key, value);
+  (*bad_values)++;
+  return false;
+}
+
+// Accept exactly the bauds LinuxGpsStream::openSerial() can program via
+// termios (see baud_to_speed() in LinuxGpsStream.cpp, read-only for this
+// file); anything else silently falls back to B9600 at open time, which
+// reads as a dead GPS rather than a typo'd config value.
+static bool parse_gps_baud(const char *value, int *out, int *bad_values) {
+  static const int VALID_BAUDS[] = { 4800, 9600, 19200, 38400, 57600, 115200 };
+  char *end = NULL;
+  long v = strtol(value, &end, 10);
+  if (end != value && *end == '\0') {
+    for (size_t i = 0; i < sizeof(VALID_BAUDS) / sizeof(VALID_BAUDS[0]); i++) {
+      if (v == VALID_BAUDS[i]) {
+        *out = (int) v;
+        return true;
+      }
+    }
+  }
+  printf("ERROR: meshcored.ini: gps_baud = '%s' is not a supported rate "
+         "(expected one of 4800, 9600, 19200, 38400, 57600, 115200)\n", value);
+  (*bad_values)++;
+  return false;
+}
+
+// Copy `value` into a string field, freeing whatever it pointed to if this
+// field has already been assigned once during this load() call. The
+// compile-time default is a string literal and not ours to free; `*owned`
+// tracks the transition from "still the default" to "a safe_copy()
+// allocation" (and stays false across an out-of-memory copy, which is the
+// literal fallback again), so a duplicate key does not leak the previous
+// allocation or free() something that was never malloc()'d.
+static void assign_string(const char **field, bool *owned, char *value, size_t maxlen) {
+  if (*owned) free((void *) *field);
+  bool ok = false;
+  *field = safe_copy(value, maxlen, &ok);
+  *owned = ok;
+}
+
 LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
   LoadResult result;
 
@@ -372,9 +480,34 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
   if (!f) return result;   // result.opened stays false
   result.opened = true;
 
+  // String fields start out pointing at their compile-time literal default;
+  // *_owned flips true the first time this load() call replaces it with a
+  // safe_copy() allocation, so a duplicate key knows there is something of
+  // its own to free before overwriting it again.
+  bool spidev_owned = false, lora_gpiochip_owned = false,
+       advert_name_owned = false, admin_password_owned = false,
+       gps_device_owned = false;
+
   bool first_line = true;
   char line[512];
   while (fgets(line, sizeof(line), f)) {
+    // fgets() stops at sizeof(line)-1 bytes even mid-line, with no '\n' to
+    // show it. Left unhandled, the unread remainder is read as its own line
+    // next iteration and parsed as a fresh key=value pair -- silently
+    // splitting one overlong line into a truncated setting plus a bogus
+    // "unknown key". Nothing this loop writes is anywhere near this long, so
+    // treat it as a line that cannot be honoured rather than guess where it
+    // was meant to end.
+    size_t raw_len = strlen(line);
+    if (raw_len == sizeof(line) - 1 && line[raw_len - 1] != '\n' && !feof(f)) {
+      int c;
+      while ((c = fgetc(f)) != EOF && c != '\n') { }
+      printf("ERROR: meshcored.ini: line exceeds %zu bytes; discarding it\n", sizeof(line) - 1);
+      result.bad_values++;
+      first_line = false;
+      continue;
+    }
+
     char *p = line;
 
     // Strip a UTF-8 BOM. An editor that writes one would otherwise glue it to
@@ -397,7 +530,14 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
 
     char *key = p;
     while (*p && !isspace((unsigned char)*p) && *p != '=') p++;
-    if (*p == '\0') continue;
+    if (*p == '\0') {
+      // No '=' anywhere on the line, and no key/value split possible either --
+      // was silently dropped before. Inert like an unknown key (nothing here
+      // consumes it), so counted the same way rather than treated as fatal.
+      printf("ERROR: meshcored.ini: line '%s' has no '=' (ignored)\n", trim(key));
+      result.unknown_keys++;
+      continue;
+    }
     *p++ = '\0';
 
     while (*p && (isspace((unsigned char)*p) || *p == '=')) p++;
@@ -419,19 +559,24 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
       }
     }
 
-    if (strcmp(key, "spidev") == 0)         spidev = safe_copy(value, 32);
-    else if (strcmp(key, "lora_gpiochip") == 0) lora_gpiochip = safe_copy(value, 32);
-    else if (strcmp(key, "lora_freq") == 0) lora_freq = atof(value);
-    else if (strcmp(key, "lora_bw") == 0)   lora_bw = atof(value);
-    else if (strcmp(key, "lora_sf") == 0)   lora_sf = (uint8_t)atoi(value);
-    else if (strcmp(key, "lora_cr") == 0)   lora_cr = (uint8_t)atoi(value);
-    else if (strcmp(key, "lora_tcxo") == 0) lora_tcxo = atof(value);
-    else if (strcmp(key, "lora_tx_power") == 0)   lora_tx_power = atoi(value);
-    else if (strcmp(key, "current_limit") == 0)  current_limit = atof(value);
-    else if (strcmp(key, "dio2_as_rf_switch") == 0)  dio2_as_rf_switch = atoi(value) != 0;
-    else if (strcmp(key, "rx_boosted_gain") == 0)  rx_boosted_gain = atoi(value) != 0;
-    else if (strcmp(key, "use_regulator_ldo") == 0)  use_regulator_ldo = atoi(value) != 0;
-    else if (strcmp(key, "rx_register_patch") == 0)  rx_register_patch = atoi(value) != 0;
+    long ival = 0;
+    float fval = 0.0f;
+    bool bval = false;
+
+    if (strcmp(key, "spidev") == 0)         assign_string(&spidev, &spidev_owned, value, 32);
+    else if (strcmp(key, "lora_gpiochip") == 0) assign_string(&lora_gpiochip, &lora_gpiochip_owned, value, 32);
+    else if (strcmp(key, "lora_freq") == 0) { if (parse_float(key, value, &fval, &result.bad_values)) lora_freq = fval; }
+    else if (strcmp(key, "lora_bw") == 0)   { if (parse_float(key, value, &fval, &result.bad_values)) lora_bw = fval; }
+    else if (strcmp(key, "lora_sf") == 0)   { if (parse_int(key, value, 0, 255, &ival, &result.bad_values)) lora_sf = (uint8_t) ival; }
+    else if (strcmp(key, "lora_cr") == 0)   { if (parse_int(key, value, 0, 255, &ival, &result.bad_values)) lora_cr = (uint8_t) ival; }
+    else if (strcmp(key, "lora_tcxo") == 0) { if (parse_float(key, value, &fval, &result.bad_values)) lora_tcxo = fval; }
+    else if (strcmp(key, "lora_tx_power") == 0) { if (parse_int(key, value, -128, 127, &ival, &result.bad_values)) lora_tx_power = (int8_t) ival; }
+    else if (strcmp(key, "current_limit") == 0) { if (parse_float(key, value, &fval, &result.bad_values)) current_limit = fval; }
+    else if (strcmp(key, "dio2_as_rf_switch") == 0) { if (parse_bool(key, value, &bval, &result.bad_values)) dio2_as_rf_switch = bval; }
+    else if (strcmp(key, "rx_boosted_gain") == 0)   { if (parse_bool(key, value, &bval, &result.bad_values)) rx_boosted_gain = bval; }
+    else if (strcmp(key, "use_regulator_ldo") == 0) { if (parse_bool(key, value, &bval, &result.bad_values)) use_regulator_ldo = bval; }
+    else if (strcmp(key, "rx_register_patch") == 0) { if (parse_bool(key, value, &bval, &result.bad_values)) rx_register_patch = bval; }
+    else if (strcmp(key, "defer_clock") == 0)       { if (parse_bool(key, value, &bval, &result.bad_values)) defer_clock = bval ? 1 : 0; }
 
     else if (strcmp(key, "lora_irq_pin") == 0)   { if (parse_pin(key, value, 0, &pin, &result.bad_values)) lora_irq_pin   = (uint32_t) pin; }
     else if (strcmp(key, "lora_reset_pin") == 0) { if (parse_pin(key, value, 0, &pin, &result.bad_values)) lora_reset_pin = (uint32_t) pin; }
@@ -440,24 +585,24 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
     else if (strcmp(key, "lora_rxen_pin") == 0)  { if (parse_pin(key, value, 0, &pin, &result.bad_values)) lora_rxen_pin  = (uint32_t) pin; }
     else if (strcmp(key, "lora_txen_pin") == 0)  { if (parse_pin(key, value, 0, &pin, &result.bad_values)) lora_txen_pin  = (uint32_t) pin; }
 
-    else if (strcmp(key, "advert_name") == 0)    advert_name = safe_copy(value, 100);
-    else if (strcmp(key, "admin_password") == 0) admin_password = safe_copy(value, 100);
-    else if (strcmp(key, "lat") == 0)            lat = atof(value);
-    else if (strcmp(key, "lon") == 0)            lon = atof(value);
+    else if (strcmp(key, "advert_name") == 0)    assign_string(&advert_name, &advert_name_owned, value, 100);
+    else if (strcmp(key, "admin_password") == 0) assign_string(&admin_password, &admin_password_owned, value, 100);
+    else if (strcmp(key, "lat") == 0) { if (parse_float(key, value, &fval, &result.bad_values)) lat = fval; }
+    else if (strcmp(key, "lon") == 0) { if (parse_float(key, value, &fval, &result.bad_values)) lon = fval; }
     else if (strcmp(key, "gps_device") == 0)  {
       // Validate here rather than at open time: bad_values makes begin() refuse
       // to start, which is the right answer for a device string the operator
       // wrote and we cannot honour. Discovering it later would instead look
       // like an absent GPS.
       if (LinuxGpsStream::parseDevice(value).valid) {
-        gps_device = safe_copy(value, 64);
+        assign_string(&gps_device, &gps_device_owned, value, 64);
       } else {
         printf("ERROR: meshcored.ini: gps_device '%s' is not a device path or a "
                "usable gpsd:// URL\n", value);
         result.bad_values++;
       }
     }
-    else if (strcmp(key, "gps_baud") == 0)    gps_baud = atoi(value);
+    else if (strcmp(key, "gps_baud") == 0) { int baud; if (parse_gps_baud(value, &baud, &result.bad_values)) gps_baud = baud; }
     else if (strcmp(key, "gps_en_pin") == 0)  { if (parse_pin(key, value, -1, &pin, &result.bad_values)) gps_en_pin = (int) pin; }
 
     else {
