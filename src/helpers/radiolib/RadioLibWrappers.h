@@ -78,6 +78,15 @@ public:
   // _noise_floor goes with it: getNoiseFloor() reports the cached value, and
   // leaving it behind would keep serving the old floor to isChannelActive() and
   // to telemetry until the first sub-window of the new configuration closes.
+  //
+  // The cost, which is the whole reason this is a judgement call rather than an
+  // obvious win: for the ~3 s until the first sub-window closes, _nf.ready() is
+  // false, so isChannelActive() skips the interference-threshold branch
+  // entirely and getNoiseFloor() reports 0. The node transmits over the top of
+  // anything that check would have caught, and telemetry shows an uncalibrated
+  // floor. That is accepted deliberately -- 3 s of no RSSI check beats 180 s of
+  // a wrong one, and the CAD check is unaffected throughout -- but a caller
+  // adding a new reset site should know it is spending that, not nothing.
   void resetNoiseFloor() { _nf.reset(); _noise_floor = 0; _noise_log_ctr = 0; }
 
   // Called by every setParams() override, which is why the reset above lives

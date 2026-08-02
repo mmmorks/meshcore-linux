@@ -69,25 +69,46 @@
   // CSMA margin RadioLibWrapper derives from it (NOISE_THRESHOLD_SIGMA_K *
   // sigma) from 2.8 dB to 10.5 dB, overriding the operator's
   // interference_threshold in exactly the busy mesh where it was set. The same
-  // run settles at 1.6 dB with the gate fixed.
+  // run settles at 1.5 dB with the gate fixed -- but see the sweep below before
+  // taking that one figure for the whole story.
   //
-  // A fixed gate does not merely slow that loop, it removes it: admitting a
-  // sample can no longer widen the set of samples admitted next, and since an
-  // admitted sample raises _dev by at most the gate width, sigma is bounded
-  // outright at GATE/biasK.
+  // What a fixed gate buys is the removal of that loop, and nothing more. It is
+  // NOT a tighter numeric bound: GATE/biasK is 8.5/2.835 = 3.0, the same number
+  // MAX_SIGMA already imposes. The difference is structural -- signal above the
+  // gate is excluded however much of it there is, instead of being kept out
+  // only until enough of it gets in to move the gate.
+  //
+  // Traffic *inside* the gate still inflates sigma, and needs no feedback loop
+  // to do it. At a 0.8 dB spread the gate sits about 6.2 dB above the mean
+  // (8.5 - biasK*0.8), so sustained traffic parked just under that is admitted
+  // wholesale. Swept at 80% occupancy against a 0.8 dB floor, worst sigma by
+  // packet level above the mean:
+  //
+  //   dB above mean:  +2    +3    +4    +5    +6    +7    +8    +9
+  //   this gate:     1.45  1.74  2.04  2.27  2.35  2.24  1.51  0.90
+  //   old gate:      1.45  1.74  2.04  2.33  2.63  2.92  3.00  0.87
+  //
+  // So the fix is worth nothing below +5, everything above +6, and the residual
+  // peak is 2.35 dB at +6 -- a CSMA margin of 8.2 dB where 2.8 would be right.
+  // Do not read the gate as a guarantee about sigma; read it as a guarantee
+  // that the *set* of samples reaching sigma cannot grow.
+  //
+  // No gate can do better here. Censoring a packet 5 dB above the floor means
+  // sitting below mean + 5, which censors genuine noise at any spread past
+  // ~1.2 dB. Signal that weak and noise that wide are not separable by an RSSI
+  // threshold, and pretending otherwise just moves the damage.
   //
   // The value is biasK * MAX_SIGMA (2.835 * 3.0): never look further above the
   // window statistic than the largest mean offset the estimator is allowed to
-  // report, which makes the bound above exactly the MAX_SIGMA clamp -- now
-  // reachable only by genuine spread. Measured from the mean rather than from
-  // windowValue() the gate is still >=4 sigma for spreads up to 1.25 dB and
-  // >=3 sigma up to 1.45 dB, against the 0.6-0.9 dB these receivers actually
-  // produce, so censoring bias on genuine noise stays negligible across the
-  // whole plausible range. Above ~2 dB the noise tail starts to overflow the
-  // gate and sigma reads low (simulated: 1.98 dB at a true 2.5, 2.12 at a true
-  // 3.0). That is the deliberate trade, and it is the safe direction: a low
-  // sigma reads the floor low, which fires the busy check early -- absorbed by
-  // CSMA backoff -- rather than losing a detection.
+  // report. Measured from the mean rather than from windowValue() the gate is
+  // still >=4 sigma for spreads up to 1.25 dB and >=3 sigma up to 1.45 dB,
+  // against the 0.6-0.9 dB these receivers actually produce, so censoring bias
+  // on genuine noise stays negligible across the whole plausible range. Above
+  // ~2 dB the noise tail starts to overflow the gate and sigma reads low
+  // (simulated: 1.98 dB at a true 2.5, 2.12 at a true 3.0). That is the
+  // deliberate trade, and it is the safe direction: a low sigma reads the floor
+  // low, which fires the busy check early -- absorbed by CSMA backoff -- rather
+  // than losing a detection.
   #define NOISE_TRACKER_SCALE_GATE_DB  8.5f
 #endif
 
@@ -279,8 +300,13 @@ public:
    *
    * Measured as the mean amount by which noise samples exceed the window
    * statistic. That gap is exactly what the bias table predicts -- biasK() *
-   * sigma -- so dividing by biasK() inverts it. Samples well above the window
-   * statistic are censored out, so channel occupancy cannot widen it.
+   * sigma -- so dividing by biasK() inverts it. Samples far enough above the
+   * window statistic are censored out, which stops channel occupancy from
+   * widening this without limit. It does not stop it widening this at all:
+   * traffic inside the gate is indistinguishable from a wide noise floor, and
+   * sustained traffic 4-6 dB above the floor still reads as ~2.3 dB of spread
+   * against a true 0.8. NOISE_TRACKER_SCALE_GATE_DB has the measured sweep and
+   * the reason no gate can do better.
    *
    * Anchoring to windowValue() rather than to the floor estimate is deliberate,
    * and it applies to the censoring gate as much as to the deviation itself.
@@ -288,9 +314,9 @@ public:
    * positive feedback loop: a floor reading Delta too high makes the mean
    * deviation ~Delta, which inflates sigma, which raises the floor further; a
    * gate placed relative to it widens as sigma grows and admits the very signal
-   * that grew it (see NOISE_TRACKER_SCALE_GATE_DB). windowValue() is
-   * sigma-independent, so neither loop exists, and sigma is bounded outright at
-   * NOISE_TRACKER_SCALE_GATE_DB / biasK rather than only by MAX_SIGMA.
+   * that grew it. windowValue() is sigma-independent, so neither loop exists --
+   * which fixes the set of samples that can reach this estimate, not the value
+   * it can reach.
    */
   float sigma() const { return _sigma; }
 

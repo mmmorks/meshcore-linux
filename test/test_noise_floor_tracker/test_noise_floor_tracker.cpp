@@ -445,6 +445,39 @@ TEST(NoiseFloorTracker, SigmaIsBoundedUnderSustainedNearFloorTraffic) {
   EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 3.0f);
 }
 
+// The worst point on the curve, not the best one. The test above picks the
+// packet level where the fix helps most; this one picks where it helps least.
+//
+// The gate sits about 6.2 dB above the mean at this spread, so traffic parked
+// just under it is admitted wholesale -- no feedback needed, and none of the
+// fix's benefit available. Sweeping level at 80% occupancy, worst sigma runs
+// 1.45 / 1.74 / 2.04 / 2.27 / 2.35 / 2.24 / 1.51 at +2..+8 dB, against
+// 1.45 / 1.74 / 2.04 / 2.33 / 2.63 / 2.92 / 3.00 for the pre-fix gate: nothing
+// gained below +5, everything above +6. This pins the peak of that curve so the
+// suite describes the whole bound and not just its good end.
+//
+// Read it as a ceiling on a known residual rather than as a regression guard.
+// The pre-fix gate scores 2.63 here against this gate's 2.35, so it does trip
+// the bound -- by 0.03 dB, which is seed noise, not a signal. The two tests
+// either side of this one are the ones with real separation (3.00 and 2.83
+// against 1.51 and 1.83); this one exists to record where the curve peaks.
+TEST(NoiseFloorTracker, SigmaResidualAtTheWorstPacketLevelIsBounded) {
+  NoiseFloorTracker nf;
+  Rng rng(20260802);
+  feedNoise(nf, rng, 5000, NOISE_MEAN, MEASURED_SIGMA);
+  ASSERT_NEAR(MEASURED_SIGMA, nf.sigma(), 0.3f);
+
+  // +6 dB at 80% occupancy: the peak.
+  float worst = feedBurstyTraffic(nf, rng, 2000, 20, 5, 6.0f, -1.0f, MEASURED_SIGMA);
+  EXPECT_LT(worst, 2.6f)
+      << "residual grew past the level this gate is known to permit: sigma "
+      << worst << " dB (CSMA margin " << 3.5f * worst << " dB)";
+
+  // And the floor has still not followed the traffic, which is what keeps this
+  // a scale-estimate problem rather than a floor problem.
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 5.0f);
+}
+
 // The same bound under the messier version: a spread of link budgets rather
 // than one repeated level, which is what gave the old gate its foothold -- the
 // weakest packets got in, widened it, and let the rest follow.
