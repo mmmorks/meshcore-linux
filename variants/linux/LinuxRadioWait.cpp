@@ -3,6 +3,7 @@
 #include "LinuxEventLoop.h"
 #include "LinuxEventSource.h"
 
+#include <limits.h>
 #include <time.h>
 
 // Slice length used when the event source has no usable edge descriptor. With
@@ -51,7 +52,15 @@ bool waitForIrqAsserted(LinuxIrqLevel& level, LinuxEventSource* src,
     // spin: wait() drains the source it reports readable, and applies its own
     // cool-off to the degenerate cases (POLLNVAL, POLLHUP, poll() failure)
     // that would otherwise return instantly forever.
-    loop.wait(have_events ? (int)(deadline - now) : IRQ_WAIT_FALLBACK_SLICE_MS);
+    //
+    // Clamped rather than cast: timeout_ms is a uint32_t and poll() takes an
+    // int, so a caller asking for more than INT_MAX ms (~24.8 days) would hand
+    // poll() a negative timeout, which means "block forever" -- the unbreakable
+    // hang this whole function exists to make impossible. Nothing asks for that
+    // today; the clamp is here so that nothing can.
+    uint64_t remaining = deadline - now;
+    if (remaining > (uint64_t)INT_MAX) remaining = (uint64_t)INT_MAX;
+    loop.wait(have_events ? (int)remaining : IRQ_WAIT_FALLBACK_SLICE_MS);
   }
 }
 
