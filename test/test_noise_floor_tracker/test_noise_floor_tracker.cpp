@@ -30,6 +30,13 @@ public:
 const float NOISE_MEAN  = -110.0f;
 const float NOISE_SIGMA = 2.0f;
 
+// The spread a receiver actually shows: 0.6-0.9 dB measured on a live SX1262 at
+// 250 kHz. NOISE_SIGMA above is deliberately wider so the bias correction gets
+// exercised, but the traffic tests want the real number -- the distance from a
+// true 0.8 dB up to the 3 dB MAX_SIGMA cap is the whole span the censoring gate
+// used to be able to travel, and starting at 2.0 hides most of it.
+const float MEASURED_SIGMA = 0.8f;
+
 // Samples needed to fill the ring completely: the short first sub-window plus a
 // full-length one for every remaining slot.
 const int FULL_WINDOW = NOISE_TRACKER_FIRST_SUB_SAMPLES
@@ -38,6 +45,35 @@ const int FULL_WINDOW = NOISE_TRACKER_FIRST_SUB_SAMPLES
 void feedNoise(NoiseFloorTracker& nf, Rng& rng, int n,
                float mean = NOISE_MEAN, float sd = NOISE_SIGMA) {
   for (int i = 0; i < n; i++) nf.addSample(mean + sd * rng.normal());
+}
+
+// A duty-cycled interferer: `cycles` repetitions of `on` samples at
+// mean + delta (or, when delta_hi > delta, at a level drawn per burst from
+// [delta, delta_hi]) followed by `off` samples of plain noise. Noise of the
+// same spread rides on both, since a packet does not replace the noise.
+//
+// Bursty rather than i.i.d. on purpose: it is the quiet gaps that keep
+// windowValue() on the true floor, so this is the shape of traffic that can
+// inflate the scale estimate while leaving the floor itself correct.
+// Returns the widest sigma seen at any point, not the final one: the failure
+// this guards against is transient by nature -- the estimate climbs while the
+// traffic runs and relaxes once it stops -- so sampling only at the end would
+// miss exactly the excursion that matters.
+float feedBurstyTraffic(NoiseFloorTracker& nf, Rng& rng, int cycles, int on, int off,
+                        float delta, float delta_hi = -1.0f, float sd = NOISE_SIGMA) {
+  float worst = nf.sigma();
+  for (int c = 0; c < cycles; c++) {
+    float lvl = delta_hi > delta ? delta + (delta_hi - delta) * rng.uniform() : delta;
+    for (int i = 0; i < on; i++) {
+      nf.addSample(NOISE_MEAN + lvl + sd * rng.normal());
+      if (nf.sigma() > worst) worst = nf.sigma();
+    }
+    for (int i = 0; i < off; i++) {
+      nf.addSample(NOISE_MEAN + sd * rng.normal());
+      if (nf.sigma() > worst) worst = nf.sigma();
+    }
+  }
+  return worst;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +108,15 @@ TEST(NoiseFloorTracker, ConvergesToNoiseMean) {
 TEST(NoiseFloorTracker, BiasCorrectionHoldsAcrossScales) {
   // The bias is proportional to sigma, so one coefficient must work for every
   // plausible noise spread. If BIAS_K were tuned to a single sigma this fails.
-  const float sigmas[] = { 0.5f, 1.0f, 2.0f, 3.0f };
-  for (int i = 0; i < 4; i++) {
+  //
+  // "Plausible" is bounded above by the censoring gate: the gate is a fixed
+  // width above the window statistic, so once the noise tail itself reaches
+  // past it -- somewhere above 2 dB, against the 0.6-0.9 dB these receivers
+  // measure -- part of the distribution is censored and the estimate reads low.
+  // That is the documented trade for a gate signal cannot widen
+  // (NOISE_TRACKER_SCALE_GATE_DB), and the next test pins the direction.
+  const float sigmas[] = { 0.5f, 1.0f, 2.0f };
+  for (int i = 0; i < 3; i++) {
     NoiseFloorTracker nf;
     Rng rng(900 + i);
     feedNoise(nf, rng, 6000, NOISE_MEAN, sigmas[i]);
@@ -82,11 +125,53 @@ TEST(NoiseFloorTracker, BiasCorrectionHoldsAcrossScales) {
   }
 }
 
+// Beyond the gate's range the estimate must degrade in the safe direction. A
+// floor that reads low fires the busy-channel check early and CSMA backoff
+// absorbs it; a floor that reads high loses the detection outright, and that
+// packet is not coming back.
+TEST(NoiseFloorTracker, ImplausiblyWideNoiseReadsLowNotHigh) {
+  const float sigmas[] = { 2.5f, 3.0f };
+  for (int i = 0; i < 2; i++) {
+    NoiseFloorTracker nf;
+    Rng rng(910 + i);
+    feedNoise(nf, rng, 6000, NOISE_MEAN, sigmas[i]);
+    EXPECT_LE((float)nf.floorDbm(), NOISE_MEAN + 1.0f)
+        << "floor read high at sigma = " << sigmas[i];
+    EXPECT_GE((float)nf.floorDbm(), NOISE_MEAN - 2.0f * sigmas[i])
+        << "floor read uselessly low at sigma = " << sigmas[i];
+  }
+}
+
 TEST(NoiseFloorTracker, EstimatesScale) {
   NoiseFloorTracker nf;
   Rng rng(999);
   feedNoise(nf, rng, 5000);
   EXPECT_NEAR(NOISE_SIGMA, nf.sigma(), 0.8f);
+}
+
+// Warm-up has a direction, and only one of the two is affordable. A floor that
+// reads high raises the busy-channel comparison with it, and the detection lost
+// that way is lost for good; a floor that reads low only fires the check early,
+// which CSMA backoff absorbs. The estimator is asymmetric by design for exactly
+// this reason, and the asymmetry has to hold at every ring occupancy, not just
+// at the full window -- a node that has just changed bandwidth walks through
+// all twelve of them.
+TEST(NoiseFloorTracker, WarmUpNeverReadsHighAtAnyRingOccupancy) {
+  for (uint32_t seed = 0; seed < 8; seed++) {
+    NoiseFloorTracker nf;
+    Rng rng(31000 + seed * 977);
+    for (int w = 1; w <= NOISE_TRACKER_SUB_WINDOWS; w++) {
+      feedNoise(nf, rng, w == 1 ? NOISE_TRACKER_FIRST_SUB_SAMPLES
+                                : NOISE_TRACKER_SUB_SAMPLES);
+      ASSERT_TRUE(nf.ready());
+      EXPECT_LE((float)nf.floorDbm(), NOISE_MEAN + 1.0f)
+          << "floor read high with " << w << " sub-window(s) in the ring (seed "
+          << seed << ")";
+      // The other side of the same claim: low is safe, but not arbitrarily so.
+      EXPECT_GE((float)nf.floorDbm(), NOISE_MEAN - 5.0f)
+          << "floor read uselessly low with " << w << " sub-window(s) in the ring";
+    }
+  }
 }
 
 TEST(NoiseFloorTracker, ConvergesWithinAFewSecondsOfSamples) {
@@ -324,6 +409,55 @@ TEST(NoiseFloorTracker, SigmaIsUnaffectedByASustainedInterferer) {
   }
   EXPECT_NEAR(quiet_sigma, worst, 0.3f)
       << "interference widened the estimated noise spread to " << worst << " dB";
+}
+
+// Regression: the censoring gate used to be placed at
+// windowValue() + biasK*sigma + max(6 dB, 4*sigma). Both of those terms grow
+// with sigma, so admitting a weak packet widened the gate that had admitted it
+// -- positive feedback, bounded only by MAX_SIGMA. Under sustained traffic a
+// few dB above the floor it ratcheted all the way there, which silently takes
+// the CSMA margin RadioLibWrapper derives from sigma (NOISE_THRESHOLD_SIGMA_K *
+// sigma) from ~2.8 dB to 10.5 dB, overriding the operator's
+// interference_threshold in exactly the busy mesh where they set it.
+//
+// The gate is a fixed width above the window statistic now, so an admitted
+// sample cannot widen the set of samples admitted next.
+TEST(NoiseFloorTracker, SigmaIsBoundedUnderSustainedNearFloorTraffic) {
+  NoiseFloorTracker nf;
+  Rng rng(20260802);
+  feedNoise(nf, rng, 5000, NOISE_MEAN, MEASURED_SIGMA);
+  ASSERT_NEAR(MEASURED_SIGMA, nf.sigma(), 0.3f);
+
+  // 80% occupancy, every packet 8 dB above the floor: 2 s of packet, 0.5 s of
+  // gap, for ~85 minutes at a 100 ms sampling interval. This is the exact shape
+  // that used to pin sigma at MAX_SIGMA.
+  float worst = feedBurstyTraffic(nf, rng, 2000, 20, 5, 8.0f, -1.0f, MEASURED_SIGMA);
+  EXPECT_LT(worst, 2.2f)
+      << "sustained traffic 8 dB above the floor widened sigma to " << worst << " dB"
+      << " (CSMA margin " << 3.5f * worst << " dB)";
+
+  // ...and the floor itself is still the floor, which is what makes the sigma
+  // reading above wrong rather than merely large. Not exact: at this occupancy
+  // each sub-window holds far fewer clean samples than the bias table assumes,
+  // so the window statistic sits a little high. A couple of dB of that is
+  // inherent and is not what this test is about -- following the traffic to
+  // -102 would be.
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 3.0f);
+}
+
+// The same bound under the messier version: a spread of link budgets rather
+// than one repeated level, which is what gave the old gate its foothold -- the
+// weakest packets got in, widened it, and let the rest follow.
+TEST(NoiseFloorTracker, SigmaIsBoundedUnderMixedStrengthTraffic) {
+  NoiseFloorTracker nf;
+  Rng rng(4711);
+  feedNoise(nf, rng, 5000, NOISE_MEAN, MEASURED_SIGMA);
+  ASSERT_NEAR(MEASURED_SIGMA, nf.sigma(), 0.3f);
+
+  float worst = feedBurstyTraffic(nf, rng, 2000, 20, 20, 3.0f, 10.0f, MEASURED_SIGMA);
+  EXPECT_LT(worst, 2.4f)
+      << "traffic 3-10 dB above the floor widened sigma to " << worst << " dB";
+  EXPECT_NEAR((float)NOISE_MEAN, (float)nf.floorDbm(), 3.0f);
 }
 
 TEST(NoiseFloorTracker, SigmaStaysWithinPhysicalBounds) {

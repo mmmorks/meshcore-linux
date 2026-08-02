@@ -40,7 +40,8 @@
   // Scale ceiling. Receiver noise spread is set by bandwidth, temperature and
   // LNA gain state; measured on a live SX1262 at 250 kHz the median sits at
   // 0.6-0.9 dB, so 3 dB is generous headroom and anything beyond it is not a
-  // noise spread.
+  // noise spread. NOISE_TRACKER_SCALE_GATE_DB is derived from this value;
+  // raising one without the other leaves the gate as the binding constraint.
   #define NOISE_TRACKER_MAX_SIGMA_DB  3.0f
 #endif
 
@@ -51,11 +52,43 @@
   #define NOISE_TRACKER_SIGMA_LAMBDA  0.02f
 #endif
 
-#ifndef NOISE_TRACKER_SIGMA_GATE_DB
-  // Samples above floor + max(this, 4*sigma) are excluded from the scale
-  // estimate. Signal energy must not widen the estimated noise spread, and at
-  // >=4 sigma the censoring bias on genuine noise samples is negligible.
-  #define NOISE_TRACKER_SIGMA_GATE_DB  6.0f
+#ifndef NOISE_TRACKER_SCALE_GATE_DB
+  // Censoring gate for the scale estimate: samples more than this far above the
+  // window statistic are treated as signal and take no part in it. Signal
+  // energy must not widen the estimated noise spread.
+  //
+  // Measured from windowValue(), deliberately, and NOT from the floor estimate
+  // or from any multiple of sigma. An earlier revision censored above
+  // windowValue() + biasK*sigma + max(6 dB, 4*sigma): both of those terms grow
+  // with the quantity the gate exists to protect, which closes a positive
+  // feedback loop under sustained near-floor traffic. Packets a few dB above
+  // the floor are admitted, they raise _dev, the wider gate then admits
+  // stronger packets, and sigma ratchets up until MAX_SIGMA stops it. Simulated
+  // against this exact code -- 80% channel occupancy, packets 8 dB above a
+  // 0.8 dB floor -- sigma reached the 3.0 dB cap, which silently widens the
+  // CSMA margin RadioLibWrapper derives from it (NOISE_THRESHOLD_SIGMA_K *
+  // sigma) from 2.8 dB to 10.5 dB, overriding the operator's
+  // interference_threshold in exactly the busy mesh where it was set. The same
+  // run settles at 1.6 dB with the gate fixed.
+  //
+  // A fixed gate does not merely slow that loop, it removes it: admitting a
+  // sample can no longer widen the set of samples admitted next, and since an
+  // admitted sample raises _dev by at most the gate width, sigma is bounded
+  // outright at GATE/biasK.
+  //
+  // The value is biasK * MAX_SIGMA (2.835 * 3.0): never look further above the
+  // window statistic than the largest mean offset the estimator is allowed to
+  // report, which makes the bound above exactly the MAX_SIGMA clamp -- now
+  // reachable only by genuine spread. Measured from the mean rather than from
+  // windowValue() the gate is still >=4 sigma for spreads up to 1.25 dB and
+  // >=3 sigma up to 1.45 dB, against the 0.6-0.9 dB these receivers actually
+  // produce, so censoring bias on genuine noise stays negligible across the
+  // whole plausible range. Above ~2 dB the noise tail starts to overflow the
+  // gate and sigma reads low (simulated: 1.98 dB at a true 2.5, 2.12 at a true
+  // 3.0). That is the deliberate trade, and it is the safe direction: a low
+  // sigma reads the floor low, which fires the busy check early -- absorbed by
+  // CSMA backoff -- rather than losing a detection.
+  #define NOISE_TRACKER_SCALE_GATE_DB  8.5f
 #endif
 
 #ifndef NOISE_TRACKER_MIN_DBM
@@ -84,9 +117,20 @@
 // extreme-value formula, which is not accurate at these window sizes. Indexing
 // by occupancy rather than using one constant matters during warm-up: a partly
 // filled ring has been minimised over fewer samples, so its value is closer to
-// the mean, and applying the full-window coefficient would over-correct by up
-// to 0.9 dB at sigma = 2. That error reads *high*, which is the direction that
-// loses detections, so it is worth a 12-entry table to remove.
+// the mean, and the full-window coefficient would over-correct there.
+//
+// What that costs is sigma(), not the reported floor. The coefficient cancels
+// out of the floor: updateScale() divides the measured mean excess by it and
+// floorEstimate() multiplies it straight back, so as long as neither sigma
+// clamp binds the floor is windowValue() + _dev whatever the table says.
+// Getting it wrong therefore misreports the *spread*: the full-window value
+// used throughout reads 16% low at the first sub-window and 12% at the second
+// (measured, at sigma = 2) while leaving the floor within 0.03 dB of correct at
+// both. That still matters, because sigma sets the CSMA margin under a
+// too-narrow interference_threshold (NOISE_THRESHOLD_SIGMA_K * sigma, in
+// RadioLibWrapper::isChannelActive) and decides where MIN_SIGMA/MAX_SIGMA start
+// binding -- and those clamps are the only route by which a wrong coefficient
+// can move the reported floor at all.
 #ifndef NOISE_TRACKER_BIAS_TABLE
   #define NOISE_TRACKER_BIAS_TABLE { \
     2.375f, 2.502f, 2.579f, 2.632f, 2.674f, 2.708f, \
@@ -235,16 +279,18 @@ public:
    *
    * Measured as the mean amount by which noise samples exceed the window
    * statistic. That gap is exactly what the bias table predicts -- biasK() *
-   * sigma -- so dividing by biasK() inverts it. Samples well above the floor
-   * are censored out, so channel occupancy cannot widen it.
+   * sigma -- so dividing by biasK() inverts it. Samples well above the window
+   * statistic are censored out, so channel occupancy cannot widen it.
    *
-   * Anchoring to windowValue() rather than to the floor estimate is deliberate.
-   * The floor is derived from sigma, so measuring spread about it closes a
+   * Anchoring to windowValue() rather than to the floor estimate is deliberate,
+   * and it applies to the censoring gate as much as to the deviation itself.
+   * The floor is derived from sigma, so anything measured about it closes a
    * positive feedback loop: a floor reading Delta too high makes the mean
-   * deviation ~Delta, which inflates sigma, which raises the floor further. It
-   * is bounded by MAX_SIGMA rather than divergent, but it degrades exactly when
-   * the estimate is already in transition. windowValue() is sigma-independent,
-   * so no such loop exists.
+   * deviation ~Delta, which inflates sigma, which raises the floor further; a
+   * gate placed relative to it widens as sigma grows and admits the very signal
+   * that grew it (see NOISE_TRACKER_SCALE_GATE_DB). windowValue() is
+   * sigma-independent, so neither loop exists, and sigma is bounded outright at
+   * NOISE_TRACKER_SCALE_GATE_DB / biasK rather than only by MAX_SIGMA.
    */
   float sigma() const { return _sigma; }
 
@@ -269,21 +315,19 @@ private:
   void updateScale(float rssi_dbm) {
     if (_valid == 0) return;    // no window statistic to measure against yet
 
-    // One ring scan serves both uses below -- floorEstimate() is windowValue()
-    // plus the bias term, and the deviation is measured against windowValue()
-    // itself. Reading it once also makes the two impossible to drift apart.
+    // One ring scan serves both uses below: the censoring gate and the
+    // deviation are both anchored on the window statistic, which is the only
+    // quantity here that neither signal nor the scale estimate can move.
+    // Reading it once also makes the two impossible to drift apart.
     const float wv = windowValue();
-    const float k  = biasK();
 
-    float gate = NOISE_TRACKER_SIGMA_GATE_DB;
-    if (4.0f * _sigma > gate) gate = 4.0f * _sigma;
-    if (rssi_dbm >= wv + k * _sigma + gate) return;   // signal or interferer, not noise
+    if (rssi_dbm >= wv + NOISE_TRACKER_SCALE_GATE_DB) return;   // signal or interferer, not noise
 
     float d = rssi_dbm - wv;
     if (d < 0.0f) d = 0.0f;     // below the window statistic only by sampling noise
     _dev += NOISE_TRACKER_SIGMA_LAMBDA * (d - _dev);
 
-    float s = _dev / k;
+    float s = _dev / biasK();
     if (s > NOISE_TRACKER_MAX_SIGMA_DB) s = NOISE_TRACKER_MAX_SIGMA_DB;
     if (s < NOISE_TRACKER_MIN_SIGMA_DB) s = NOISE_TRACKER_MIN_SIGMA_DB;
     _sigma = s;
