@@ -1,0 +1,41 @@
+#!/bin/sh
+# gnss-set-baud - put the HAT's GNSS receiver at 115200 before gpsd opens it.
+#
+# The receiver on the Waveshare LoRaWAN/GNSS HAT is an Allystar URANUS5, not a
+# u-blox. It answers enough of the u-blox binary protocol for gpsd's u-blox
+# driver to bind (NAV output plus CFG-MSG), and NAKs essentially everything
+# else -- including CFG-PRT, which is the u-blox way to set the baud rate. Its
+# native Allystar command set is reachable over plain NMEA and does work, so
+# the port speed is set with $PCAS01 rather than CFG-PRT.
+#
+# Why a script rather than an inline ExecStartPre: the command contains a '$'
+# and a CR/LF, and systemd applies its own $-expansion and C-escape processing
+# to Exec lines before /bin/sh ever sees them. Getting the string through both
+# layers intact is a quoting trap that fails silently -- the receiver would
+# just never see a valid sentence. A file sidesteps it.
+#
+# Runs from ExecStartPre, i.e. before gpsd opens the port, so there is no
+# window where gpsd is reading at the wrong speed.
+
+DEV="${1:-/dev/ttyAMA0}"
+CMD='$PCAS01,5*19'          # $PCAS01,5 = 115200 baud
+
+# Not an error: a node with no GNSS HAT still starts gpsd for other devices.
+[ -c "$DEV" ] || exit 0
+
+# The speed is volatile. It returns to 9600 whenever the module loses power,
+# but survives a gpsd restart -- so at this point the receiver may be listening
+# at either speed and there is no way to ask. Send at both. The wrong one is
+# line noise the receiver discards; the right one lands. This makes the script
+# idempotent, which matters because it runs on every gpsd start, not just boot.
+for speed in 9600 115200; do
+    stty -F "$DEV" "$speed" raw -echo clocal >/dev/null 2>&1 || continue
+    printf '%s\r\n' "$CMD" > "$DEV" 2>/dev/null
+    sleep 1
+done
+
+# Leave the port where gpsd is about to open it, so that if anything above went
+# wrong the failure surfaces as gpsd's own "no data received" rather than as a
+# speed mismatch that looks like dead hardware.
+stty -F "$DEV" 115200 raw -echo clocal >/dev/null 2>&1
+exit 0
