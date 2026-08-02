@@ -704,6 +704,48 @@ result settles around **±400 ns** dispersion and a sub-microsecond RMS offset.
 Against the ±100 ms of NMEA-only, that is roughly a five-order-of-magnitude
 improvement.
 
+#### Serving the time back to the network
+
+A node this well disciplined is worth more than one host's clock, but chronyd
+does not offer it by default and gives no hint that it is holding back: with no
+`allow` directive chrony 4 never opens UDP/123 at all, so the symptom on a
+client is a silent timeout rather than a refusal, and `ss -lun` on the node
+shows only chronyc's `127.0.0.1:323` control socket.
+
+Debian's `chrony.conf` starts with `confdir /etc/chrony/conf.d`, so add a file
+there rather than editing the shipped config:
+
+```
+# /etc/chrony/conf.d/serve-lan.conf
+allow 192.168.0.0/16
+```
+
+```sh
+sudo systemctl restart chrony
+ss -lun | grep :123        # want: 0.0.0.0:123
+sudo chronyc serverstats   # "NTP packets received" climbs as clients appear
+sudo chronyc clients       # who is asking
+```
+
+**Give the `allow` a subnet.** A bare `allow` permits everything, and that is a
+worse mistake here than it looks: the node runs no firewall, and if its
+interface has a globally-routable IPv6 address — as it does on this network —
+an unqualified `allow` publishes a stratum-1 server to the internet, not to the
+LAN. The address-family split matters too: `allow 192.168.0.0/16` covers v4
+only, so v6 clients keep timing out until a second `allow` names their prefix.
+Name the prefix; do not reach for the bare form to fix it.
+
+The restart is not free. chronyd comes back with an empty refclock filter and
+falls back to the pool — stratum 4 for the first couple of minutes — before PPS
+re-accumulates samples and `chronyc tracking` returns to Stratum 1 / Reference
+ID `50505300 (PPS)`. Clients asking during that window get served the pool's
+time, correctly labelled, which is harmless but will look like a regression to
+anyone who checks immediately after the restart.
+
+A single-source stratum 1 is also a single point of failure: lose sky and this
+node quietly becomes a stratum 3-4 relay of the Debian pool. Clients should list
+it alongside a couple of internet servers rather than pointing at it alone.
+
 #### Keeping GNSS up without meshcored
 
 Once chrony takes its time from the receiver, the dependency runs the wrong way
