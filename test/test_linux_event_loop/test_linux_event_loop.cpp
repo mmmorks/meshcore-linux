@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -188,6 +189,33 @@ TEST(LinuxEventLoopWait, StaleDescriptorReportsNothingReadable) {
   // Passing that count up would make the caller loop with no delay, which is
   // exactly the busy-wait this class removes.
   EXPECT_EQ(0, loop.wait(0));
+}
+
+TEST(LinuxEventLoopWait, HungUpDescriptorDoesNotSpinTheLoop) {
+  // The POLLHUP sibling of the POLLNVAL case above: a pipe whose write end is
+  // closed reports its hangup on every poll() and never clears, so passing that
+  // count up would reinstate the busy loop.
+  //
+  // Platforms disagree on the revents. Linux reports POLLHUP alone. macOS --
+  // where this native build runs -- also sets POLLIN, because read() returns 0
+  // without blocking and its poll() calls that readable; there the descriptor
+  // is genuinely drainable and one wake is the right answer. What must hold
+  // everywhere is that a hung-up descriptor never yields a wake the caller
+  // cannot clear, so assert the platform's own view of readability.
+  LinuxEventLoop loop;
+  loop.reset();
+
+  int fds[2];
+  ASSERT_EQ(0, pipe(fds));
+  close(fds[1]);            // hangup, with no data behind it
+  loop.registerFd(fds[0]);
+
+  struct pollfd probe = { fds[0], POLLIN, 0 };
+  ASSERT_GE(poll(&probe, 1, 0), 0);
+  int expected = (probe.revents & POLLIN) != 0 ? 1 : 0;
+
+  EXPECT_EQ(expected, loop.wait(0));
+  close(fds[0]);
 }
 
 TEST(LinuxEventLoopWait, CountsOnlyReadableDescriptors) {
