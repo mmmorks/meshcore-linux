@@ -433,8 +433,10 @@ Linux:
 
 - The floor is a minimum-statistics estimator (a bias-corrected minimum over a
   sliding window) that re-seeds itself whenever radio parameters or RX gain
-  state change (`set radio`, `set radio.rxgain`, …), instead of tracking a
-  stale floor from the previous receiver state for up to 180 s.
+  state actually change *at runtime* (`tempradio`, `set radio.rxgain`, …) —
+  not `set radio`, which only persists to `prefs.json` for the next
+  [reboot](#changing-settings-after-first-boot) — instead of tracking a stale
+  floor from the previous receiver state for up to 180 s.
 - The estimate's scale (sigma) is protected by a fixed censoring gate so that
   busy-channel traffic can no longer ratchet sigma upward without limit. This
   removes the *unbounded* growth, not the spread itself — sustained traffic a
