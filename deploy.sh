@@ -5,7 +5,6 @@
 #   ./deploy.sh                      # build + deploy to $MESHCORE_HOST (default: pimesh)
 #   ./deploy.sh othernode            # deploy to another ssh host
 #   SKIP_BUILD=1 ./deploy.sh         # reuse the existing build artifact
-#   ENV_NAME=linux ./deploy.sh       # deploy a different pio env
 #
 # Copies the binary and meshcorectl over, installs them, restarts the service,
 # and then insists the service actually came back up.
@@ -98,10 +97,16 @@ else
 fi
 
 # --- 3. ship ------------------------------------------------------------------
+#
+# STAGE is created remotely with mktemp -d rather than a name built from this
+# process's own PID: "/tmp/meshcore-deploy.$$" is predictable and, under the
+# default umask, world-writable, so on a shared node another local user could
+# pre-create it or swap the binary in the window between the scp below and the
+# sudo install that reads from it. mktemp -d picks an unguessable name owned
+# by (and, by default, readable/writable only by) the connecting user.
 
-STAGE="/tmp/meshcore-deploy.$$"
+STAGE="$(rsh 'mktemp -d')" || die "cannot create a staging directory on $HOST"
 say "copying to $HOST:$STAGE"
-rsh "mkdir -p $STAGE"
 scp "${SSH_OPTS[@]}" -q \
   "$BIN" \
   "$REPO_DIR/variants/linux/meshcorectl" \
@@ -120,10 +125,19 @@ scp "${SSH_OPTS[@]}" -q \
 #
 # A node that is not provisioned yet fails at the verification step with its own
 # log, which is a better diagnosis than anything this script could guess at.
+#
+# A failure *after* the stop (below) is different: the node is left stopped,
+# not merely "not yet updated", and with nothing said about why. The ERR trap
+# in the remote script covers exactly that gap -- it fires on any command that
+# would otherwise end the script silently under `set -e`, names the line that
+# failed, says plainly that meshcored may now be down, and removes the stage
+# dir so a retry does not accumulate them.
 
 say "installing"
-rsh "STAGE='$STAGE' bash -s" <<'REMOTE'
+rsh "STAGE='$STAGE' bash -s" <<'REMOTE' || die "remote install failed -- see the diagnosis above; meshcored may be left stopped on $HOST"
 set -euo pipefail
+
+trap 'ec=$?; echo "   !! install step failed (exit $ec) at line $LINENO -- meshcored may be stopped; removing $STAGE" >&2; rm -rf "$STAGE"' ERR
 
 # --- setup, all idempotent ---------------------------------------------------
 # Modelled on a node that works. Each step is a no-op once it has been done, so
