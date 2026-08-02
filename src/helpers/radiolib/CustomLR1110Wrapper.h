@@ -44,8 +44,13 @@ public:
 
   uint8_t getSpreadingFactor() const override { return ((CustomLR1110 *)_radio)->getSpreadingFactor(); }
   
+  // Changing the LNA gain state moves the noise floor, and this path does not
+  // go through setParams(). See RadioLibWrapper::resetNoiseFloor(); reset only
+  // on a successful change, since a rejected one leaves the frontend alone.
   bool setRxBoostedGainMode(bool en) override {
-    return ((CustomLR1110 *)_radio)->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
+    if (((CustomLR1110 *)_radio)->setRxBoostedGainMode(en) != RADIOLIB_ERR_NONE) return false;
+    resetNoiseFloor();
+    return true;
   }
   bool getRxBoostedGainMode() const override {
     return ((CustomLR1110 *)_radio)->getRxBoostedGainMode();

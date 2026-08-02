@@ -40,8 +40,13 @@ public:
 
   void doResetAGC() override { sx126xResetAGC((SX126x *)_radio); }
 
+  // Changing the LNA gain state moves the noise floor, and this path does not
+  // go through setParams(). See RadioLibWrapper::resetNoiseFloor(); reset only
+  // on a successful change, since a rejected one leaves the frontend alone.
   bool setRxBoostedGainMode(bool en) override {
-    return ((CustomSX1268 *)_radio)->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
+    if (((CustomSX1268 *)_radio)->setRxBoostedGainMode(en) != RADIOLIB_ERR_NONE) return false;
+    resetNoiseFloor();
+    return true;
   }
   bool getRxBoostedGainMode() const override {
     return ((CustomSX1268 *)_radio)->getRxBoostedGainMode();
