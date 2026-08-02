@@ -60,7 +60,34 @@ public:
   // LoRa symbol time in microseconds, for a spreading factor and a bandwidth in
   // kHz. Every airtime and timeout derived from the modem's rate starts here.
   static uint32_t symbolMicros(uint8_t sf, float bw) { return ((uint32_t)10000 << sf) / (bw * 10); }
-  void updatePreamble(uint8_t sf) { _preamble_sf = sf; _radio->setPreambleLength(preambleLengthForSF(sf)); }
+
+  // Discard the noise-floor estimate because the receiver it characterises has
+  // changed. Bandwidth is the big one -- the thermal floor moves ~6 dB going
+  // from 62.5 to 250 kHz -- but frequency and LNA gain move it too.
+  //
+  // Without this the estimate can only *rise* as contaminated sub-windows age
+  // out of the ring, so a floor that has genuinely jumped up takes the full
+  // NOISE_TRACKER_SUB_WINDOWS * NOISE_TRACKER_SUB_SAMPLES window (180 s at the
+  // default sampling rate) to be reported. That asymmetry is right for a floor
+  // that drifts and wrong for one the operator has just moved: with
+  // interference_threshold set, isChannelActive() would read busy against a
+  // stale floor and defer every transmit to getCADFailMaxDuration() for three
+  // minutes. The batch estimator this replaced re-converged in ~2 s, so the
+  // reset is what keeps a runtime `set bw` as cheap as it used to be.
+  //
+  // _noise_floor goes with it: getNoiseFloor() reports the cached value, and
+  // leaving it behind would keep serving the old floor to isChannelActive() and
+  // to telemetry until the first sub-window of the new configuration closes.
+  void resetNoiseFloor() { _nf.reset(); _noise_floor = 0; _noise_log_ctr = 0; }
+
+  // Called by every setParams() override, which is why the reset above lives
+  // here: it is the one hook every radio family already routes a parameter
+  // change through.
+  void updatePreamble(uint8_t sf) {
+    _preamble_sf = sf;
+    _radio->setPreambleLength(preambleLengthForSF(sf));
+    resetNoiseFloor();
+  }
   PacketMillis calcMaxPacketMillis(uint8_t sf, float bw, uint8_t cr, uint8_t preambleSymbols);
   virtual int16_t performChannelScan();
 

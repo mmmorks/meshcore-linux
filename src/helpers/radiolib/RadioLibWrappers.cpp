@@ -39,6 +39,14 @@
   #define NOISE_LOG_EVERY_N_SAMPLES  20
 #endif
 
+// Payload budget calcMaxPacketMillis() assumes when the modem cannot tell it
+// how long a packet takes. Long on purpose: this deadline exists to break a
+// stuck header IRQ, and one that expires early would clear the flags of a
+// packet still arriving.
+#ifndef MAX_PACKET_FALLBACK_PAYLOAD_US
+  #define MAX_PACKET_FALLBACK_PAYLOAD_US  4000000UL
+#endif
+
 static volatile uint8_t state = STATE_IDLE;
 
 // this function is called when a complete packet
@@ -62,11 +70,10 @@ void RadioLibWrapper::begin() {
     setFlag(); // LoRa packet is already received
   }
 
-  _noise_floor = 0;
   _threshold = 0;
   _cad_enabled = false;
 
-  _nf.reset();
+  resetNoiseFloor();          // clears _nf, _noise_floor and the log rate limiter
   _next_noise_sample = millis();
 }
 
@@ -333,7 +340,22 @@ PacketMillis RadioLibWrapper::calcMaxPacketMillis(uint8_t sf, float bw, uint8_t 
   // airtime for max packet at current radio settings
   uint32_t total_us   = _radio->getTimeOnAir(MAX_TRANS_UNIT);
   // airtime for payload only (no preamble, header or SOF)
-  uint32_t payload_us = total_us > preamble_us ? total_us - preamble_us : 4000 - preamble_us; // fallback to 4 secs at worst case
+  uint32_t payload_us;
+  if (total_us > preamble_us) {
+    payload_us = total_us - preamble_us;
+  } else {
+    // getTimeOnAir() gave nothing usable (it returns 0 on an unconfigured
+    // modem). Fall back to the 4 s this has always claimed -- as 4 s of
+    // *payload*, not as 4 s of total airtime minus the preamble.
+    //
+    // The value used to be 4000, i.e. 4 ms, and the subtraction underflowed for
+    // any setting whose preamble exceeds that: every one of them. An underflow
+    // here is not a mis-sized deadline but the absence of one, because the
+    // result becomes a ~49-day payload watchdog, so CustomSX1262::isReceiving()
+    // would hold a latched HEADER_VALID true forever and isReceiving() would
+    // never again report the channel idle.
+    payload_us = MAX_PACKET_FALLBACK_PAYLOAD_US;
+  }
   // rescale payload_us for max possible CR
   if (cr >= 5 && cr < 8) { payload_us = (payload_us * 8) / cr; }
 

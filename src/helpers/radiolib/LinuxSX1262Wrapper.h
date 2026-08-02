@@ -20,6 +20,14 @@ class LinuxSX1262Wrapper : public RadioLibWrapper {
   // reference -- so this is a naming convenience, not a checked conversion.
   LinuxSX1262* r() const { return (LinuxSX1262 *)_radio; }
 
+  // Same for the board. waitForRadioIrq() is LinuxBoard's, not
+  // mesh::MainBoard's, and this reaches it through the member the wrapper was
+  // constructed with rather than through the `board` global LinuxSX1262.h
+  // declares. Those are the same object today; going through the member is what
+  // keeps them the same object if a second instance is ever constructed, and
+  // stops this file quietly depending on a global it does not own.
+  LinuxBoard* b() const { return (LinuxBoard *)_board; }
+
 public:
   LinuxSX1262Wrapper(LinuxSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
 
@@ -62,7 +70,7 @@ public:
       return state;   // isChannelActive() reads anything but CHANNEL_FREE as busy
     }
 
-    if (!board.waitForRadioIrq(_cad_timeout_ms)) {
+    if (!b()->waitForRadioIrq(_cad_timeout_ms)) {
       // Logged every time rather than latched: the rate is bounded by transmit
       // attempts, and a line that has stopped reporting should stay visible for
       // as long as it is broken.
@@ -113,8 +121,15 @@ public:
   }
   uint8_t getSpreadingFactor() const override { return r()->spreadingFactor; }
 
+  // Toggling the LNA's boosted-gain mode moves the noise floor by a couple of
+  // dB, so whatever the estimator learned before it describes a different
+  // receiver. Same reasoning as setParams() -- see
+  // RadioLibWrapper::resetNoiseFloor() -- and only on a successful change,
+  // because a rejected one leaves the frontend exactly as it was.
   bool setRxBoostedGainMode(bool en) override {
-    return r()->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
+    if (r()->setRxBoostedGainMode(en) != RADIOLIB_ERR_NONE) return false;
+    resetNoiseFloor();
+    return true;
   }
   bool getRxBoostedGainMode() const override {
     return r()->getRxBoostedGainMode();
