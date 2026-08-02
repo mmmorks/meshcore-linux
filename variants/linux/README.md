@@ -151,7 +151,7 @@ Key settings:
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
 | `gps_device` | *(empty)* | Where to read NMEA from. A serial device path (e.g. `/dev/ttyACM0`), or `gpsd://[host][:port]` to read from a gpsd instance (default `127.0.0.1:2947`). Empty disables GPS. |
 | `gps_baud` | `9600` | Baud rate for a serial `gps_device`. One of 4800/9600/19200/38400/57600/115200. Ignored when `gps_device` names gpsd — gpsd owns the port and its baud rate. |
-| `gps_en_pin` | `-1` | GPIO line held HIGH to wake a GPS module that boots in standby (e.g. the L76K STANDBY line on the Waveshare LoRaWAN/GNSS HAT). `-1` = none. |
+| `gps_en_pin` | `-1` | GPIO line held HIGH to wake a GPS module that boots in standby (e.g. the L76K STANDBY line on the Waveshare LoRaWAN/GNSS HAT). `-1` = none. **Leave unset with a `gpsd://` source** and hold the line from the host instead — see [Keeping GNSS up without meshcored](#keeping-gnss-up-without-meshcored). |
 
 ### 3. Enable SPI and GPIO access
 
@@ -428,13 +428,17 @@ sudo apt install gpsd gpsd-clients chrony
 `/etc/default/gpsd`:
 
 ```sh
-DEVICES="/dev/ttyS0"
+DEVICES="/dev/ttyAMA0"      # /dev/ttyS0 on a Pi whose PL011 is not the GPS UART
 GPSD_OPTIONS="-n"
 ```
 
 `-n` is required. chrony's SHM refclock is not a gpsd socket client, so without
 it gpsd stops reading the receiver whenever meshcored disconnects, and chrony
 sees nothing.
+
+`-n` is necessary but **not sufficient** — Debian leaves gpsd socket-activated,
+so it does not run at all until a client connects. See [Keeping GNSS up without
+meshcored](#keeping-gnss-up-without-meshcored).
 
 `/etc/chrony/chrony.conf`:
 
@@ -453,9 +457,16 @@ number:
 chronyc sources        # e.g. "#x GPS  ...  +307ms[ +307ms]"  ->  offset 0.307
 ```
 
-The value is systematic, not noise (std dev was ~5 ms over the sample), so one
-constant fixes it. Note the sign: a *positive* offset cancels a positive
-reported error. Getting it backwards doubles the error instead.
+Note the sign: a *positive* offset cancels a positive reported error. Getting it
+backwards doubles the error instead.
+
+The value is systematic rather than noise *within* a session — std dev was ~5 ms
+over one sample — but it is not a constant of the board. It is dominated by how
+long the receiver takes to start its sentence burst plus how long that burst
+takes to clock out, so it moves with the sentence set and the baud rate. On this
+HAT it has been seen at 0.193 s, 0.307 s and 0.384 s at different times without
+gpsd being touched. Expect to re-check it, and see the PPS section below, which
+inverts this tuning advice once a pulse-per-second signal is available.
 
 Verify with `chronyc sources` (a `GPS` line that is no longer `#x`) and
 `meshcorectl gps` (fix and satellite count, as before).
@@ -473,9 +484,13 @@ sudo chronyc online
 ```
 
 The daemon reconnects to gpsd on its own, with backoff, so start order does not
-matter and restarting gpsd underneath a running node is safe. It also drops the
-connection while GPS is switched off and reconnects on `gps on`, so gpsd is
-never left holding a client that has stopped reading.
+matter and restarting gpsd underneath a running node is safe.
+
+`gps off` stops the reads rather than closing the socket, so gpsd is left
+holding a client that has stopped draining until it drops it itself. What the
+daemon does guarantee is that no stale NMEA is acted on: the first read after a
+gap of more than 5 s closes the old socket and reconnects, so `gps on` starts
+from live sentences instead of replaying whatever backed up while it was off.
 
 With a gpsd source the daemon no longer tries to set the system clock at all —
 chrony owns it. That is deliberate beyond tidiness: the other caller of the same
@@ -483,32 +498,446 @@ path is `clock sync` / `time <epoch>`, which carries a timestamp from a remote
 mesh peer, and on a general-purpose host that should never be able to move the
 clock.
 
-#### PPS is not available on the Waveshare LoRaWAN/GNSS HAT
+#### PPS on the Waveshare LoRaWAN/GNSS HAT (needs a hardware mod)
 
-Investigated and closed — do not re-investigate. The L76K does emit a
-pulse-per-second signal, but on the SX126X XXXM LoRaWAN/GNSS HAT it is **not
-routed to a Raspberry Pi header GPIO**. The schematic takes L76K pin 5 (`1PPS`,
-net `PPS`) through R19 to indicator LED `L_PPS1` and no further; no `PPS` net
-appears in the Raspberry Interface block. Confirmed empirically: 20 s of
-`gpiomon` across all 14 free header GPIOs (2, 3, 5, 6, 12, 13, 17, 19, 22–27)
-with a 21-satellite fix produced zero edges.
+The L76K emits a pulse-per-second signal, but the HAT does not route it to a
+Raspberry Pi header GPIO. L76K pin 4 (`1PPS`, net `PPS`) goes through R19 (510R)
+to indicator LED `L_PPS1` and no further; no `PPS` net reaches the Raspberry
+Interface block, and no unpopulated jumper or DNF resistor would route it. One
+wire fixes that.
 
-So there is no stratum-1 PPS refclock to be had on this board, and NMEA via
-gpsd (above) is the only route to GNSS timekeeping. On a HAT that *does* route
-PPS, add `dtoverlay=pps-gpio,gpiopin=<N>` and
-`refclock PPS /dev/pps0 refid PPS lock NMEA` — but PPS is a precision layer on
-top of gpsd, never a replacement for it, because it says when a second begins
-and not which second it is.
+It is worth soldering: NMEA-only is worth about ±100 ms, while kernel PPS on a
+Pi settles under a microsecond — bounded by interrupt latency, not by the
+receiver, whose PPS is spec'd in the tens of nanoseconds.
 
-Two related notes about this HAT, both easy to get wrong:
+PPS is a precision layer on top of gpsd, never a replacement for it, because it
+says when a second begins and not which second it is. Keep the NMEA refclock.
 
-- `gps_en_pin = 4` is load-bearing. R13 (marked `NC/0R`) is fitted, so driving
-  GPIO 4 low stops NMEA dead. The pin reads high when undriven only because of
-  the SoC's own default pull-up on GPIO 0–8, which is not something to rely on.
+##### Pins the HAT already uses
+
+Waveshare colour-codes the net labels in the Raspberry Interface block: maroon
+nets are connected on the HAT, green ones are pass-through and connect to
+nothing. Two of them are easy to misread as free:
+
+- `DIO4` is maroon at **BCM 6** (P1 pin 31). The HAT drives it as one of the two
+  `CTRL` inputs of U3 (PE4259 RF switch); the other is the SX1262's own `DIO2`.
+  The SX126X module has no DIO4 pin of its own.
+- `Pi_3V3` (pin 1) and `3V3_Pi` (pin 17) are green and dangle — **the HAT takes
+  only 5 V from the Pi** and regulates its own 3V3 with AMS-1 (AMS1117-3.3, fed
+  from P1 pins 2/4). The pads are unconnected on the HAT, but the Pi still
+  drives its rail onto them.
+
+A consequence of the second point: the PPS high level is the AMS1117 output, not
+the Pi's rail. Both are nominally 3.3 V and grounds are common, so no level
+shifting is needed — but the two rails are independently derived, which is one
+more reason for the series resistor below.
+
+##### Tapping the signal
+
+The `PPS` net's only accessible copper is R19 and the `L_PPS1` anode.
+
+**Option 1 — R19's Q1-side pad.** Full 3.3 V CMOS swing, LED keeps working. The
+layout puts R19 down beside Q1 while `L_PPS1` sits at the top-right board edge,
+so the short trace is Q1 pin 4 → R19 and the long one is R19 → LED. Identify the
+right pad by continuity to Q1 pin 4 (fourth castellated pad from the pin-1/GND
+corner), or with a scope: the `PPS`-side pad swings 0→3.3 V, the LED-side pad
+clamps at the LED's ~1.9 V forward drop. **Do not tap the LED side** — 1.9 V is
+marginal against the Pi's V_IH. Fit a 220–330R resistor in series with the tap.
+
+**Option 2 — remove `L_PPS1` and tap its anode pad.** Mechanically easier:
+bigger pad, at the board edge next to P5's through-holes for strain relief, and
+R19's 510R becomes the series protection for free. With the LED gone that node
+swings the full 0→3.3 V. Cost is losing the indicator.
+
+Either way R19 is an 0402. Use 30 AWG wire and glue it down — the pad will lift
+the first time that wire is flexed.
+
+##### Landing it on the Pi
+
+Land the other end on a free P1 pad on the HAT's own underside, so the mod stays
+self-contained and connects through the header when the HAT is seated.
+
+**BCM 26 (P1 pin 37)** is the recommendation: green in the schematic, unused by
+`meshcored.ini` in either pin set, and GND is immediately adjacent at pin 39 for
+the return. BCM 19 (35), BCM 12 (32), BCM 25 (22) and BCM 27 (13) also work.
+
+Pins to stay off, and why:
+
+| Pin(s) | Reason |
+| --- | --- |
+| 1, 17 | Pi 3V3 supply. Unconnected on the HAT, still driven by the Pi — a tap here shorts `PPS` into the Pi's rail. |
+| 27, 28 | `ID_SD`/`ID_SC`, reserved for HAT EEPROM ID detection at boot. |
+| 3, 5 | BCM 2/3. Usable, but they carry the Pi's 1.8K I²C pull-ups. |
+| 7 | BCM 4 — GPS `STANDBY`. |
+| 8, 10 | BCM 14/15 — GPS UART. |
+| 19, 21, 23 | SPI to the SX1262. |
+| 31 | BCM 6 — `DIO4`, RF switch control. |
+| 12, 36, 38, 40 | `RST`, `DIO1`, `BUSY`, `CS`. |
+
+Note that both conventional `pps-gpio` pins are already taken on this HAT: GPIO
+18 is `RST` and GPIO 4 is `STANDBY`. Check the current `lora_irq_pin` and
+`lora_reset_pin` in `meshcored.ini` before committing to a pin, too — those are
+free on the HAT but not necessarily free in your config.
+
+##### Loading the overlay
+
+`/boot/firmware/config.txt`:
+
+```
+dtoverlay=pps-gpio,gpiopin=26,pull=down
+```
+
+The pull-down matters: whenever the L76K is in standby — or simply not powered
+yet — it stops driving its pin 4, and the Pi's input would otherwise float.
+`pull` is supported by the overlay on current
+Raspberry Pi OS but is not in every version — `dtoverlay -h pps-gpio` lists what
+yours takes, and an external 10K to GND does the same job. Leave
+`assert_falling_edge` at its default; the L76K marks the top of the second with
+a **rising** edge, 100 ms wide.
+
+##### Checking whether the overlay actually loaded
+
+**The kernel prints nothing on success.** There is no `pps-gpio` line in
+`dmesg` — the driver logs no probe message on a current kernel, so `dmesg | grep
+pps` showing only the `pps_core` and `pps_ldisc` banners means nothing is wrong.
+`lsmod` is no better: `pps_gpio` sits at refcount 0 even when bound, because
+that column counts dependent modules, not device bindings. Chasing either of
+those absences is a dead end.
+
+The three checks that do carry information:
+
+```sh
+cat /sys/class/pps/pps*/name          # want one reading pps@1a  (0x1a = GPIO 26)
+gpioinfo | grep -w 26                 # want:  "GPIO26"  "pps@1a"  input  [used]
+ls -l /sys/bus/platform/drivers/pps-gpio/   # want a symlink named pps@1a
+```
+
+Two traps once those pass:
+
+- **gpsd creates a second, permanently silent PPS device.** It attaches a PPS
+  line discipline to the serial port, which shows up as another `/dev/ppsN`
+  named `serial0`. Nothing drives DCD on that port, so its assert counter stays
+  at zero forever and `ppstest` on it hangs in silence. Check the `name` files
+  above rather than assuming `/dev/pps0` is the GPIO one.
+- **The numbering is not guaranteed.** The GPIO source is `pps0` only because
+  the platform driver binds at boot, before gpsd starts. For a stable name, drop
+  a udev rule in `/etc/udev/rules.d/10-pps-gpio.rules` and use `/dev/pps-gpio`
+  below:
+
+  ```
+  SUBSYSTEM=="pps", ATTR{name}=="pps@1a.-1", SYMLINK+="pps-gpio"
+  ```
+
+Then watch actual pulses. `/dev/pps*` is mode 600 root:root, so this needs
+`sudo` — chronyd is unaffected, as it opens refclocks before dropping
+privileges:
+
+```sh
+sudo apt install pps-tools
+sudo ppstest /dev/pps0     # want ~1.000000 s between assert events
+```
+
+Nothing appears until the receiver has a fix — the L76K gates PPS on that, so a
+silent `/dev/pps0` under a cold start is expected, not a wiring fault.
+
+##### Handing it to chrony
+
+`/etc/chrony/chrony.conf`, amending the single `SHM 0` line from above:
+
+```
+refclock SHM 0 refid GPS offset 0.307 delay 0.2 noselect
+refclock PPS /dev/pps-gpio refid PPS lock GPS prefer
+```
+
+`/dev/pps-gpio` rather than `/dev/pps0`: install the udev rule from the previous
+section first. The numbering is not guaranteed, and pointing this line at gpsd's
+silent serial PPS device instead of the GPIO one fails quietly — chrony simply
+never gets a sample.
+
+`noselect` keeps NMEA labelling seconds without ever disciplining the clock
+itself. As a side effect the NMEA line stops being reported as a falseticker
+(`#x`) and starts showing as `#?`, which for a `noselect` source is the normal,
+healthy state rather than a fault.
+
+**Adding PPS changes what the `offset` is for, and inverts how to tune it.** It
+is no longer a calibration — NMEA is `noselect`, so its value has no effect on
+the clock at all. Its only remaining job is to keep NMEA inside ±0.5 s, the
+nearest-second rounding limit, so `lock GPS` pairs each pulse with the right
+second.
+
+For that job a **larger offset is safer than a smaller one**, which is the
+opposite of the tuning advice above. The delay is physically one-sided: NMEA can
+only arrive *after* the second it describes, never before. So raising the offset
+costs nothing on the low side and buys headroom on the high side, where all the
+risk lives — the delay can grow by hundreds of milliseconds. Turning NMEA
+sentences back on moves it by that much on its own: see the measured table under
+"Satellite counts, and tuning what the receiver sends" below, where a `GSA` rate
+change alone accounts for ~197 ms.
+
+This is not hypothetical. On this node the raw delay was measured at 0.307 s,
+then 0.193 s an hour later, then 0.384 s twenty minutes after that, without
+anyone touching gpsd. With `offset 0.307` the reported error stayed inside
+±120 ms throughout. Had the offset been "corrected" to zero, that last excursion
+would have left only 116 ms of margin.
+
+So once PPS is running, leave the offset where it is and treat a non-zero
+reading on the `GPS` line as normal. Comment the value in `chrony.conf` — the
+next person to read it will otherwise assume it is a live calibration and tune
+it toward zero, which is now exactly wrong.
+
+Give it a couple of minutes to accumulate samples. `chronyc sources` should end
+up with `#* PPS` selected and the NTP servers demoted to `^-`, and
+`chronyc tracking` should report `Stratum : 1` and `Reference ID : 50505300
+(PPS)`.
+
+Measured on this HAT after the mod: raw inter-pulse jitter at `ppstest` is about
+±3 µs, which is Pi interrupt latency rather than the receiver; chrony's filtered
+result settles around **±400 ns** dispersion and a sub-microsecond RMS offset.
+Against the ±100 ms of NMEA-only, that is roughly a five-order-of-magnitude
+improvement.
+
+#### Keeping GNSS up without meshcored
+
+Once chrony takes its time from the receiver, the dependency runs the wrong way
+round: the *host's clock* now rests on a stack that, by default, only works
+while the mesh daemon happens to be running. Two things cause that, and neither
+announces itself — a node in this state looks perfect until meshcored stops.
+
+Both are worth fixing even without PPS, and become more so with it, because
+`lock GPS` means PPS cannot number its own seconds. No gpsd is not "PPS without
+NMEA labelling", it is **no stratum 1 at all**.
+
+**1. gpsd does not start until something connects to it.** Debian ships gpsd
+socket-activated: `gpsd.socket` is enabled and `gpsd.service` is not, so the
+daemon is spawned by the first client on port 2947. On a node where meshcored is
+the only gpsd client, that makes the entire GNSS chain — device, SHM, chrony's
+stratum 1 — conditional on the mesh daemon connecting. A meshcored held down by
+a bad `meshcored.ini` takes the host's clock with it.
+
+`-n` does not cover this. It keeps gpsd reading *after* the last client leaves;
+it says nothing about starting before the first one arrives.
+
+```sh
+systemctl is-enabled gpsd.service gpsd.socket   # the trap: "disabled" / "enabled"
+sudo systemctl enable --now gpsd.service        # unit's [Install] pulls gpsd.socket in via Also=
+```
+
+Then make a crash self-healing, since after this there is no longer a client
+whose reconnect would restart it:
+
+```ini
+# /etc/systemd/system/gpsd.service.d/resilience.conf
+[Service]
+Restart=on-failure
+RestartSec=5
+```
+
+**2. The GPS enable pin is left unowned when meshcored exits.** `gps_en_pin` is
+held for the daemon's lifetime and no longer.
+
+This one is weaker than it first looks, and the measurement is worth recording
+because the obvious guess is wrong. Stopping meshcored does **not** drop the
+receiver: on bookworm with libgpiod 1.6.3 the pad keeps its last state, and
+`gpioinfo` reports the line as
+
+```
+line   4:      "GPIO4"       unused  output  active-high
+```
+
+— unowned, but still driving high, with the fix intact and chrony still at
+stratum 1. So this is not an outage waiting to happen.
+
+What it is, is undeclared. What holds the L76K awake is a pull-up before
+meshcored's first run and a leftover output level after its last, neither of
+which is configuration, and neither of which any layer promises to keep. An
+unowned line is also unprotected — nothing stops another consumer claiming it
+and driving it low. On a host whose clock rests on that receiver, the pin should
+be owned on purpose.
+
+Hand the line to the kernel instead, in `/boot/firmware/config.txt`:
+
+```
+dtoverlay=gpio-hog,gpio=4
+```
+
+and leave `gps_en_pin` unset in `meshcored.ini`. A hogged GPIO is driven for the
+whole boot and, in the overlay's own words, "not available to other drivers or
+for gpioset/gpioget" — so nothing can take it and nothing can release it.
+
+> **Pass `gpio=4` explicitly.** The overlay's default is **26**, which on this
+> board is the PPS input. `dtoverlay=gpio-hog` bare would hog the pulse line and
+> break the thing it was added to protect.
+
+Not `gpio=4=op,dh`. That firmware directive sets the pad before the kernel
+starts, which reads like the same thing and is not: it sets an initial state, it
+does not take ownership. The line stays free for anything to claim, drive and
+drop — which is precisely the situation being fixed. Only the hog makes the pin
+state both declared and defended.
+
+With the hog in place, meshcored's own claim fails and it says so —
+
+```
+WARNING: could not claim GPS enable pin 4; GPS may stay asleep
+         (expected if the host holds this line, e.g. a GPIO hog)
+```
+
+— which is the correct outcome, not a fault. Setting `gps_en_pin` alongside a
+`gpsd://` device also draws a warning pointing back here.
+
+##### Proving it
+
+Two different failures, so two checks. That GNSS survives the mesh daemon:
+
+```sh
+sudo systemctl stop meshcored
+sleep 30
+chronyc tracking      # want: Reference ID 50505300 (PPS), Stratum 1, unchanged
+cgps -s               # want: still a fix -- gpsd is holding the receiver alone
+sudo systemctl start meshcored
+```
+
+And that it does not need one to *begin* with, which is the socket-activation
+case and only shows itself across a boot:
+
+```sh
+systemctl is-enabled gpsd.service     # want: enabled (not "disabled" + an enabled socket)
+sudo journalctl -b -u gpsd | head -3  # want: started at boot, before any client connected
+```
+
+The second is the one that bites. gpsd left to socket activation looks identical
+to a correctly configured node for as long as meshcored keeps connecting to it.
+
+#### Satellite counts, and tuning what the receiver sends
+
+Out of the box `cgps` shows an empty satellite table and `meshcorectl gps`
+reports zero satellites, even with a good fix. gpsd drives this receiver with
+its **u-blox binary driver** and sets its own message list on every device
+activation, which turns NMEA off entirely. Without NMEA `GSV`/`GSA` gpsd never
+builds a `SKY` object, and the UBX routes to the same data are unavailable here
+— the receiver ACKs `NAV-SVINFO` (01,30) and `NAV-SAT` (01,35) and then emits
+neither.
+
+**The receiver is not a u-blox.** It is an **Allystar URANUS5** (`$PCAS06,0`
+answers `$GPTXT,01,01,02,SW=URANUS5,V5.3.0.0`) presenting a partial u-blox
+emulation: enough NAV output and `CFG-MSG` for gpsd's driver to bind, and a NAK
+for nearly everything else — `CFG-PRT`, `CFG-NAV5`, `CFG-GNSS`, `CFG-SBAS`,
+`CFG-TMODE2/3`, `CFG-RATE`, `CFG-ANT`, `MON-VER`, `MON-HW`. gpsd is not
+misdetecting it; the framing really is UBX (`b5 62`). This matters because the
+NAKs make the receiver look unconfigurable when it is not — its **native
+Allystar `$PCAS` command set is reachable over plain NMEA and works**, and that
+is the only way to reach the baud rate, since `CFG-PRT` is ignored.
+
+Install both files: [`gnss-set-baud`](gnss-set-baud), which sets the port speed
+before gpsd opens it, and [`gpsd-gnss-tuning.conf`](gpsd-gnss-tuning.conf),
+which wires that in and re-enables the two sentences on every start (`CFG-MSG`
+is RAM-only, so it cannot be saved to the receiver):
+
+```sh
+sudo install -m 755 gnss-set-baud /usr/local/sbin/gnss-set-baud
+sudo mkdir -p /etc/systemd/system/gpsd.service.d
+sudo install -m 644 gpsd-gnss-tuning.conf \
+    /etc/systemd/system/gpsd.service.d/gnss-tuning.conf
+sudo systemctl daemon-reload && sudo systemctl restart gpsd
+```
+
+The `$PCAS01,5` speed setting is volatile — it survives a gpsd restart but not
+a power cycle — so `ExecStartPre` re-applies it on every start rather than
+persisting it with `$PCAS00`, whose success cannot be confirmed without
+physically power-cycling the board. The script sends at both 9600 and 115200
+because there is no way to ask which speed the receiver is currently listening
+at; the wrong one is line noise it discards. Verified by forcing the receiver
+back to 9600 and restarting gpsd: it recovers to 115200 with a fix.
+
+Do not expect gpsd's speed hunting to cover a mismatch — it was observed sitting
+at `bps=9600 driver=None` against a 115200 receiver and never converging.
+
+> **gpsd has an Allystar driver, but you cannot use it.** `driver_allystar.c`
+> arrived in gpsd **3.26** (11 May 2025); bookworm ships 3.22 and trixie 3.25,
+> and there is no gpsd in trixie-backports — so a distro upgrade does not reach
+> it either. It would not help regardless: its `msg_nav_svinfo()` parses the
+> satellite message and then deliberately returns 0, commented *"no way to know
+> if a sat used, or unhealthy"*. Binary satellite data is a dead end on this
+> part from both directions, which is why NMEA `GSV`/`GSA` is the answer.
+
+**Measure the receiver, not the client stream.** This distinction cost real
+debugging time. gpsd *synthesizes* NMEA for its clients from the binary data, so
+what meshcored reads is not what the receiver sent — on this node the client
+stream was measured *larger* than the device stream (608 B/s vs 445 B/s), which
+is only possible if gpsd is generating it. Sentences the receiver never sends
+(`GGA`, `RMC`, `ZDA`, and the giveaway `GBS`) appear there regardless. Use
+`gpspipe -R` for the device and `gpspipe -r` for the client:
+
+```sh
+gpspipe -R -x 20 > /tmp/dev.bin   # literal receiver bytes
+gpspipe -r -x 20 > /tmp/cli.txt   # what a gpsd client sees
+```
+
+Tuning against the client stream produces conclusions that are exactly
+backwards — a `CFG-MSG` disabling a sentence gets ACKed and appears to have been
+ignored, when in truth the sentence was already off and the one still arriving
+was gpsd's own.
+
+**The sentence rates and the baud rate are one decision, not two.** Everything
+shares a single UART, and gpsd's fix — the sample chrony reads from SHM 0 —
+comes from UBX `NAV-TIMEGPS` in that same stream. NMEA therefore does not
+compete with chrony for a parser, it competes for the wire: an epoch carrying a
+`GSA`/`GSV` burst delivers its `NAV-TIMEGPS` late. Measured here, with chrony's
+`GPS` refclock offset as the readout:
+
+| baud | `GSA` / `GSV` | UART load | mean offset | sd | spread |
+|---|---|---|---|---|---|
+| 9600 | 1 / 5 | 436 B/s (45%) | +188.5 ms | 21.3 ms | 79 ms |
+| 9600 | 5 / 5 | 315 B/s (33%) | −16.3 ms | 10.0 ms | 27 ms |
+| 9600 | 2 / 2 | 497 B/s (52%) | +199.1 ms | 147.2 ms | 369 ms |
+| 9600 | 1 / 1 | — | **+523 ms** | — | — |
+| 115200 | 5 / 5 | 321 B/s (2.8%) | −88.3 ms | 6.8 ms | 20 ms |
+| **115200** | **1 / 1** | **849 B/s (7.4%)** | **−29 to −97 ms** | **6.4–9.9 ms** | **16–26 ms** |
+
+Read the 9600 rows first, because they are the trap. `GSA` at rate 1 puts a
+burst in front of *every* `NAV-TIMEGPS` and adds a flat ~197 ms — easy to
+mistake for a fixed calibration constant and bury in the `offset` above. But the
+fix is not "make them both faster" either: what governs the result is the
+**fraction of epochs carrying a burst**, because chrony's median filter is what
+rejects them. At rate 5 one epoch in five is congested and is treated as an
+outlier. At rate 2 half are, the filter can no longer tell which population is
+real, the samples go bimodal (+310 ms and −48 ms here) and sd jumps 16×. That
+369 ms spread is close to the 0.4 s `lock GPS` needs, i.e. close to losing PPS
+lock. Staggering the rates is the same failure in slow motion — keep the bursts
+coincident. At rate 1 every epoch is congested, so it degenerates into a flat
++523 ms offset.
+
+Raising the baud rate dissolves the whole problem: the burst takes a twelfth as
+long to clock out, and rate 1 — the *worst* setting at 9600 — becomes the best
+available, with a one-second satellite view at 7% of the wire. The two 115200
+figures come from runs with different settle times and n=6, so treat the sd
+range as noise rather than evidence that rate 1 beats rate 5; the point is that
+rate 1 is now *sustainable*, which at 9600 it was not.
+
+The mean offset wanders by ~70 ms between runs at either speed, which is the
+same effect documented under PPS above and is why the `offset` needs margin
+rather than centring. **At 115200 the residual sits near −100 ms**, so if you
+change the baud rate, re-check that the `GPS` line still has room inside ±0.4 s;
+`offset 0.307` was calibrated at 9600 and now over-corrects by about that much.
+
+What is *not* worth spending the freed bandwidth on: the constellation set is
+fixed at GPS + GLONASS + BeiDou (`CFG-GNSS` NAKs, and Allystar's `$PCAS04` has
+no Galileo option), and a faster navigation rate does not reach chrony, which
+takes its time from PPS. Timing is the scarce resource here; bandwidth is not.
+
+#### Two HAT quirks that are easy to get wrong
+
+- GPIO 4 is load-bearing. R13 (marked `NC/0R`) is fitted, so driving GPIO 4 low
+  stops NMEA dead. The pin reads high when undriven only because of the SoC's
+  own default pull-up on GPIO 0–8, which is not something to rely on. Hold it
+  deliberately: `gps_en_pin = 4` does it for as long as meshcored runs, and
+  `dtoverlay=gpio-hog,gpio=4` does it for the whole boot — with a `gpsd://`
+  source, use the hog and leave `gps_en_pin` unset ([why](#keeping-gnss-up-without-meshcored)).
 - Switch **S1** drives the same transistor in parallel with GPIO 4. If the GPS
   will not sleep, that switch is why. `FORCE_ON` is pushbutton K1, not a GPIO —
   GPIO 17 is unconnected here, despite `DEV_FORCE 17` in Waveshare's sample code
   for the standalone L76X module.
+
+### Resetting a node
 
 There are two levels of reset:
 

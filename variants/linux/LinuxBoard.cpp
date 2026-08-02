@@ -192,13 +192,34 @@ void LinuxBoard::begin() {
   // LoRaWAN/GNSS HAT) must have their STANDBY line driven HIGH to wake and
   // stream NMEA. Bind and hold it high for the daemon lifetime. Non-fatal: a
   // repeater must still run without GPS.
+  //
+  // "for the daemon lifetime" is the catch, and it is why the warning below
+  // exists. The line is released when this process exits, leaving it unowned.
+  // Measured on bookworm/libgpiod 1.6.3 the pad keeps its last state, so the
+  // receiver does not drop -- but nothing promises that, and nothing stops
+  // another consumer claiming the line and driving it low. Where gpsd owns the
+  // receiver, that unowned pin is underneath the host's clock, so the host
+  // should be the one holding it.
   if (config.gps_en_pin != -1) {
+    if (LinuxGpsStream::parseDevice(config.gps_device).transport == LinuxGpsStream::GPSD_SOCKET) {
+      printf("WARNING: gps_en_pin is set alongside a gpsd:// gps_device. The pin is\n"
+             "         still driven, but it is released when meshcored exits, leaving\n"
+             "         the receiver -- and so chrony's GNSS source -- resting on an\n"
+             "         unowned line. Prefer holding it from the host (on a Pi:\n"
+             "         dtoverlay=gpio-hog,gpio=%d) and leaving gps_en_pin unset.\n"
+             "         See variants/linux/README.md.\n",
+             (int)config.gps_en_pin);
+    }
     if (initGPIOPin(config.gps_en_pin, config.lora_gpiochip, config.gps_en_pin) == 0) {
       pinMode(config.gps_en_pin, OUTPUT);
       digitalWrite(config.gps_en_pin, HIGH);
       printf("GPS enable pin %d driven HIGH\n", (int)config.gps_en_pin);
     } else {
-      printf("WARNING: could not claim GPS enable pin %d; GPS may stay asleep\n",
+      // Expected, and correct, on a host that hogs the line itself: a hogged
+      // GPIO is unavailable to any other consumer by design, and the receiver
+      // is already awake. Only worth acting on if nothing else holds the pin.
+      printf("WARNING: could not claim GPS enable pin %d; GPS may stay asleep\n"
+             "         (expected if the host holds this line, e.g. a GPIO hog)\n",
              (int)config.gps_en_pin);
     }
   }
