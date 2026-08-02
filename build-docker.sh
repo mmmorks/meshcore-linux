@@ -8,7 +8,6 @@
 #
 # Usage:
 #   ./build-docker.sh                 # builds env "linux_repeater"
-#   ./build-docker.sh linux           # builds a different env
 #   FIRMWARE_VERSION=1.0 ./build-docker.sh
 #   BASE_IMAGE=debian:trixie ./build-docker.sh linux_repeater  # libgpiod v2
 #
@@ -64,6 +63,19 @@ echo ">> building env '${ENV_NAME}' (version '${FIRMWARE_VERSION}') in ${IMAGE} 
 
 # No -it: a TTY is not needed for a batch build, and requesting one makes the
 # script fail outright when stdin is not a terminal (CI, agents, `| tee`).
+#
+# The container itself still runs as root -- apt-get needs it, and there is no
+# host-matching user account inside the image for `--user "$(id -u):$(id -g)"`
+# to resolve against without extra setup. Root only ever writes into one thing
+# host-visible through the bind mount: /src/.pio (BUILD_DIR plus the
+# non-namespaced libdeps/ cache PlatformIO keeps alongside it) -- everything
+# else root touches (apt/pip state, the venv, PlatformIO's own package cache
+# in CACHE_VOL) lives in the container's own filesystem or a Docker-managed
+# volume, neither host-visible. So chowning .pio back to the invoking user
+# after the build is equivalent to running unprivileged for the one directory
+# that would otherwise leave root-owned files on a Linux host; it is a no-op
+# on macOS, where Docker Desktop's bind-mount layer does not carry container
+# UIDs through to the host anyway.
 docker run --rm \
   --platform linux/arm64 \
   -v "${REPO_DIR}":/src -w /src \
@@ -71,6 +83,8 @@ docker run --rm \
   -e "FIRMWARE_VERSION=${FIRMWARE_VERSION}" \
   -e "ENV_NAME=${ENV_NAME}" \
   -e "PLATFORMIO_BUILD_DIR=${BUILD_DIR}" \
+  -e "HOST_UID=$(id -u)" \
+  -e "HOST_GID=$(id -g)" \
   "${IMAGE}" bash -c '
     set -e
     apt-get update
@@ -81,6 +95,7 @@ docker run --rm \
     . /pio/bin/activate
     pip install --quiet --upgrade platformio
     pio run -e "${ENV_NAME}"
+    chown -R "${HOST_UID}:${HOST_GID}" .pio
   '
 
 echo ">> done: ${BUILD_DIR}/${ENV_NAME}/meshcored"
