@@ -549,6 +549,14 @@ bigger pad, at the board edge next to P5's through-holes for strain relief, and
 R19's 510R becomes the series protection for free. With the LED gone that node
 swings the full 0→3.3 V. Cost is losing the indicator.
 
+**Option 2 is what this board runs**, and it works: `ppstest` shows ~±3 µs of
+inter-pulse jitter and chrony settles at a single-digit-microsecond RMS offset
+on it. Two consequences follow from that choice rather than from PPS in general.
+R19 is already the series resistor, so do not add another. And with `L_PPS1`
+gone there is no longer a blinking indicator to glance at — the checks under
+"Checking whether the overlay actually loaded" below are the only way to see
+whether pulses are arriving.
+
 Either way R19 is an 0402. Use 30 AWG wire and glue it down — the pad will lift
 the first time that wire is flexed.
 
