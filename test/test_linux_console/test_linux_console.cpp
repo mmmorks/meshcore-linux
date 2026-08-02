@@ -26,6 +26,7 @@ class TestConsole : public LinuxConsole {
 public:
   using LinuxConsole::attachClient;
   using LinuxConsole::clientFd;
+  using LinuxConsole::serverFd;
 };
 
 // Minimal PeekableStream over a fixed script, for the lookahead contract tests.
@@ -380,6 +381,73 @@ TEST_F(LinuxConsoleTest, DoesNotStealASocketAnotherInstanceIsUsing) {
   ASSERT_GE(client, 0);
   ASSERT_EQ(1, ::write(client, "m", 1));
   EXPECT_EQ('m', first.read());   // the first instance kept the path
+  close(client);
+}
+
+// --- close-on-exec across LinuxBoard::reboot() -------------------------------
+//
+// reboot() re-execs this process image, and execv() keeps every descriptor that
+// is not close-on-exec. An inherited listener is the damaging one: the new
+// image's begin() decides whether another instance owns the control-socket path
+// by connecting to it, and the leftover listener answers -- so the daemon
+// declines its own path, falls through to /tmp, and after a second reboot has no
+// control socket at all.
+
+TEST_F(LinuxConsoleTest, ControlSocketDescriptorsAreCloseOnExec) {
+  TestConsole console;
+  console.begin();
+
+  ASSERT_GE(console.serverFd(), 0);
+  EXPECT_TRUE(fcntl(console.serverFd(), F_GETFD) & FD_CLOEXEC)
+      << "an inherited listener answers the next image's liveness probe";
+
+  int client = connect_client(_sock);
+  ASSERT_GE(client, 0);
+  ASSERT_EQ(1, ::write(client, "a", 1));
+  EXPECT_EQ('a', console.read());   // one call accepts and reads
+  ASSERT_GE(console.clientFd(), 0);
+
+  // accept() does not carry the listener's descriptor flags across, so this is
+  // a separate guarantee rather than a consequence of the one above.
+  EXPECT_TRUE(fcntl(console.clientFd(), F_GETFD) & FD_CLOEXEC)
+      << "an inherited client fd holds a dead session open at the far end";
+
+  close(client);
+}
+
+// What the re-exec'd image must find: the socket file still on disk, but nothing
+// listening on it, so try_bind()'s probe is refused and the stale-socket path
+// unlinks and rebinds the same candidate.
+TEST_F(LinuxConsoleTest, AReleasedListenerLeavesOnlyAStaleSocketToRebind) {
+  {
+    LinuxConsole console;
+    console.begin();
+    console.end();   // what LinuxBoard::reboot() does before execv()
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, _sock, sizeof(addr.sun_path) - 1);
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT_GE(probe, 0);
+    EXPECT_NE(0, connect(probe, (struct sockaddr*)&addr, sizeof addr));
+    EXPECT_EQ(ECONNREFUSED, errno) << "something is still listening after end()";
+    close(probe);
+
+    struct stat st;
+    ASSERT_EQ(0, lstat(_sock, &st));   // the file outlives the descriptor
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+  }   // and end() runs again from the destructor, harmlessly
+
+  LinuxConsole restarted;
+  restarted.begin();
+  EXPECT_EQ(std::string::npos, captured_stderr().find("already in use"))
+      << "the restarted daemon refused the path it had just released";
+
+  int client = connect_client(_sock);
+  ASSERT_GE(client, 0);
+  ASSERT_EQ(1, ::write(client, "r", 1));
+  EXPECT_EQ('r', restarted.read());
   close(client);
 }
 

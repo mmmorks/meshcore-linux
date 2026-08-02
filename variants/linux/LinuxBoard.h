@@ -99,18 +99,9 @@ public:
     exit(0);
   }
 
-  // The ardulinux core's global ::reboot() (cores/ardulinux/main.cpp) re-execs
-  // this same process via execv(), with --erase stripped from argv so a
-  // reboot cannot re-trigger a filesystem wipe. exit(0) here would be wrong:
-  // the shipped systemd unit uses Restart=on-failure, not Restart=always, so
-  // a clean exit is a stop, not a restart -- and both the `reboot` and
-  // `clkreboot` CLI commands reach this from an authenticated remote admin
-  // over the mesh (CommonCLI::handleCommand), so that would take an
-  // unattended repeater off-air. Qualified as ::reboot() to resolve to the
-  // global one and not recurse into this member of the same name.
-  void reboot() override {
-    ::reboot();
-  }
+  // Tear the control socket down and re-exec this process image. Defined in
+  // LinuxBoard.cpp, which is where LinuxConsole is visible.
+  void reboot() override;
 
   // Block on the LoRa IRQ edge descriptor plus whichever console descriptors
   // will actually be drained this iteration, instead of spinning. Defined in

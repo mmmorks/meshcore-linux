@@ -231,6 +231,29 @@ void LinuxBoard::begin() {
   }
 }
 
+// The ardulinux core's global ::reboot() (cores/ardulinux/main.cpp) re-execs
+// this same process via execv(), with --erase stripped from argv so a reboot
+// cannot re-trigger a filesystem wipe. exit(0) here would be wrong: the
+// shipped systemd unit uses Restart=on-failure, not Restart=always, so a clean
+// exit is a stop, not a restart -- and both the `reboot` and `clkreboot` CLI
+// commands reach this from an authenticated remote admin over the mesh
+// (CommonCLI::handleCommand), so that would take an unattended repeater
+// off-air. Qualified as ::reboot() to resolve to the global one and not recurse
+// into this member of the same name.
+//
+// execv() keeps every descriptor that is not close-on-exec, and the console's
+// listener is the one that must not reach the new image: begin() there decides
+// whether a control socket already belongs to another instance by connecting to
+// it, and an inherited listener answers, so the daemon would decline its own
+// path. LinuxConsole marks its descriptors close-on-exec; closing them here as
+// well means a descriptor that ever escaped that -- a new one added there, or
+// an exec that reaches this process by another route -- still cannot resurrect
+// the listener. powerOff() needs none of this: exit(0) closes everything.
+void LinuxBoard::reboot() {
+  Console.end();
+  ::reboot();
+}
+
 void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   LinuxEventSource* src = irqEventSource();
 

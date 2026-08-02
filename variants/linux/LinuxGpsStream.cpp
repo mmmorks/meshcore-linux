@@ -67,6 +67,20 @@ LinuxGpsStream::Target LinuxGpsStream::parseDevice(const char* device) {
   return t;
 }
 
+// LinuxBoard::reboot() re-execs this process image, and execv() keeps every
+// descriptor that is not close-on-exec. Neither of the ones opened here is
+// reachable from the new image, so each reboot would leak a socket to gpsd or
+// an open handle on the GPS tty for the life of the rebooted daemon.
+//
+// fcntl() rather than SOCK_CLOEXEC/O_CLOEXEC: this file also compiles for the
+// native test build on macOS, and one pattern is easier to check than two. The
+// window before the flag is set is harmless -- the only exec is this process's
+// own reboot(), which cannot run part-way through these calls.
+static void set_cloexec(int fd) {
+  int fl = fcntl(fd, F_GETFD, 0);
+  if (fl != -1) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
 // Map an integer baud to the matching termios Bxxxx constant.
 // Unknown values log and fall back to B9600.
 static speed_t baud_to_speed(int baud) {
@@ -144,6 +158,7 @@ void LinuxGpsStream::startConnect() {
   // the host, which may not be Linux.
   _fd = socket(_addr.ss_family, SOCK_STREAM, 0);
   if (_fd < 0) { dropConnection(); return; }
+  set_cloexec(_fd);
   fcntl(_fd, F_SETFL, fcntl(_fd, F_GETFL, 0) | O_NONBLOCK);
 
   int one = 1;
@@ -259,6 +274,7 @@ bool LinuxGpsStream::openSerial(const char* path, int baud) {
     MESH_DEBUG_PRINTLN("LinuxGpsStream: cannot open %s: %s", path, strerror(errno));
     return false;
   }
+  set_cloexec(_fd);
 
   struct termios tio;
   if (tcgetattr(_fd, &tio) != 0) {

@@ -31,6 +31,16 @@ public:
   // mode. Call once from setup(). Never blocks.
   void begin();
 
+  // Close the listener and any attached client. Idempotent.
+  //
+  // Exists for LinuxBoard::reboot(), which re-execs this process image: the
+  // descriptors are close-on-exec, but a listener that reached the new image
+  // anyway would answer begin()'s liveness probe and make the daemon refuse
+  // its own control-socket path. Closing here first makes that outcome depend
+  // on nothing but this call. The socket file is left in place -- see the
+  // stale-socket handling in try_bind().
+  void end();
+
   int read() override;     // PeekableStream::read() plus newline normalisation
   int peek() override;     // same normalisation, so the two cannot disagree
   size_t write(uint8_t c) override;
@@ -61,6 +71,11 @@ protected:
 
   // The descriptor currently serving the console, or -1 when none is attached.
   int  clientFd() const { return _client_fd; }
+
+  // The listening control socket, or -1 when none was bound. Protected for the
+  // same reason as clientFd(): tests need to inspect the descriptor (that it is
+  // close-on-exec), and nothing outside this class may act on it.
+  int  serverFd() const { return _server_fd; }
 
 private:
   bool tryAccept();

@@ -24,6 +24,14 @@ namespace {
 
 using Target = LinuxGpsStream::Target;
 
+// The GPS descriptor is protected so the event loop cannot register it (see
+// LinuxBoard::idleUntilEvent). Tests still have to see it, to check that it
+// cannot survive the execv() in LinuxBoard::reboot().
+class TestGpsStream : public LinuxGpsStream {
+public:
+  using LinuxGpsStream::fd;
+};
+
 TEST(ParseDevice, EmptyIsNoTransportButValid) {
   Target t = LinuxGpsStream::parseDevice("");
   EXPECT_TRUE(t.valid);
@@ -271,6 +279,20 @@ TEST(GpsdTransport, InvalidUrlFailsBegin) {
   EXPECT_FALSE(s.isPresent());
 }
 
+// LinuxBoard::reboot() re-execs this process image, and execv() keeps every
+// descriptor that is not close-on-exec. Neither of these is reachable from the
+// new image, so each reboot would otherwise leak one for the life of the
+// rebooted daemon -- and hold gpsd's client slot open with nobody reading it.
+TEST(GpsdTransport, SocketIsCloseOnExec) {
+  FakeGpsd fake;
+  TestGpsStream s;
+  ASSERT_TRUE(s.begin(gpsdUrl(fake.port()).c_str(), 9600));
+  settle(s, fake);
+
+  ASSERT_GE(s.fd(), 0);
+  EXPECT_TRUE(fcntl(s.fd(), F_GETFD) & FD_CLOEXEC);
+}
+
 TEST(GpsdReconnect, ReconnectsAfterServerDrop) {
   FakeGpsd fake;
   LinuxGpsStream s;
@@ -406,6 +428,18 @@ TEST(SerialGpsStream, OpensDeviceAndReadsBytes) {
 
   pty.send("$GPGGA,x\r\n");
   EXPECT_EQ(readSerialWithin(s), '$');
+}
+
+// The serial-path counterpart of GpsdTransport.SocketIsCloseOnExec.
+TEST(SerialGpsStream, DeviceIsCloseOnExec) {
+  FakePtyGps pty;
+  ASSERT_TRUE(pty.ok());
+
+  TestGpsStream s;
+  ASSERT_TRUE(s.begin(pty.path(), 9600));
+
+  ASSERT_GE(s.fd(), 0);
+  EXPECT_TRUE(fcntl(s.fd(), F_GETFD) & FD_CLOEXEC);
 }
 
 // baud_to_speed() is a private implementation detail; verify indirectly by

@@ -52,6 +52,23 @@ static void set_nonblock(int fd) {
   if (fl != -1) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+// LinuxBoard::reboot() replaces this process image with execv(), which keeps
+// every descriptor that is not close-on-exec. A surviving listener is the
+// damaging one: the new image's begin() decides whether a control socket is
+// already owned by probing it with connect(), and the leftover listener answers
+// -- so the daemon declines its own path, falls through to /tmp, and after a
+// second reboot has no control socket at all. Everything created here is marked
+// instead of only the listener, so no site has to be reasoned about separately.
+//
+// fcntl() rather than SOCK_CLOEXEC/accept4(): this file also compiles for the
+// native test build on macOS, which has neither. The window between creating a
+// descriptor and marking it does not matter here -- the only exec is this
+// process's own reboot(), which cannot run part-way through these calls.
+static void set_cloexec(int fd) {
+  int fl = fcntl(fd, F_GETFD, 0);
+  if (fl != -1) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
 // Fill `addr` with the AF_UNIX address for `path`. False if it will not fit.
 static bool fill_sun_path(struct sockaddr_un* addr, const char* path) {
   if (!path || !*path) return false;
@@ -84,6 +101,7 @@ static bool socket_is_live(const char* path) {
 
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return false;   // cannot probe; treat as stale rather than refuse to start
+  set_cloexec(fd);
   set_nonblock(fd);
 
   // "Refused" is the only answer that proves nobody is home. Anything else --
@@ -137,6 +155,7 @@ static int try_bind(const char* path) {
 
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return -1;
+  set_cloexec(fd);
 
   // Anyone who reaches this socket gets the unauthenticated admin CLI, so it
   // must never exist -- even momentarily -- at wider permissions than intended.
@@ -233,6 +252,9 @@ void LinuxConsole::attachClient(int fd) {
   // belongs to the previous input, and letting it surface here would prepend a
   // fragment of someone else's command to this client's first line.
   closeClient();
+  // accept() does not carry the listener's descriptor flags across, so this is
+  // a fresh site, not a repeat of the one in try_bind().
+  set_cloexec(fd);
   set_nonblock(fd);
   set_nosigpipe(fd);
   _client_fd = fd;
@@ -267,6 +289,7 @@ void LinuxConsole::refuseExtraClients() {
   // clears its POLLIN, an ignored one would not.
   int fd;
   while ((fd = accept(_server_fd, nullptr, nullptr)) >= 0) {
+    set_cloexec(fd);
     set_nosigpipe(fd);
     ssize_t n = send(fd, BUSY_MSG, sizeof BUSY_MSG - 1, MSG_NOSIGNAL);
     (void)n;   // best effort: the message is a courtesy, the close is the answer
@@ -359,10 +382,14 @@ size_t LinuxConsole::write(uint8_t c) {
   return 1;
 }
 
-LinuxConsole::~LinuxConsole() {
+void LinuxConsole::end() {
   closeClient();
-  if (_server_fd >= 0) close(_server_fd);
+  if (_server_fd >= 0) { close(_server_fd); _server_fd = -1; }
   // The socket file is deliberately left in place: begin() decides whether an
   // existing one is stale by probing it, and /run/meshcored is a systemd
   // RuntimeDirectory that goes away with the unit anyway.
+}
+
+LinuxConsole::~LinuxConsole() {
+  end();
 }

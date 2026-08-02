@@ -59,6 +59,12 @@ public:
 protected:
   int rawReadByte() override;   // one raw byte from the fd, or -1
 
+  // The open GPS descriptor, or -1. Protected, not public: tests need to
+  // inspect it (that it is close-on-exec), while the event loop in
+  // LinuxBoard::idleUntilEvent() must still have no way to reach it -- see the
+  // comment there on why registering this descriptor would reinstate a spin.
+  int fd() const { return _fd; }
+
 private:
   // gpsd connection state. CONNECTING exists because connect() must not block
   // the main loop: it is started non-blocking and completed on a later read.
