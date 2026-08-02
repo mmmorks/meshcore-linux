@@ -28,7 +28,8 @@ dio2_as_rf_switch = 1
 # gps_device = /dev/ttyS0     # meshcored owns the UART
 # gps_device = gpsd://        # or gpsd owns it, which also lets chrony
 #                             #   discipline the host clock from GNSS.
-#                             #   See "Reading GPS from gpsd" in README.md.
+#                             #   See "Disciplining the host clock from GNSS"
+#                             #   in README.md.
 # gps_baud = 9600             # serial only; gpsd owns the baud rate itself
 # gps_en_pin = 4
 

@@ -37,8 +37,8 @@
 #     not read, and the chrony refclock needs a per-board offset that has to be
 #     measured on the node rather than guessed. Doing it half-automatically
 #     would be worse than not at all: a wrong offset makes chrony classify the
-#     GPS as a falseticker and silently ignore it. See "Reading GPS from gpsd"
-#     in variants/linux/README.md.
+#     GPS as a falseticker and silently ignore it. See "Disciplining the host
+#     clock from GNSS" in variants/linux/README.md.
 #
 # The setup steps it DOES run are all idempotent: on an already-provisioned node
 # they print nothing and change nothing.
