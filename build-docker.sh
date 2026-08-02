@@ -66,16 +66,23 @@ echo ">> building env '${ENV_NAME}' (version '${FIRMWARE_VERSION}') in ${IMAGE} 
 #
 # The container itself still runs as root -- apt-get needs it, and there is no
 # host-matching user account inside the image for `--user "$(id -u):$(id -g)"`
-# to resolve against without extra setup. Root only ever writes into one thing
-# host-visible through the bind mount: /src/.pio (BUILD_DIR plus the
-# non-namespaced libdeps/ cache PlatformIO keeps alongside it) -- everything
-# else root touches (apt/pip state, the venv, PlatformIO's own package cache
-# in CACHE_VOL) lives in the container's own filesystem or a Docker-managed
-# volume, neither host-visible. So chowning .pio back to the invoking user
-# after the build is equivalent to running unprivileged for the one directory
-# that would otherwise leave root-owned files on a Linux host; it is a no-op
-# on macOS, where Docker Desktop's bind-mount layer does not carry container
-# UIDs through to the host anyway.
+# to resolve against without extra setup. Instead, chown back to the invoking
+# user's uid/gid the specific paths THIS run's `pio run -e "${ENV_NAME}"`
+# writes into the bind-mounted repo: its build output, the shared
+# project.checksum PlatformIO keeps at the top of BUILD_DIR, and its
+# per-env libdeps/ cache. That is deliberately narrower than "chown -R .pio":
+# .pio/build and .pio/libdeps are shared across every env ever built in this
+# checkout, including other envs built natively on the host (e.g. an MCU
+# cross-build via `pio run -e <mcu-env>`), and those pre-existing host-owned
+# trees can contain files (git-cloned lib_deps' own .git/objects/pack/*,
+# which git itself writes read-only) that a recursive chown over the whole
+# tree would try to touch. On Docker Desktop's bind-mount layer that fails
+# outright with EPERM even though the container is root, which would abort
+# this script under `set -e` *after* a successful build -- confirmed with a
+# minimal repro (see task-5-report.md). Scoping to this run's own paths
+# avoids ever touching another env's tree; `|| echo ... WARNING` on top of
+# that means even an unexpected chown failure inside the scoped paths is
+# reported but never turns a successful build into a script failure.
 docker run --rm \
   --platform linux/arm64 \
   -v "${REPO_DIR}":/src -w /src \
@@ -95,7 +102,11 @@ docker run --rm \
     . /pio/bin/activate
     pip install --quiet --upgrade platformio
     pio run -e "${ENV_NAME}"
-    chown -R "${HOST_UID}:${HOST_GID}" .pio
+    chown -R "${HOST_UID}:${HOST_GID}" \
+      "${PLATFORMIO_BUILD_DIR}/${ENV_NAME}" \
+      "${PLATFORMIO_BUILD_DIR}/project.checksum" \
+      ".pio/libdeps/${ENV_NAME}" \
+      || echo ">> WARNING: could not reclaim ownership of every build artifact for ${HOST_UID}:${HOST_GID} (see chown errors above) -- the build itself still succeeded" >&2
   '
 
 echo ">> done: ${BUILD_DIR}/${ENV_NAME}/meshcored"
