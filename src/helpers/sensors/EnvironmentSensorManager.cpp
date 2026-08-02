@@ -720,6 +720,20 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
     }
     return true;
   }
+  // Deliberately NOT enumerated by getNumSettings()/getSettingName()/
+  // getSettingValue() above, unlike "gps": those three also drive
+  // CMD_GET_CUSTOM_VARS's wire payload in every companion_radio build
+  // (examples/companion_radio/MyMesh.cpp, ui-tiny/ui-new UITask.cpp), so
+  // adding an entry there changes an embedded companion-app payload on every
+  // target that compiles ENV_INCLUDE_GPS -- out of scope for a Linux CLI
+  // finding. "gps_interval" stays settable-but-not-listed, same as before.
+  //
+  // Also deliberately NOT gated on gps_detected, unlike "gps": every
+  // example's applyGpsPrefs() calls this at boot regardless of whether GPS
+  // hardware was found (and CMD_SET_CUSTOM_VAR / CommonCLI's `gps interval`
+  // rely on that), so gating it would break persisting the interval pref on
+  // exactly the boards this whole review pass is about -- Linux's
+  // no-GPS-by-default setups.
   if (strcmp(name, "gps_interval") == 0) {
     uint32_t interval_seconds = atoi(value);
     gps_update_interval_sec = interval_seconds > 0 ? interval_seconds : 1;
