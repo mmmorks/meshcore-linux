@@ -179,7 +179,16 @@ void LinuxGpsStream::finishConnect() {
   while (sent < want) {
     ssize_t n = ::write(_fd, WATCH_CMD + sent, want - sent);
     if (n > 0) { sent += (size_t) n; continue; }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;  // rare; retried below
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+    dropConnection();
+    return;
+  }
+  if (sent < want) {
+    // A freshly-connected non-blocking socket's send buffer would not take
+    // the whole WATCH command in one write(). Nothing retries the remainder
+    // and the read-gap logic cannot detect the resulting silence, so this
+    // must not be treated as READY -- drop and let startConnect() retry the
+    // handshake from scratch.
     dropConnection();
     return;
   }
@@ -205,11 +214,11 @@ void LinuxGpsStream::serviceGpsd() {
   uint32_t now = millis();
 
   // EnvironmentSensorManager drains this stream only while gps_active is true,
-  // so a `gps off` stops the reads entirely. A tty tolerates that -- undrained
-  // bytes just age out of the kernel buffer -- but a socket does not: the
-  // receive window fills and gpsd drops clients it cannot write to. Dropping it
-  // ourselves is both the polite move and the one that stops `gps on` from
-  // replaying a backlog of stale NMEA as though it were current.
+  // so a `gps off` stops the reads entirely. A tty just queues undrained bytes
+  // (serviceSerialGap() below flushes those); a socket's receive window fills
+  // instead, and gpsd drops clients it cannot write to. Dropping it ourselves
+  // is both the polite move and the one that stops `gps on` from replaying a
+  // backlog of stale NMEA as though it were current.
   if (_state == GPSD_READY && _last_read_ms != 0 &&
       (uint32_t)(now - _last_read_ms) > READ_GAP_MS) {
     dropConnection();
@@ -223,6 +232,20 @@ void LinuxGpsStream::serviceGpsd() {
     return;
   }
   if (_state == GPSD_CONNECTING) finishConnect();
+}
+
+// Mirrors serviceGpsd()'s read-gap logic for the serial path. `gps off` stops
+// EnvironmentSensorManager from draining this stream, so NMEA sentences pile
+// up (up to the tty's kernel input queue, ~4 KB) while nothing reads them.
+// There is no connection to drop and re-establish here as there is for gpsd
+// -- flushing the queued bytes is the tty equivalent, so `gps on` sees fresh
+// data instead of replaying the backlog as though it were current.
+void LinuxGpsStream::serviceSerialGap() {
+  uint32_t now = millis();
+  if (_last_read_ms != 0 && (uint32_t)(now - _last_read_ms) > READ_GAP_MS) {
+    tcflush(_fd, TCIFLUSH);
+  }
+  _last_read_ms = now;
 }
 
 bool LinuxGpsStream::isPresent() const {
@@ -277,6 +300,7 @@ void LinuxGpsStream::end() {
 
 int LinuxGpsStream::rawReadByte() {
   if (_transport == GPSD_SOCKET) serviceGpsd();
+  else if (_transport == SERIAL_DEVICE) serviceSerialGap();
   if (_fd < 0 || _state == GPSD_CONNECTING) return -1;
 
   uint8_t b;
@@ -285,11 +309,13 @@ int LinuxGpsStream::rawReadByte() {
 
   // On a socket, n == 0 is the peer hanging up -- gpsd restarted, or dropped a
   // client it could not write to. A tty never reports that, so only the socket
-  // path treats it as a disconnect.
-  if (_transport == GPSD_SOCKET && (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))) {
+  // path treats it as a disconnect. EINTR is a signal interrupting the call,
+  // not a broken connection -- benign, same as EAGAIN/EWOULDBLOCK.
+  if (_transport == GPSD_SOCKET &&
+      (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))) {
     dropConnection();
   }
-  return -1;  // n == 0 (no data) or -1/EAGAIN
+  return -1;  // n == 0 (no data) or -1/EAGAIN/EINTR
 }
 
 size_t LinuxGpsStream::write(uint8_t c) {

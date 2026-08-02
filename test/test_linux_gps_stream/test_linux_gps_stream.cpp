@@ -4,8 +4,16 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <termios.h>
 #include <unistd.h>
 #include <string>
+
+// openpty(): macOS declares it in <util.h>; glibc in <pty.h>.
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 #include <Arduino.h>
 #include <MicroNMEA.h>
@@ -305,6 +313,25 @@ TEST(GpsdReconnect, ReconnectsAfterReadGap) {
   EXPECT_EQ(fake.acceptCount(), 2) << "a read gap should have reconnected";
 }
 
+// The negative case for the test above: a pause shorter than the threshold
+// is normal poll-loop jitter, not a `gps off`, and must not pay the cost of
+// a reconnect.
+TEST(GpsdReconnect, ShortReadGapDoesNotReconnect) {
+  FakeGpsd fake;
+  LinuxGpsStream s;
+  ASSERT_TRUE(s.begin(gpsdUrl(fake.port()).c_str(), 9600));
+  settle(s, fake);
+  fake.send("$A\r\n");
+  ASSERT_EQ(readWithin(s, fake), '$');
+
+  ASSERT_EQ(fake.acceptCount(), 1);
+
+  g_mock_millis += 2000;      // well under the 5 s gap threshold
+  settle(s, fake);
+
+  EXPECT_EQ(fake.acceptCount(), 1) << "a short gap must not force a reconnect";
+}
+
 TEST(GpsdReconnect, UnreachableGpsdKeepsRetryingWithoutSpinning) {
   LinuxGpsStream s;
   ASSERT_TRUE(s.begin("gpsd://127.0.0.1:1", 9600));   // nothing listens
@@ -313,6 +340,143 @@ TEST(GpsdReconnect, UnreachableGpsdKeepsRetryingWithoutSpinning) {
   // and the stream stays present for a gpsd that may yet start.
   EXPECT_EQ(s.read(), -1);
   EXPECT_TRUE(s.isPresent());
+}
+
+// A short-write test for finishConnect()'s partial-WATCH-write path was
+// attempted and dropped: the command is ~38 bytes, and forcing write() to
+// return short/EAGAIN for a payload that small requires shrinking the
+// *client* socket's own SO_SNDBUF below ~38 bytes. Shrinking the fake
+// server's SO_RCVBUF (the only buffer a test harness can reach here) does
+// not do it -- write() succeeds once data fits in the local kernel send
+// buffer, regardless of the peer's advertised window, and LinuxGpsStream
+// exposes no hook to shrink the client fd's own SO_SNDBUF. The dropConnection()
+// call on the short-write path is exercised by code review and by the
+// existing error-path tests (invalid URL, unreachable host) taking the same
+// dropConnection() branch instead.
+
+// Minimal pty-backed stand-in for a real /dev/tty* GPS receiver. openpty()
+// hands back a connected master/slave pair; the slave is closed immediately
+// so LinuxGpsStream can open the path itself (mirroring how it opens a real
+// device node), and the test drives bytes in through the master side.
+class FakePtyGps {
+public:
+  FakePtyGps() {
+    int master = -1, slave = -1;
+    char name[256] = {};
+    if (openpty(&master, &slave, name, nullptr, nullptr) != 0) return;
+    close(slave);   // LinuxGpsStream::openSerial() opens its own fd on `name`
+    fcntl(master, F_SETFL, fcntl(master, F_GETFL, 0) | O_NONBLOCK);
+    _master = master;
+    _path = name;
+    _ok = true;
+  }
+  ~FakePtyGps() { if (_master >= 0) close(_master); }
+
+  bool ok() const { return _ok; }
+  const char* path() const { return _path.c_str(); }
+  int masterFd() const { return _master; }
+  void send(const std::string& s) { ::write(_master, s.data(), s.size()); }
+
+private:
+  bool _ok = false;
+  int _master = -1;
+  std::string _path;
+};
+
+// Pump the stream until it yields a byte or the budget runs out. No accept()
+// step needed (unlike the gpsd readWithin()): a pty has no listen/accept
+// phase, so LinuxGpsStream::begin() has the device open by the time this runs.
+int readSerialWithin(LinuxGpsStream& s, int attempts = 400) {
+  for (int i = 0; i < attempts; i++) {
+    int c = s.read();
+    if (c >= 0) return c;
+    usleep(500);
+  }
+  return -1;
+}
+
+TEST(SerialGpsStream, OpensDeviceAndReadsBytes) {
+  FakePtyGps pty;
+  ASSERT_TRUE(pty.ok());
+
+  LinuxGpsStream s;
+  ASSERT_TRUE(s.begin(pty.path(), 9600));
+  EXPECT_EQ(s.transport(), LinuxGpsStream::SERIAL_DEVICE);
+  EXPECT_TRUE(s.isPresent());
+
+  pty.send("$GPGGA,x\r\n");
+  EXPECT_EQ(readSerialWithin(s), '$');
+}
+
+// baud_to_speed() is a private implementation detail; verify indirectly by
+// reading back the termios settings the tty ends up with. A pty's line
+// discipline state is shared by both ends, so what LinuxGpsStream configured
+// through the slave path is visible via the master fd this test still holds.
+TEST(SerialGpsStream, BaudIsAppliedToTheDevice) {
+  FakePtyGps pty;
+  ASSERT_TRUE(pty.ok());
+
+  LinuxGpsStream s;
+  ASSERT_TRUE(s.begin(pty.path(), 19200));
+
+  struct termios tio;
+  ASSERT_EQ(tcgetattr(pty.masterFd(), &tio), 0);
+  EXPECT_EQ(cfgetispeed(&tio), (speed_t)B19200);
+  EXPECT_EQ(cfgetospeed(&tio), (speed_t)B19200);
+}
+
+// The serial-path analogue of GpsdReconnect.ReconnectsAfterReadGap: `gps off`
+// stops EnvironmentSensorManager from draining the stream, so bytes queue in
+// the tty's kernel input buffer while nothing reads them. `gps on` must not
+// replay that backlog as though it were current (finding 4).
+TEST(SerialGpsStream, StaleBacklogFlushedAfterReadGap) {
+  FakePtyGps pty;
+  ASSERT_TRUE(pty.ok());
+
+  LinuxGpsStream s;
+  ASSERT_TRUE(s.begin(pty.path(), 9600));
+
+  // Establish a first successful read so _last_read_ms is seeded -- the gap
+  // check is a no-op until then.
+  pty.send("$A\r\n");
+  ASSERT_EQ(readSerialWithin(s), '$');
+  for (int i = 0; i < 3; i++) readSerialWithin(s);   // drain "A\r\n"
+
+  // Simulate the backlog that piles up while `gps off` stops the drain.
+  pty.send("$STALE,should,not,appear\r\n");
+  usleep(20000);   // let the kernel queue it on the slave side before the gap
+
+  g_mock_millis += 10000;   // longer than the 5 s gap threshold
+
+  // The read that resumes after the gap must flush the backlog rather than
+  // hand any of it back.
+  EXPECT_EQ(s.read(), -1);
+
+  // Fresh data written after the flush is still delivered normally.
+  pty.send("$FRESH\r\n");
+  EXPECT_EQ(readSerialWithin(s), '$');
+}
+
+// Negative case: a pause shorter than the threshold is normal poll-loop
+// jitter, not a `gps off`, and must not discard data that is simply waiting
+// to be read.
+TEST(SerialGpsStream, ShortReadGapDoesNotFlush) {
+  FakePtyGps pty;
+  ASSERT_TRUE(pty.ok());
+
+  LinuxGpsStream s;
+  ASSERT_TRUE(s.begin(pty.path(), 9600));
+
+  pty.send("$A\r\n");
+  ASSERT_EQ(readSerialWithin(s), '$');
+  for (int i = 0; i < 3; i++) readSerialWithin(s);   // drain "A\r\n"
+
+  pty.send("$B\r\n");
+  usleep(20000);
+
+  g_mock_millis += 2000;   // well under the 5 s gap threshold
+
+  EXPECT_EQ(s.read(), '$') << "a short gap must not flush pending data";
 }
 
 }  // namespace

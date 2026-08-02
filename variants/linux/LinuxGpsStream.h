@@ -70,6 +70,7 @@ private:
   void finishConnect();
   void dropConnection();
   void serviceGpsd();
+  void serviceSerialGap();
 
   int       _fd = -1;
   Transport _transport = NO_SOURCE;
@@ -81,5 +82,5 @@ private:
   uint32_t  _retry_at_ms    = 0;   // earliest next connect attempt
   uint32_t  _retry_delay_ms = 0;   // current backoff, 0 until the first failure
   uint32_t  _connect_at_ms  = 0;   // when the in-flight connect started
-  uint32_t  _last_read_ms   = 0;   // for the read-gap reconnect
+  uint32_t  _last_read_ms   = 0;   // for the read-gap reconnect (gpsd) / flush (serial)
 };
