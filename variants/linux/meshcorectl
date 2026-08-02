@@ -3,7 +3,7 @@
 
   meshcorectl                    interactive REPL (line editing, history, tab-complete)
   meshcorectl set name foo       one-shot: send one command, print the reply, exit
-  echo -e "advert\\nprefs" | meshcorectl   pipe: run each line, print replies
+  echo -e "advert\\nneighbors" | meshcorectl   pipe: run each line, print replies
 
 The interactive mode is a self-contained readline client (equivalent to wrapping
 a raw socket in rlwrap): arrow-key editing, Ctrl-R reverse search, persistent
