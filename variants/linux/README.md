@@ -17,7 +17,9 @@ The daemon is `meshcored`; its CLI client is `meshcorectl`.
 - [Deploying to a remote node](#deploying-to-a-remote-node)
 - [The control CLI](#the-control-cli-meshcorectl)
 - [Operation](#operation) — [idle CPU](#idle-cpu-usage),
-  [CAD](#channel-activity-detection), [changing settings](#changing-settings-after-first-boot)
+  [CAD](#channel-activity-detection),
+  [divergence from upstream](#divergence-from-upstream),
+  [changing settings](#changing-settings-after-first-boot)
 - [GPS](#gps) — [serial](#serial-gps), [gpsd + chrony](#disciplining-the-host-clock-from-gnss),
   [PPS](#pps-on-the-waveshare-lorawangnss-hat), [serving time](#serving-the-time-to-the-lan),
   [receiver tuning](#tuning-the-receiver)
@@ -143,7 +145,7 @@ The file has two kinds of setting:
 | `lora_freq` | `869.618` | MHz |
 | `lora_bw` | `62.5` | kHz |
 | `lora_sf` | `8` | Spreading factor |
-| `lora_cr` | `8` | Coding rate |
+| `lora_cr` | `5` | Coding rate |
 | `lora_tcxo` | `1.8` | TCXO voltage; `0.0` if the module has no TCXO |
 | `lora_tx_power` | `22` | dBm |
 | `current_limit` | `140` | Radio over-current protection, mA |
@@ -157,8 +159,12 @@ The file has two kinds of setting:
 | `gps_device` | *(empty)* | Serial path (`/dev/ttyACM0`) or `gpsd://[host][:port]` (default `127.0.0.1:2947`). Empty disables GPS |
 | `gps_baud` | `9600` | Serial `gps_device` only; one of 4800/9600/19200/38400/57600/115200. Ignored for `gpsd://` — gpsd owns the port |
 | `gps_en_pin` | `-1` | GPIO held HIGH to wake a receiver that boots in standby (e.g. the L76K STANDBY line). `-1` = none. Leave unset with a `gpsd://` source — see [Keeping GNSS up without meshcored](#keeping-gnss-up-without-meshcored) |
+| `defer_clock` | *(unset)* | Override whether meshcored sets the system clock from GPS/mesh time sync. Unset: on exactly when `gps_device` is `gpsd://` (gpsd already owns the clock). `true`: never set it — e.g. a serial `gps_device` whose NMEA is separately fed to chrony. `false`: always attempt to set it, even against a `gpsd://` device |
 
-Comments (`#`, `;`), blank lines and `[section]` headers are ignored.
+Comments (`#`, `;`), blank lines and `[section]` headers are ignored. Boolean
+settings (`dio2_as_rf_switch`, `rx_boosted_gain`, `use_regulator_ldo`,
+`rx_register_patch`, `defer_clock`) accept `1`/`0`, `true`/`false`, `on`/`off`
+or `yes`/`no`, case-insensitively; anything else is a fatal invalid value.
 
 #### Config validation
 
@@ -166,7 +172,7 @@ Every problem is reported on its own `ERROR:` line at startup:
 
 | Problem | Response |
 |---------|----------|
-| **Invalid value** — a GPIO pin outside `0..255`, non-numeric, or empty | **Fatal**, the daemon refuses to start |
+| **Invalid value** — a GPIO pin outside `0..255`, a malformed or out-of-range number, an unrecognised boolean spelling, an unsupported `gps_baud`, or empty | **Fatal**, the daemon refuses to start |
 | **Unrecognised key** — e.g. `lora_frequency` for `lora_freq` | **Warning**, key ignored, startup continues |
 | **File missing or unreadable** | **Warning**, built-in defaults used. The radio then fails to start, since no pins are configured |
 
@@ -280,7 +286,6 @@ first-boots with the INI defaults: `sudo rm -rf /var/lib/meshcore/*`.
 ./deploy.sh                      # build + deploy to $MESHCORE_HOST (default: pimesh)
 ./deploy.sh othernode            # another ssh host
 SKIP_BUILD=1 ./deploy.sh         # reuse the existing build artifact
-ENV_NAME=linux ./deploy.sh       # a different pio env
 ```
 
 It asks the node which Debian release it runs, picks the matching container base
@@ -303,7 +308,7 @@ ssh <host> 'sudo mv /usr/bin/meshcored.prev /usr/bin/meshcored && sudo systemctl
 ## The control CLI (`meshcorectl`)
 
 Everything the MeshCore docs describe as the "serial CLI" — `set`, `get`,
-`prefs`, `advert`, `neighbors`, the `gps` commands — is reached here through
+`advert`, `neighbors`, the `gps` commands — is reached here through
 `meshcorectl`.
 
 The Arduino `Serial` object is output-only on Linux, so `meshcored` prints to
@@ -320,12 +325,22 @@ writable path wins, and startup logs which one it picked:
 The socket is mode `0660` and owned by the user running the daemon, so reaching
 it means being that user, being in its group, or being root.
 
+**The `/tmp` fallback is a predictable, shared path.** Unlike `/run/meshcored`
+(a systemd `RuntimeDirectory`, mode `0750`) or `$XDG_RUNTIME_DIR` (per-user,
+mode `0700`), `/tmp` is world-writable and its name never changes, so on a
+multi-user host another local user can pre-create or race for
+`/tmp/meshcored.sock` before the daemon starts. `meshcored` only takes over a
+path it can prove is not already answering connections (see `try_bind()` in
+`variants/linux/LinuxConsole.cpp`), so this is not an admin-socket takeover —
+but it is still a path only a single-user development box should rely on.
+Under systemd or with `$XDG_RUNTIME_DIR` set, this fallback is never reached.
+
 Three ways to drive it:
 
 ```sh
 sudo meshcorectl                             # REPL: line editing, history, Tab completion
 meshcorectl set name my-repeater             # one-shot: send, print reply, exit
-printf 'prefs\nneighbors\n' | meshcorectl    # piped: one command per line
+printf 'ver\nneighbors\n' | meshcorectl      # piped: one command per line
 ```
 
 The REPL needs no `socat` or `rlwrap`: arrow-key editing, Ctrl-R search, Tab
@@ -333,9 +348,19 @@ completion of known commands, and history in `~/.meshcorectl_history`.
 `MESHCORED_CONTROL_SOCKET` overrides the path for the client exactly as it does
 for the daemon, which is how you reach a node that is not the packaged service.
 
-Only **one client at a time** is served; a second connection waits for the first
-to disconnect. Raw tools work too:
-`sudo socat - UNIX-CONNECT:/run/meshcored/meshcored.sock`.
+Only **one client at a time** is served; a second connection is refused
+immediately with `ERR: control socket busy, another client is connected` and
+closed. Raw tools work too: `sudo socat - UNIX-CONNECT:/run/meshcored/meshcored.sock`
+(also subject to the same one-client rule).
+
+`meshcorectl` exits `0` only if every command it sent was actually run by the
+daemon — that includes `reboot`, `clkreboot` and `poweroff`, whose only "reply"
+is their own echo before the daemon goes away. It exits `1` if the socket is
+missing or unusable, if the connection is refused as busy, if a command draws no
+reply at all, or if a *later* command in a piped script finds the daemon already
+gone (the case after one of those three ran earlier in the same script). A piped
+script stops at the first such failure rather than sending the remaining lines
+into a dead or busy connection.
 
 Running `meshcored` in a foreground terminal with no service behind it, you can
 skip the socket and type commands straight into its stdin. A connected socket
@@ -399,6 +424,35 @@ queued packet on a contended channel spends over half that window inside a scan 
 with the modem in standby, **not listening**. That is inherent to CAD-before-TX,
 but worth knowing before enabling it on a high-SF preset.
 
+### Divergence from upstream
+
+This fork changes the noise-floor estimator and the `int.thresh` CSMA check in
+`src/helpers/radiolib/` and `src/helpers/NoiseFloorTracker.h` — shared code, not
+`variants/linux/` — so it affects every target built from this tree, not only
+Linux:
+
+- The floor is a minimum-statistics estimator (a bias-corrected minimum over a
+  sliding window) that re-seeds itself whenever radio parameters or RX gain
+  state change (`set radio`, `set radio.rxgain`, …), instead of tracking a
+  stale floor from the previous receiver state for up to 180 s.
+- The estimate's scale (sigma) is protected by a fixed censoring gate so that
+  busy-channel traffic can no longer ratchet sigma upward without limit. This
+  removes the *unbounded* growth, not the spread itself — sustained traffic a
+  few dB above the true floor can still widen sigma measurably (worst case
+  ~2.35 dB against a true 0.8 dB spread). See `NOISE_TRACKER_SCALE_GATE_DB` in
+  `src/helpers/NoiseFloorTracker.h` for the measured sweep and its exact
+  guarantee.
+- `resetAGC()` deliberately no longer re-seeds the noise floor estimate — doing
+  so was a measured, live-hardware regression (see its definition in
+  `src/helpers/radiolib/RadioLibWrappers.cpp`).
+
+**This puts a floor under `int.thresh` that the operator's own setting cannot
+go below.** `isChannelActive()` enforces `margin = max(int.thresh,
+NOISE_THRESHOLD_SIGMA_K * sigma)` (`NOISE_THRESHOLD_SIGMA_K` = 3.5), and sigma
+is clamped to at most 3.0 dB — so however tight `int.thresh` is set, the
+enforced margin can be as high as **~10.5 dB**. A very tight `int.thresh` may
+therefore have less effect than its number suggests.
+
 ### Changing settings after first boot
 
 Name, password, location and the radio parameters live in `prefs.json` after the
@@ -406,12 +460,16 @@ first boot and are changed through the CLI:
 
 ```
 set name <name>
-set password <password>
+password <newpwd>
 set lat <lat>
 set lon <lon>
 set freq <mhz>
-set sf <factor>
+set radio <freq>,<bw>,<sf>,<cr>
 ```
+
+`password` is top-level, not `set password`. There is no standalone `set sf`;
+spreading factor (and bandwidth/coding rate) change only together, via
+`set radio`, and take effect after a `reboot`.
 
 ## GPS
 
@@ -894,8 +952,11 @@ sudo systemctl start meshcored
 Running directly rather than under systemd, `meshcored --fsdir /var/lib/meshcore --erase`
 is the one-shot equivalent. Do **not** add `--erase` to the service unit: systemd
 re-runs `ExecStart` on every restart, so it would wipe the filesystem and
-regenerate the identity each time. (The firmware's own `reboot()` strips
-`--erase`, but that protection does not extend to a systemd restart.)
+regenerate the identity each time. (A `reboot`/`clkreboot` CLI command re-execs
+the process with `--erase` stripped from its argument list, so *that* restart
+path does not repeat the erase — but a systemd-triggered restart always replays
+the unit's original `ExecStart` line from scratch, so this protection does not
+extend to it.)
 
 ## Known gaps
 
