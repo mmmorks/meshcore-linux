@@ -1224,6 +1224,32 @@ OBSERVE_SECONDS = 1.5
 # a few sentences without hauling the whole stream around.
 RAW_WINDOW = 256
 
+# The widest set §2.3.4 offers, for wherever the enabled constellations are
+# unknown rather than known to be empty.
+ALL_CONSTELLATIONS = max(MODE_CONSTELLATION.values(), key=len)
+
+
+def projected_sky(sats_now, constellations):
+    """Satellites per talker for a projection, with the unobservable filled in.
+
+    A talker contributes no satellites either because its constellation is
+    genuinely absent or because GSV is switched off and there is nothing to
+    count -- and to the budget those are the same zero. Since GSV is the only
+    sentence that reveals the sky, pricing a change against what GSV shows
+    prices GSV itself at zero on any node where it is currently off, and both
+    of budget()'s operating points go blind together, so not even the ceiling
+    warning fires.
+
+    An unobservable sky is unknown, not empty, so it is priced at the Table 16
+    ceiling: over-stating costs a refusal the operator can --force,
+    under-stating costs the node.
+    """
+    out = dict(sats_now)
+    for talker in talkers_for(constellations):
+        if not out.get(talker):
+            out[talker] = TALKER_CEILING[talker]
+    return out
+
 
 class Change:
     """One documented configuration change.
@@ -1283,7 +1309,13 @@ class SetBaud(Change):
         session.port.set_baud(self.baud)
         got = session.get(CFG_PRT)
         if got is None:
-            return False, "no CFG-PRT reply at %d" % self.baud
+            # Say what state this leaves behind. The port is now clocked at the
+            # requested speed whether or not the receiver followed, and there is
+            # no way to ask the receiver which speed it is on -- it returns to
+            # 9600 on power loss, which is the only way back to a known state.
+            return False, ("no CFG-PRT reply at %d; the port is clocked there "
+                           "but the receiver's speed is now unknown -- it "
+                           "returns to 9600 on power loss" % self.baud)
         return got["baudRate"] == self.baud, "CFG-PRT reads %d" % got["baudRate"]
 
     def projected(self, session, obs):
@@ -1292,7 +1324,7 @@ class SetBaud(Change):
         # budget is the only thing that catches that, so it runs here too --
         # at the NEW speed, against the traffic already on the wire.
         return (session.current_rates(obs), self.baud,
-                session.current_hz(), obs.constellations)
+                session.current_hz(), session.current_constellations(obs))
 
 
 # §2.3.2 and §3.2.2.4 Table 13. The only navigation intervals the spec lists.
@@ -1322,7 +1354,7 @@ class SetRate(Change):
 
     def projected(self, session, obs):
         return (session.current_rates(obs), session.port.baud,
-                1000.0 / self.interval, obs.constellations)
+                1000.0 / self.interval, session.current_constellations(obs))
 
 
 # Which sentences $PCAS03 can address, read off the command's own field table
@@ -1365,7 +1397,8 @@ class SetSentences(Change):
         # costs and is counted there or not at all.
         rates.update({k: v for k, v in self.rates.items()
                       if k in STANDARD_SENTENCES})
-        return rates, session.port.baud, session.current_hz(), obs.constellations
+        return (rates, session.port.baud, session.current_hz(),
+                session.current_constellations(obs))
 
 
 class SetConstellation(Change):
@@ -1512,7 +1545,7 @@ class Session:
     def get(self, message):
         """Send an empty-payload Get and return the parsed reply, or None."""
         frame = self._exchange(message)
-        if frame is None or frame.key != message.key:
+        if frame is None:
             return None
         try:
             return message.parse(frame.payload)
@@ -1528,14 +1561,69 @@ class Session:
         message's rate, not the whole set, so the full picture can only come
         from counting the wire. Reporting an inference as a readback is the
         same trap the README records about measuring gpsd's synthesized NMEA.
+
+        Accurate to +-1 epoch: OBSERVE_SECONDS is wall clock, not a whole
+        number of fixes, so at 1 Hz a 1.5 s window catches one epoch or two
+        depending on where it lands. Rates are ratios, so a partial epoch
+        mostly cancels, but a sentence at rate 2 can read as 1 or 3.
         """
-        epochs = max(1, max((n for n in obs.nmea_counts.values()), default=1))
-        rates = {}
+        # Accumulate per sentence NAME across talkers. $GPGSV, $BDGSV and
+        # $GLGSV are all GSV, and assigning rather than adding would keep only
+        # whichever talker happened to be counted last.
+        counts = {}
         for tag, count in obs.nmea_counts.items():
             name = tag[2:] if len(tag) == 5 and not tag.startswith("P") else tag
             if name in STANDARD_SENTENCES and count:
-                rates[name] = max(1, int(round(float(epochs) / count)))
+                counts[name] = counts.get(name, 0) + count
+
+        # A raw count is sentences, not fixes: GSV repeats once per four
+        # satellites per talker and GSA once per constellation. Dividing by the
+        # multiplicity each sentence declares is what turns one into the other.
+        # Skipping it inflates the epoch estimate by GSV's multiplicity, and
+        # every once-per-fix sentence then infers "every Nth fix" instead of
+        # every fix -- an under-count in the guard's input, which is the
+        # direction current_hz's docstring explains cannot be recovered from.
+        #
+        # Normalised against the sky that was OBSERVED, not the projected one:
+        # these counts were produced by the sky that was actually there, and
+        # pricing them against a substituted ceiling would divide real
+        # sentences by an imaginary multiplicity.
+        talkers = talkers_for(obs.constellations)
+        per_epoch = {}
+        unknown = []
+        for name, count in counts.items():
+            times = STANDARD_SENTENCES[name].repeat(obs.sats_in_view, talkers)
+            if times:
+                per_epoch[name] = float(count) / times
+            else:
+                # Arriving, but the model cannot say how many per fix -- GSA
+                # with GSV switched off leaves no talker list to count. Left
+                # out of the epoch estimate rather than counted as one per fix:
+                # too small a multiplicity here inflates epochs and thins out
+                # every other sentence's inferred rate.
+                unknown.append(name)
+
+        epochs = max(per_epoch.values()) if per_epoch else 1.0
+        rates = {name: max(1, int(round(epochs / n)))
+                 for name, n in per_epoch.items()}
+        # An unknown multiplicity is priced at the most demanding rate there
+        # is, for the same asymmetry as current_hz.
+        rates.update(dict.fromkeys(unknown, 1))
         return rates
+
+    def current_constellations(self, obs):
+        """Which constellations are enabled, inferred from the talkers seen.
+
+        Only GSV reveals this, so with GSV switched off there is nothing to
+        count -- and the honest answer is then "unknown", which is NOT the same
+        as "none" even though frozenset() prices them identically. Unknown
+        falls back to every constellation §2.3.4 offers, for the same asymmetry
+        as current_hz: `set sentences GSV=1` is precisely the command run to
+        turn GSV on, and pricing it against a sky only GSV can show prices the
+        sentence being enabled at zero bytes and waves it through on the way to
+        muting the node.
+        """
+        return obs.constellations or ALL_CONSTELLATIONS
 
     def current_hz(self):
         """Fix rate, read back from CFG-RATE.
@@ -1603,7 +1691,9 @@ class Session:
         projection = change.projected(self, obs)
         if projection is not None:
             rates, baud, hz, constellations = projection
-            bud = budget(rates, baud, hz, obs.sats_in_view, constellations)
+            bud = budget(rates, baud, hz,
+                         projected_sky(obs.sats_in_view, constellations),
+                         constellations)
             if not bud.ok and not force:
                 return Verdict(
                     "refused",
@@ -1616,12 +1706,31 @@ class Session:
             self.port.write(sentence)
             time.sleep(PROBE_SPACING)
 
-        ok, detail = change.confirm(self)
+        try:
+            ok, detail = change.confirm(self)
+        except Exception as exc:
+            # The change is already on the wire. A readback that fails must not
+            # take that fact with it: SetBaud.confirm re-clocks the port, and a
+            # tcsetattr failure there would otherwise propagate out of apply()
+            # and leave the caller believing nothing was written. Broad on
+            # purpose -- what must survive is the record of the write, whatever
+            # went wrong after it.
+            return Verdict("unconfirmed",
+                           "%s; written, but the readback failed: %s: %s"
+                           % (change.describe(), type(exc).__name__, exc), bud)
+
+        # A passing budget can still have no headroom. The operator never sees
+        # the Budget object, and a warning that is not said out loud is not a
+        # warning -- this is the case where enabling a constellation fits the
+        # sky now and cannot fit a full one.
+        note = ""
+        if bud is not None and bud.warn:
+            note = " -- no headroom if the sky fills (%.0f%% at the ceiling)" % (
+                bud.ceiling_pct,)
+        text = "%s; %s%s" % (change.describe(), detail, note)
         if ok is None:
-            return Verdict("unconfirmed", "%s; %s" % (change.describe(), detail),
-                           bud)
-        return Verdict("ok" if ok else "nak",
-                       "%s; %s" % (change.describe(), detail), bud)
+            return Verdict("unconfirmed", text, bud)
+        return Verdict("ok" if ok else "nak", text, bud)
 
     # -- wire -------------------------------------------------------------
     def _read_window(self, timeout):
@@ -1660,12 +1769,24 @@ class Session:
         payload is the whole of the Get convention (§3.1), so there is nothing
         for a caller to supply -- and therefore no way through here to put bytes
         of their choosing on the wire.
+
+        Returns the message asked for, in the framing it was asked in, or None.
+        The scanners watch every framing because *detecting* an answer is the
+        question `probe` exists to settle -- but decoding one is a different
+        act. A u-blox CFG-PRT puts baudRate at a different offset from a CASIC
+        one, so reading a foreign-framed reply with this framing's layout turns
+        "it answered in another dialect" into a confident wrong number, and this
+        is the path feeding current_hz (a guard input) and SetBaud.confirm (a
+        truth claim). poll() reports the foreign answer as the finding it is;
+        a readback has to decline it.
         """
         self.port.flush_input()
         for sc in self.scanners.values():
             sc.take()
         self.port.write(self.framing.encode(message.cls, message.mid, b""))
         for frame in self._read_window(PROBE_TIMEOUT):
+            if frame.framing != self.framing.name:
+                continue
             if frame.key == message.key:
                 return frame
             if (frame.key == ACK_NACK.key
@@ -1762,19 +1883,54 @@ def _raises(fn, expect=Exception):
     return False
 
 
-def _methods(cls):
-    """Every Python-level function reachable on `cls`, for structural checks.
+def _write_sites():
+    """Names of every function in this file that can call something's write().
 
-    Includes the private ones on purpose: "there is no third transmit path" is a
-    claim about the whole class, and a helper taking a caller-supplied payload
-    would break it just as thoroughly as a public send().
+    Read from the module's own syntax tree, because the property being asserted
+    is "only these functions transmit" and a blacklist of method names asserts a
+    naming convention instead. A Session.emit(cls, mid, body) passes any list of
+    forbidden names and any search for the word "payload", and still puts a
+    caller's bytes on the wire; it fails this.
     """
-    out = []
-    for name in dir(cls):
-        attr = getattr(cls, name)
-        if hasattr(attr, "__code__"):
-            out.append(attr)
+    import ast  # only used here, and this is the only caller
+    with open(__file__) as fh:
+        tree = ast.parse(fh.read())
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "write"):
+                out.add(node.name)
     return out
+
+
+def _all_subclasses(cls):
+    """Every subclass of cls, however deeply nested.
+
+    Recursive because apply() gates on isinstance, which is: a subclass of a
+    subclass is accepted there, so the closed-set check has to see it too.
+    __subclasses__() alone reports only direct children.
+    """
+    out = set()
+    for sub in cls.__subclasses__():
+        out.add(sub)
+        out |= _all_subclasses(sub)
+    return out
+
+
+def _sky(counts, sats):
+    """An observation stated directly, so inference can be checked off a wire.
+
+    Injects the GSV records rather than restating how sats_in_view and
+    constellations are derived, so the check exercises the real derivation.
+    """
+    obs = Observation(9600)
+    obs.nmea_counts = dict(counts)
+    obs._nmea.records["GSV"] = {t: {"totalNumSat": n} for t, n in sats.items()}
+    return obs
 
 
 class _FakePort:
@@ -1811,13 +1967,30 @@ class _FakePort:
 def _apply_on_quiet_port(change, **kw):
     """(port, verdict) for one apply() against a port showing one epoch of sky.
 
-    Twelve GPS satellites and a GSA at 9600 baud: enough for the budget to have
-    a real "sky now" to work from, so a refusal is the bandwidth model refusing
-    rather than an empty observation defaulting to zero.
+    A whole epoch, not a sample of one: twelve GPS satellites take three GSV
+    sentences to report (§2.2.3, four per transmission), so a single one would
+    correctly infer "GSV every third fix" and price the stream at a third of
+    what it costs. The budget must be refusing real traffic here, not an
+    artefact of the fixture.
     """
-    port = _FakePort(9600, nmea_wrap("GPGSV,1,1,12,02,49,123,43,0")
+    port = _FakePort(9600, nmea_wrap("GPGSV,3,1,12,02,49,123,43,0")
+                     + nmea_wrap("GPGSV,3,2,12,05,60,005,43,0")
+                     + nmea_wrap("GPGSV,3,3,12,06,06,127,29,0")
                      + nmea_wrap("GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1"))
     return port, Session(port, allow_apply=True).apply(change, **kw)
+
+
+def _breaking_readback(change, exc):
+    """Give one Change instance a readback that fails.
+
+    Patched onto the instance rather than subclassed: a sixth Change subclass
+    would break the closed-set assertion, which is a property worth more than
+    the convenience.
+    """
+    def confirm(session):
+        raise exc
+    change.confirm = confirm
+    return change
 
 
 def _poll_on_quiet_port(n, data):
@@ -2156,13 +2329,12 @@ def selftest():
 
     print("")
     print("session structure (the read-only guarantee):")
-    check("Session exposes no arbitrary-send method",
-          lambda: not [n for n in dir(Session)
-                       if n in ("send", "send_raw", "write", "transmit", "raw")])
-    check("no Session method accepts a caller-supplied payload",
-          lambda: [f.__name__ for f in _methods(Session)
-                   if "payload" in f.__code__.co_varnames[:f.__code__.co_argcount]]
-                  == [])
+    # Asserted off the syntax tree rather than off a list of forbidden method
+    # names: the property is "only these functions transmit", and a name
+    # blacklist is satisfied by anything called something else.
+    check("only the declared transmit paths can reach the wire",
+          lambda: _write_sites() == {"write", "poll", "apply",
+                                     "_exchange", "_probe_binary"})
     check("Session.poll takes only an index",
           lambda: Session.poll.__code__.co_varnames[:2] == ("self", "n"))
     check("no binary poll carries a payload",
@@ -2179,7 +2351,7 @@ def selftest():
           lambda: _raises(lambda: Session(None, allow_apply=True)
                           .apply(("CFG-RATE", b"\xf4\x01\x00\x00")), TypeError))
     check("every Change subclass is reachable from the closed set",
-          lambda: set(CHANGES) == set(Change.__subclasses__())
+          lambda: set(CHANGES) == _all_subclasses(Change)
                   == {SetBaud, SetRate, SetSentences, SetConstellation, Restart})
     check("a session scans every framing, not only the one it asks in",
           lambda: set(Session(None).scanners) == {f.name for f in ALL_FRAMINGS})
@@ -2219,6 +2391,40 @@ def selftest():
           lambda: _raises(lambda: Restart("lukewarm"), ValueError))
 
     print("")
+    print("guard inputs (inference, not measurement):")
+    # Two epochs of a three-constellation sky with everything at rate 1. The
+    # raw counts are not epochs: GSV takes 8 sentences per fix here and GSA 3,
+    # and dividing by the declared multiplicity is what recovers the rate. Read
+    # straight off the counts, so the arithmetic is what is under test rather
+    # than the wire.
+    _2EP = {"GPGSV": 6, "BDGSV": 6, "GLGSV": 4, "GNGSA": 6,
+            "GNRMC": 2, "GNGGA": 2, "GNVTG": 2, "GNZDA": 2}
+    _3C = {"GP": 12, "BD": 10, "GL": 8}
+    check("rates are inferred per fix, not per sentence",
+          lambda: Session(None).current_rates(_sky(_2EP, _3C))
+                  == {"GSV": 1, "GSA": 1, "RMC": 1, "GGA": 1, "VTG": 1, "ZDA": 1})
+    check("a sentence's talkers are summed, not overwritten",
+          lambda: Session(None).current_rates(
+              _sky({"GPGSV": 3, "BDGSV": 3, "GLGSV": 2, "GNRMC": 1}, _3C))["GSV"] == 1)
+    check("an unobservable sky is unknown, not empty",
+          lambda: Session(None).current_constellations(_sky({"GNRMC": 1}, {}))
+                  == ALL_CONSTELLATIONS
+                  and Session(None).current_constellations(_sky({}, {"GP": 6}))
+                  == frozenset(("GPS",)))
+    check("a talker with nothing to count is priced at the ceiling, not zero",
+          lambda: projected_sky({}, ALL_CONSTELLATIONS) == TALKER_CEILING
+                  and projected_sky({"GP": 6}, ALL_CONSTELLATIONS)["GP"] == 6)
+    # The measured case: enabling GSV on a node that shows only $GNRMC. Priced
+    # against the observed sky, GSV costs zero and both operating points go
+    # blind together, so the change is approved on the way to muting the node.
+    check("enabling GSV is priced even where GSV is what would reveal the sky",
+          lambda: (lambda blind, seen: blind.ok and 40.0 < blind.now_pct < 41.0
+                   and not seen.ok)(
+              budget({"RMC": 1, "GSV": 1}, 9600, 5.0, {}, frozenset()),
+              budget({"RMC": 1, "GSV": 1}, 9600, 5.0,
+                     projected_sky({}, ALL_CONSTELLATIONS), ALL_CONSTELLATIONS)))
+
+    print("")
     print("poll (against a recording port, no hardware):")
     # The one poll this hardware is known to answer, and its reply is a $GPTXT
     # (§2.2.7 -- SW= is the software field, not a part number). Filtering
@@ -2235,6 +2441,24 @@ def selftest():
                   _NMEA_POLL[0],
                   nmea_wrap("GNRMC,071556.000,A,3149.29103,N,11706.92916,E,"
                             "0.00,0.00,250420,,,A,V") + nmea_wrap(_VER))))
+    # The whole reason this tool's ancestor existed: a chip may answer a
+    # request in a dialect other than the one it was asked in, and scoring that
+    # as silence turns "it answered, just not how we expected" into "it does
+    # not support this".
+    _RATE_POLL = [i for i, p in enumerate(POLLS)
+                  if (p.cls, p.mid) == CFG_RATE.key]
+    check("a reply in a foreign framing is an answer, not silence",
+          lambda: (lambda p, r: r.outcome == "reply" and r.answered_in == "ubx"
+                   and r.detail["interval"] == 500)(
+              *_poll_on_quiet_port(_RATE_POLL[0],
+                                   UBX.encode(*CFG_RATE.key,
+                                              CFG_RATE.build(interval=500, res=0)))))
+    # ...but a readback is not a detection. Decoding that same frame with the
+    # CASIC layout would report a confident wrong number to the guard.
+    check("a readback declines a reply framed in another dialect",
+          lambda: Session(_FakePort(9600, UBX.encode(
+              *CFG_RATE.key, CFG_RATE.build(interval=500, res=0)))
+          ).get(CFG_RATE) is None)
 
     print("")
     print("apply (against a recording port, no hardware):")
@@ -2249,6 +2473,14 @@ def selftest():
           lambda: (lambda p, v: p.writes == [b"$PCAS10,0*1C\r\n"]
                    and v.status == "unconfirmed")(
               *_apply_on_quiet_port(Restart("hot"))))
+    # SetBaud.confirm re-clocks the port before reading back, and tcsetattr can
+    # fail. The change is already on the wire by then, so an exception escaping
+    # apply() would leave the caller believing nothing was written.
+    check("a readback that fails does not erase the write",
+          lambda: (lambda p, v: v.status == "unconfirmed" and p.writes
+                   and "readback failed" in v.detail)(
+              *_apply_on_quiet_port(_breaking_readback(
+                  Restart("hot"), OSError(5, "Input/output error")))))
 
     print("")
     if _FAILS:
