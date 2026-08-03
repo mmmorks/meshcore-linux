@@ -2001,6 +2001,121 @@ class Session:
 
 
 # --------------------------------------------------------------------------
+# init -- the boot-path setup that runs before gpsd opens the port
+#
+# Replaces gnss-set-baud (variants/linux/gnss-set-baud; kept as a read-only
+# reference until Task 15 removes it). Runs from gpsd's ExecStartPre, on
+# every gpsd start, on a node whose GNSS receiver is its stratum-1 clock
+# source. Three consequences:
+#
+#   * cmd_init must always return 0. A mis-tuned receiver is recoverable; a
+#     node with no gpsd at all loses its clock. A failure here has to
+#     surface as gpsd's own "no data received" -- diagnosable -- and never
+#     as a failed ExecStartPre, which stops gpsd outright.
+#   * It must be bounded: a hang in ExecStartPre blocks gpsd indefinitely.
+#     _init_sequence checks its deadline before every step and gives up
+#     cleanly rather than running one out.
+#   * It must leave the port at 115200 -- the speed gpsd is about to open it
+#     at -- so that if anything above went wrong the symptom is a clean "no
+#     data" rather than a speed mismatch that looks like dead hardware.
+#
+# gnss-set-baud sent $PCAS01,5 at both 9600 and 115200 (the speed is
+# volatile -- it returns to 9600 on power loss but survives a gpsd restart --
+# and there is no way to ask which one the receiver is on) and then sent
+# $PCAS02,200 unconditionally. That was safe only because $PCAS02,200 is
+# unparseable noise at 9600; the script's own comments say so. That is a
+# property of one sentence, not of the approach. _init_sequence instead
+# reads CFG-PRT back at 115200 and sends the fix rate only once that
+# readback confirms it, so the guard holds for any rate.
+# --------------------------------------------------------------------------
+
+INIT_BAUD = 115200
+INIT_INTERVAL_MS = 200
+INIT_CANDIDATES = (9600, INIT_BAUD)
+# Narrower than PROBE_TIMEOUT (1.5 s): PROBE_TIMEOUT is sized for probe's
+# exploratory sweep of a receiver that might not answer at all. This window
+# opens only after the receiver has already been told to move to 115200, on
+# a local, no-propagation-delay UART -- a reply that is coming is coming
+# fast.
+INIT_CONFIRM_TIMEOUT = 0.2
+
+
+def _init_sequence(port, deadline):
+    """Send the speed at both candidate rates, prove it, then send the rate.
+
+    Every write happens through Session.apply() -- the same path 'gnssctl
+    set' uses -- never through port.write() directly. The read-only-guarantee
+    check (_write_sites, below) asserts that only {write, poll, apply,
+    _exchange, _probe_binary} can reach the wire, with no exception carved
+    out for init: a port.write() call written here would add
+    "_init_sequence" to that set and fail it. Routing $PCAS01/$PCAS02
+    through SetBaud/SetRate -- the two Change subclasses that already build
+    those sentences -- keeps init inside the same closed set everything
+    else here transmits through, instead of needing a special case.
+
+    The two candidate sends use a session with no read window at all
+    (timeout=0, observe=0): at that point the receiver's speed is unknown,
+    so there is nothing worth listening for yet, and apply() always runs
+    SetBaud's own confirm() readback regardless of `force` -- listening here
+    would let that incidental readback consume a reply this step has no way
+    to use, robbing the one read that actually matters. That one read is
+    separate and deliberate: a plain, read-only Get for CFG-PRT, given
+    whatever time is left, once the port is settled at 115200. Sending the
+    fix rate is gated on THAT reply agreeing, not on anything reported by
+    the candidate sends.
+    """
+    for candidate in INIT_CANDIDATES:
+        if time.monotonic() > deadline:
+            return
+        port.set_baud(candidate)
+        blind = Session(port, allow_apply=True, timeout=0, observe=0)
+        blind.apply(SetBaud(INIT_BAUD), force=True)
+
+    if time.monotonic() > deadline:
+        return
+    port.set_baud(INIT_BAUD)
+    readback = Session(port, allow_apply=False,
+                       timeout=min(INIT_CONFIRM_TIMEOUT,
+                                  max(0.0, deadline - time.monotonic())))
+    got = readback.get(CFG_PRT)
+    if got is None or got.get("baudRate") != INIT_BAUD:
+        # Unproven -- say nothing more than that. The port is already at
+        # 115200 (set above) regardless of whether the receiver followed, so
+        # the failure surfaces as gpsd's own "no data received" rather than
+        # a speed mismatch that looks like dead hardware (see the section
+        # banner). Sending the fix rate here would be presenting an
+        # assumption as a measurement.
+        return
+
+    if time.monotonic() > deadline:
+        return
+    rate = Session(port, allow_apply=True,
+                   timeout=min(INIT_CONFIRM_TIMEOUT,
+                              max(0.0, deadline - time.monotonic())),
+                   observe=0)
+    rate.apply(SetRate(INIT_INTERVAL_MS), force=True)
+
+
+def cmd_init(args):
+    """Boot-path entry point for `gnssctl init DEVICE`. Always returns 0 --
+    see the section banner for why a failure here must never stop gpsd
+    starting.
+
+    Runs from gpsd's ExecStartPre. Not finding the device is not an error
+    either: a node with no GNSS HAT still starts gpsd for other devices.
+    """
+    if not os.path.exists(args.device):
+        return 0
+    deadline = time.monotonic() + args.timeout
+    try:
+        with Port(args.device, 9600) as port:
+            _init_sequence(port, deadline)
+    except Exception as exc:
+        print("gnssctl init: %s" % exc, file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # probe -- the read-only diagnostic
 #
 # Carried over from gnss-probe (which this file replaces). The finding that
@@ -3331,6 +3446,43 @@ def _complete(prefix):
         i += 1
 
 
+# Two canned CFG-PRT readbacks for the init checks below -- one at the speed
+# init is trying to reach, one that answered but did not actually move.
+# Baud is written literally (not via INIT_BAUD) so these stay evaluable at
+# import time regardless of where that constant is declared.
+_PRT_AT_INIT_BAUD = CASIC.encode(*CFG_PRT.key,
+                                 CFG_PRT.build(portID=1, protoMask=0x07,
+                                              mode=0x08C0, baudRate=115200))
+_PRT_AT_WRONG_BAUD = CASIC.encode(*CFG_PRT.key,
+                                  CFG_PRT.build(portID=1, protoMask=0x07,
+                                               mode=0x08C0, baudRate=9600))
+
+_INIT_WRITES_CACHE = {}
+
+
+def _init_writes(reply=b"", deadline=None):
+    """port.writes after one _init_sequence run against a fresh _FakePort
+    that answers every read with `reply` (default: silence).
+
+    Memoized per (reply, deadline): apply()'s PROBE_SPACING sleep (0.25 s,
+    real wall clock, not shortened by any test window -- see its own module
+    comment) makes one full _init_sequence run genuinely slow, and several
+    checks below ask different questions about the same run rather than
+    each driving their own.
+    """
+    key = (reply, deadline)
+    if key not in _INIT_WRITES_CACHE:
+        port = _FakePort(9600, reply)
+        dl = time.monotonic() + 5.0 if deadline is None else deadline
+        _init_sequence(port, dl)
+        _INIT_WRITES_CACHE[key] = port.writes
+    return _INIT_WRITES_CACHE[key]
+
+
+def _init_args(device="/dev/fake", timeout=10.0):
+    return _Args(device=device, timeout=timeout)
+
+
 def selftest():
     del _FAILS[:]
     print("gnssctl --selftest")
@@ -4111,6 +4263,28 @@ def selftest():
           "cmd_monitor, driven through the REPL dispatcher this time",
           lambda: len(_repl_monitor_writes(2)) == 2  # readback only, 0 redraws
                   and len(_repl_monitor_writes(4)) == 2)  # readback + 2 redraws
+
+    print("")
+    print("boot-path init (replaces gnss-set-baud):")
+    check("init always reports success, whatever happened",
+          lambda: cmd_init(_init_args(device="/nonexistent")) == 0)
+    check("init sends the speed at both candidate rates",
+          lambda: [w for w in _init_writes()
+                   if w == SetBaud(INIT_BAUD).sentences()[0]]
+                  == [SetBaud(INIT_BAUD).sentences()[0]] * 2)
+    check("init does not send the fix rate until the speed is proven",
+          lambda: SetRate(INIT_INTERVAL_MS).sentences()[0]
+                  not in _init_writes())
+    check("init sends the fix rate once the speed is proven",
+          lambda: SetRate(INIT_INTERVAL_MS).sentences()[0]
+                  in _init_writes(reply=_PRT_AT_INIT_BAUD))
+    check("a CFG-PRT reply at the wrong baud also withholds the fix rate -- "
+          "the readback has to agree, not merely answer",
+          lambda: SetRate(INIT_INTERVAL_MS).sentences()[0]
+                  not in _init_writes(reply=_PRT_AT_WRONG_BAUD))
+    check("init honours its overall deadline: one already expired sends "
+          "nothing",
+          lambda: _init_writes(deadline=time.monotonic() - 1.0) == [])
 
     print("")
     if _FAILS:
