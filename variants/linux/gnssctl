@@ -2622,6 +2622,376 @@ def cmd_bandwidth(port, args):
     return 0 if bud.ok else 1
 
 
+# --------------------------------------------------------------------------
+# The REPL -- the one place `apply` is reachable interactively.
+#
+# repl() is handed ONE already-open, already-writable Session (allow_apply=
+# True) and never builds another: ServiceGuard stops gpsd.socket AND
+# gpsd.service (see its own docstring), which drops the node's stratum-1
+# clock for minutes, so that has to happen once per REPL run, not once per
+# line typed at the prompt. The caller (the future CLI entry point) opens
+# the port, runs ServiceGuard, builds this one Session, and only then calls
+# repl(session, args).
+#
+# Every _repl_* handler below takes that same `session` and does nothing
+# else with the port -- no second Session, read-only or otherwise. That is
+# NOT the same function as cmd_show/cmd_monitor/cmd_probe/cmd_bandwidth
+# above: those are pinned by --selftest's own AST checks (_session_calls) to
+# build their OWN read-only Session(port, allow_apply=False) as their first
+# line, for the one-shot CLI path where each invocation is a fresh process.
+# Making them take a session instead would break that pin for no reason --
+# the one-shot path is correct to open read-only every time it runs, once.
+# So the logic below duplicates cmd_show/cmd_monitor/cmd_probe/cmd_bandwidth
+# rather than sharing their bodies: the alternative is extracting Session
+# construction out of functions whose read-only-ness is asserted by it being
+# there, which trades a few duplicated lines for a weakened guarantee.
+# --------------------------------------------------------------------------
+
+
+def _parse_flags(tokens, flag_names):
+    """(positional, {flag: value-or-True}) from a REPL argument list.
+
+    The REPL's own microsyntax -- plain space-separated tokens, matching
+    meshcorectl's commands -- rather than a second argparse tree next to the
+    one the CLI entry point will build. `flag_names` maps each accepted
+    `--name` to whether it takes a value. An unrecognised `--flag` raises
+    rather than being folded into the positional list: the design rule
+    against guessing on malformed input applies to REPL parsing too, not
+    only to the spec-derived validation downstream of it.
+    """
+    positional = []
+    flags = {}
+    tokens = list(tokens)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--"):
+            name = tok[2:]
+            if name not in flag_names:
+                raise ValueError("unknown option --%s" % name)
+            if flag_names[name]:
+                i += 1
+                if i >= len(tokens):
+                    raise ValueError("--%s needs a value" % name)
+                flags[name] = tokens[i]
+            else:
+                flags[name] = True
+        else:
+            positional.append(tok)
+        i += 1
+    return positional, flags
+
+
+def _parse_set_rate(text):
+    """Milliseconds for `set rate`, accepting either form this file's own
+    module docstring advertises ("gnssctl set rate 5hz"): a bare number is
+    milliseconds, one ending "hz" is a frequency. This only converts units --
+    SetRate.__init__ is what decides which resulting interval is legal
+    (NAV_INTERVALS, §2.3.2/§3.2.2.4), so a bad unit conversion still surfaces
+    as SetRate's own spec-citing refusal rather than a silent guess here.
+    """
+    text = text.strip()
+    if text.lower().endswith("hz"):
+        hz = float(text[:-2])
+        if hz <= 0:
+            raise ValueError("rate must be a positive number of Hz")
+        return int(round(1000.0 / hz))
+    return int(text)
+
+
+def _parse_set_constellation(tokens):
+    """frozenset of constellation names from 'set constellation' tokens.
+
+    'GPS+BDS', 'GPS,BDS' and 'GPS BDS' (separate tokens) all collapse to the
+    same join-then-split, so none is a special case of another. This only
+    tokenises; SetConstellation.__init__ validates the combination against
+    §2.3.4.
+    """
+    joined = "+".join(tokens).replace(",", "+")
+    return frozenset(p.strip().upper() for p in joined.split("+") if p.strip())
+
+
+def _repl_set(session, rest):
+    """'set baud|rate|sentences|constellation ...' -> one Change -> apply()
+    on the session repl() was handed.
+    """
+    tokens = rest.split()
+    if not tokens:
+        raise ValueError("set needs a target: baud, rate, sentences or "
+                         "constellation")
+    target, tokens = tokens[0], tokens[1:]
+    positional, flags = _parse_flags(tokens, {"force": False, "yes": False})
+
+    if target == "baud":
+        if len(positional) != 1:
+            raise ValueError("set baud takes exactly one value, e.g. "
+                             "'set baud 9600'")
+        change = SetBaud(int(positional[0]))
+    elif target == "rate":
+        if len(positional) != 1:
+            raise ValueError("set rate takes exactly one value, e.g. "
+                             "'set rate 5hz' or 'set rate 200'")
+        change = SetRate(_parse_set_rate(positional[0]))
+    elif target == "sentences":
+        if not positional:
+            raise ValueError("set sentences needs at least one NAME=RATE "
+                             "pair, e.g. 'set sentences GSV=1'")
+        change = SetSentences(_parse_rate_overrides(",".join(positional)))
+    elif target == "constellation":
+        if not positional:
+            raise ValueError("set constellation needs at least one "
+                             "constellation, e.g. 'set constellation GPS+BDS'")
+        change = SetConstellation(_parse_set_constellation(positional))
+    else:
+        raise ValueError("no such 'set' target: %r (baud, rate, sentences, "
+                         "constellation)" % target)
+
+    print(session.apply(change, force=flags.get("force", False),
+                        yes=flags.get("yes", False)))
+
+
+def _repl_restart(session, rest):
+    """'restart hot|warm|cold|factory [--yes]' -> Restart -> apply()."""
+    positional, flags = _parse_flags(rest.split(), {"force": False, "yes": False})
+    if len(positional) != 1:
+        raise ValueError("restart takes exactly one kind: %s"
+                         % ", ".join(sorted(RESTART_FLAG)))
+    change = Restart(positional[0])
+    print(session.apply(change, force=flags.get("force", False),
+                        yes=flags.get("yes", False)))
+
+
+def _repl_show(session, rest):
+    """Same report as cmd_show, against the session repl() was handed."""
+    if rest:
+        raise ValueError("show takes no arguments")
+    seconds = session.observe_seconds
+    print("Listening at %d baud for %.1fs, plus CFG-PRT and CFG-RATE Gets..."
+          % (session.port.baud, seconds))
+    obs = session.observe(seconds)
+    print("")
+    print(render_show(session, obs))
+    print("")
+    print(render_sky(obs))
+
+
+def _repl_monitor(session, rest):
+    """Same loop as cmd_monitor (see its docstring for why the CFG-PRT/
+    CFG-RATE readback happens ONCE, before the loop, and every redraw passes
+    readback= instead of a live session), against the session repl() was
+    handed.
+    """
+    positional, flags = _parse_flags(rest.split(), {"raw": False, "interval": True})
+    if positional:
+        raise ValueError("monitor takes no positional arguments -- only "
+                         "--raw / --interval")
+    raw = bool(flags.get("raw", False))
+    interval = float(flags["interval"]) if "interval" in flags else 1.0
+
+    print("Reading CFG-PRT and CFG-RATE once...")
+    readback = (session.get(CFG_PRT), session.get(CFG_RATE))
+
+    obs = Observation(session.port.baud)
+    scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS} if raw else {}
+
+    print("Watching %s at %d baud -- nothing else is sent. Ctrl-C to stop."
+          % (session.port.path, session.port.baud))
+    try:
+        while True:
+            data = session.port.read(interval)
+            raw_lines = []
+            if data:
+                obs.absorb(data)
+                if raw:
+                    for sc in scanners.values():
+                        sc.feed(data)
+                        for fr in sc.take():
+                            detail = Session._decode(fr)
+                            raw_lines.append("  %-9s %02x-%02x  %s" % (
+                                fr.framing, fr.cls, fr.mid,
+                                detail if detail else hexdump(fr.payload, 24)))
+            _clear_screen()
+            print(render_show(None, obs, readback=readback))
+            print("")
+            print(render_sky(obs))
+            if raw:
+                print("")
+                print("  raw frames this cycle:")
+                for line in raw_lines:
+                    print(line)
+                if not raw_lines:
+                    print("    none")
+    except KeyboardInterrupt:
+        print("")
+
+
+def _repl_probe(session, rest):
+    """Same report as cmd_probe, against the session repl() was handed."""
+    positional, flags = _parse_flags(rest.split(), {"json": True})
+    if positional:
+        raise ValueError("probe takes no positional arguments -- only --json")
+    seconds = session.observe_seconds
+    print("Listening at %d baud for %.0fs (sending nothing)..."
+          % (session.port.baud, seconds))
+    obs = session.observe(seconds)
+
+    sweeps = []
+    for framing in PROBE_ORDER:
+        print("Sweeping %s framing..." % framing.name)
+        results = sweep(session, framing)
+        sweeps.append((framing, results))
+        if productive(results):
+            break
+        if framing is not PROBE_ORDER[-1]:
+            print("  every binary poll refused; trying the next framing")
+
+    print("")
+    print(render_probe(obs, sweeps, session.port.path))
+
+    json_path = flags.get("json")
+    if json_path:
+        with open(json_path, "w") as fh:
+            json.dump(probe_json(obs, sweeps, session.port.path), fh, indent=2)
+        print("JSON written to %s" % json_path)
+
+
+def _repl_bandwidth(session, rest):
+    """Same arithmetic as cmd_bandwidth, against the session repl() was
+    handed. Sends nothing, same as cmd_bandwidth: no Get, no poll, no apply.
+    """
+    positional, flags = _parse_flags(
+        rest.split(), {"rate": True, "baud": True, "sentences": True})
+    if positional:
+        raise ValueError("bandwidth takes no positional arguments -- only "
+                         "--rate / --baud / --sentences")
+    seconds = session.observe_seconds
+    print("Listening at %d baud for %.1fs (sending nothing)..."
+          % (session.port.baud, seconds))
+    obs = session.observe(seconds)
+
+    rates = session.current_rates(obs)
+    if "sentences" in flags:
+        rates.update({k: v for k, v in
+                      _parse_rate_overrides(flags["sentences"]).items()
+                      if k in STANDARD_SENTENCES})
+
+    constellations = session.current_constellations(obs)
+    baud = int(flags["baud"]) if "baud" in flags else session.port.baud
+
+    if "rate" in flags:
+        hz = float(flags["rate"])
+        hz_note = "given by --rate"
+    else:
+        hz = 1000.0 / min(NAV_INTERVALS)
+        hz_note = "assumed: fastest documented rate (%.3g Hz) -- no Get sent" % hz
+
+    bud = budget(rates, baud, hz, obs.sats_in_view, constellations)
+    print("")
+    print("  fix rate                %s" % hz_note)
+    print(bud.render())
+
+
+# Keyed by the first word of every COMMANDS entry except "help"/"quit" -- see
+# the --selftest check that walks COMMANDS and confirms none is missing here.
+# Every value takes (session, rest): the one session repl() was handed, and
+# whatever the user typed after the verb, unparsed.
+DISPATCH = {
+    "show": _repl_show,
+    "monitor": _repl_monitor,
+    "probe": _repl_probe,
+    "bandwidth": _repl_bandwidth,
+    "set": _repl_set,
+    "restart": _repl_restart,
+}
+
+COMMANDS = ("show", "monitor", "probe", "bandwidth", "set baud", "set rate",
+            "set sentences", "set constellation", "restart", "help", "quit")
+
+HISTFILE = os.path.expanduser("~/.gnssctl_history")
+
+
+def completer(text, state):
+    matches = [c for c in COMMANDS if c.startswith(text)]
+    return matches[state] if state < len(matches) else None
+
+
+def _help_text():
+    return "\n".join(
+        ["Commands:"] + ["  " + c for c in COMMANDS] +
+        ["", "Tab completes, Ctrl-D or 'quit' exits.",
+         "'set'/'restart' take --force / --yes, same as the one-shot CLI."])
+
+
+def repl(session, args):
+    """Interactive command loop over one already-open, already-writable
+    Session -- see the module comment above this section for why it takes a
+    session rather than a port, and why DISPATCH's handlers do too.
+
+    Follows meshcorectl's interactive() shape exactly, since that pattern is
+    already proven in this repository and users of one tool will expect the
+    other to behave the same way: readline imported locally (so a Python
+    stripped of the readline module still runs one-shot commands -- the
+    module-level code never imports it, only this function does, and this
+    function is only reached for interactive use), persistent history in
+    HISTFILE, Tab completion via `completer`, Ctrl-D to exit.
+
+    `args` is accepted for signature parity with the CLI entry point this
+    file will grow (a parse_args() Namespace); nothing here reads it yet.
+    """
+    import readline
+    try:
+        readline.read_history_file(HISTFILE)
+    except OSError:
+        pass
+    readline.set_history_length(1000)
+    readline.set_completer_delims("")
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
+
+    print("gnssctl -> %s at %d baud   (Tab completes, Ctrl-D quits)"
+          % (session.port.path, session.port.baud))
+    while True:
+        try:
+            line = input("gnssctl> ").strip()
+        except EOFError:
+            print("")
+            break
+        except KeyboardInterrupt:
+            print("")
+            continue
+        if not line:
+            continue
+        if line in ("quit", "exit"):
+            break
+        if line == "help":
+            print(_help_text())
+            continue
+
+        verb, _, rest = line.partition(" ")
+        handler = DISPATCH.get(verb)
+        if handler is None:
+            print("gnssctl: no such command %r (try 'help')" % verb)
+            continue
+        try:
+            handler(session, rest.strip())
+        except ValueError as exc:
+            # Surfaces the Change subclass's OWN spec-citing message (or this
+            # REPL's own parsing errors, in the same voice) rather than
+            # replacing it with something vaguer -- the design rule Tasks 9
+            # and 11 both had to re-learn the hard way.
+            print("gnssctl: %s" % exc)
+        except KeyboardInterrupt:
+            print("")
+        except OSError as exc:
+            print("gnssctl: %s: %s" % (type(exc).__name__, exc))
+
+    try:
+        readline.write_history_file(HISTFILE)
+    except OSError:
+        pass
+    return 0
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -2915,6 +3285,39 @@ def _probe_session():
     return Session(None, allow_apply=False)
 
 
+def _dispatch_capture(verb, rest, data=b""):
+    """(port, session, stdout) from one DISPATCH call against a fake port --
+    what "the REPL dispatches through the one session it was given" actually
+    produces, without a terminal or hardware. allow_apply=True: this is the
+    session shape repl() itself builds, not the read-only one cmd_show et al
+    use for the one-shot path.
+    """
+    import io          # only used here, and this is the only caller
+    import contextlib  # only used here, and this is the only caller
+    port = _FakePort(9600, data)
+    session = Session(port, allow_apply=True, timeout=_TEST_WINDOW,
+                      observe=_TEST_WINDOW)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        DISPATCH[verb](session, rest)
+    return port, session, out.getvalue()
+
+
+def _dispatch_error(verb, rest):
+    """The message a DISPATCH handler raises for `rest`, or None if it did
+    not raise -- lets a check assert on the TEXT of a refusal (a spec
+    citation, or this file's own parsing complaint) rather than only that
+    something was raised.
+    """
+    session = Session(_FakePort(9600), allow_apply=True, timeout=_TEST_WINDOW,
+                      observe=_TEST_WINDOW)
+    try:
+        DISPATCH[verb](session, rest)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 def _scan(framing, *chunks):
     sc = Scanner(framing)
     for chunk in chunks:
@@ -2932,6 +3335,22 @@ def _observe(data):
     obs = Observation(115200)
     obs.absorb(data)
     return obs
+
+
+def _complete(prefix):
+    """Every completion `completer` offers for `prefix`, in readline's own
+    state-index protocol (state 0, 1, 2, ... until None) rather than by
+    reaching into COMMANDS directly -- this is what --selftest can exercise
+    without a real terminal or readline itself being importable.
+    """
+    out = []
+    i = 0
+    while True:
+        got = completer(prefix, i)
+        if got is None:
+            return out
+        out.append(got)
+        i += 1
 
 
 def selftest():
@@ -3628,6 +4047,59 @@ def selftest():
           "CFG-PRT/CFG-RATE readback, however many redraws run",
           lambda: len(_monitor_writes(2)) == 2  # readback only, 0 redraws
                   and len(_monitor_writes(4)) == 2)  # readback + 2 redraws
+
+    print("")
+    print("repl:")
+    check("every documented command is completable",
+          lambda: all(c in COMMANDS for c in
+                      ("show", "monitor", "probe", "bandwidth",
+                       "set baud", "set rate", "set sentences",
+                       "set constellation", "restart", "help", "quit")))
+    check("completion of a prefix offers the matching commands",
+          lambda: sorted(_complete("set ")) == sorted(
+              [c for c in COMMANDS if c.startswith("set ")]))
+    check("completion of an unknown prefix offers nothing",
+          lambda: _complete("zzz") == [])
+    check("no command in the table is missing from the dispatcher",
+          lambda: all(c.split()[0] in DISPATCH or c in ("help", "quit")
+                      for c in COMMANDS))
+    check("DISPATCH covers exactly the six dispatchable verbs -- 'help' and "
+          "'quit' are handled by repl() itself, not the dispatch table",
+          lambda: set(DISPATCH) == {"show", "monitor", "probe", "bandwidth",
+                                    "set", "restart"})
+    check("every REPL handler, and repl() itself, reuses the session it is "
+          "given -- none builds a second Session",
+          lambda: all(_session_calls(name) == [] for name in
+                      ("_repl_show", "_repl_monitor", "_repl_probe",
+                       "_repl_bandwidth", "_repl_set", "_repl_restart",
+                       "repl")))
+    check("'set baud' dispatches through the shared session and re-clocks "
+          "its port, rather than opening a second one",
+          lambda: _dispatch_capture("set", "baud 19200")[0].baud == 19200)
+    check("an invalid 'set baud' surfaces SetBaud's own §2.3.1 refusal, not "
+          "a vaguer one",
+          lambda: "§2.3.1" in (_dispatch_error("set", "baud 1234") or ""))
+    check("an invalid 'restart' kind surfaces Restart's own §2.3.5 refusal, "
+          "not a vaguer one",
+          lambda: "§2.3.5" in (_dispatch_error("restart", "sideways") or ""))
+    check("an invalid 'set sentences' rate surfaces SetSentences' own "
+          "§2.3.3 refusal, not a vaguer one",
+          lambda: "§2.3.3" in (_dispatch_error("set", "sentences GSV=11") or ""))
+    check("an invalid 'set constellation' combination surfaces "
+          "SetConstellation's own §2.3.4 refusal, not a vaguer one",
+          lambda: "§2.3.4" in (_dispatch_error("set", "constellation GPS+GAL")
+                               or ""))
+    check("an unparseable 'set' line says so rather than guessing at a "
+          "target",
+          lambda: _dispatch_error("set", "") is not None
+                  and _dispatch_error("set", "wobble 1") is not None)
+    check("an unrecognised REPL flag is refused, not folded into the value",
+          lambda: "unknown option" in
+                  (_dispatch_error("set", "baud 9600 --nope") or ""))
+    check("'restart cold' through the REPL without --yes writes nothing -- "
+          "the needs_yes gate holds through dispatch, not only through "
+          "apply() directly",
+          lambda: _dispatch_capture("restart", "cold")[0].writes == [])
 
     print("")
     if _FAILS:
