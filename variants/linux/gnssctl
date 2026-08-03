@@ -647,6 +647,10 @@ GSV = Sentence("GSV",                                          # §2.2.3
                F("totalNumSen", IntC(1)), F("senNum", IntC(1)),
                F("totalNumSat", IntC(2)),
                Repeat((1, 4), "sats",
+                      # Three digits, not two: Table 16 assigns QZSS the range
+                      # 193-197, and the spec's own GSV example carries
+                      # satellites 193 and 195. GSV repeats per satellite per
+                      # talker, so this width dominates the bandwidth model.
                       F("satID", Num("999")), F("elev", IntC(2)),
                       F("az", IntC(3)), F("cn0", Num("99"))),
                F("signalID", IntC(1)))
@@ -678,10 +682,14 @@ TXT = Sentence("TXT",                                          # §2.2.7
                F("totalNumSen", IntC(2)), F("senNum", IntC(2)),
                F("textID", IntC(2)), F("textMsg", TextC))
 
+# <Day>/<Month>/<LocalHour>/<LocalMin> are zero-padded on the wire (e.g. "00");
+# IntC would decode "00" to 0 and re-encode it as "0", losing the padding and
+# breaking round-trip. Text-decoded like <Date> elsewhere, since the padding
+# is data, not formatting.
 ZDA = Sentence("ZDA",                                          # §2.2.8
-               F("utc", Utc), F("day", IntC(2)), F("month", IntC(2)),
-               F("year", IntC(4)), F("localHour", IntC(2)),
-               F("localMin", IntC(2)))
+               F("utc", Utc), F("day", Num("99")), F("month", Num("99")),
+               F("year", Num("9999")), F("localHour", Num("99")),
+               F("localMin", Num("99")))
 
 STANDARD_SENTENCES = {s.name: s for s in
                       (RMC, GGA, GSV, GSA, VTG, GLL, TXT, ZDA)}
@@ -883,8 +891,10 @@ def selftest():
     check("TXT keeps a message containing '=' intact (§2.2.7)",
           lambda: TXT.parse(SPEC_NMEA[17].rsplit("*", 1)[0][5:])["textMsg"]
                   == "MA=CASIC")
+    # body[2:] strips the two-character talker ID and keeps the three-character
+    # sentence name, because build() emits that name as its first field.
     check("every standard sentence round-trips its own example",
-          lambda: all(s.build(**s.parse(body[5:])) == body[5:]
+          lambda: all(s.build(**s.parse(body[2:])) == body[2:]
                       for s, body in ((RMC, SPEC_NMEA[5].rsplit("*", 1)[0]),
                                       (GGA, SPEC_NMEA[6].rsplit("*", 1)[0]),
                                       (GSA, SPEC_NMEA[14].rsplit("*", 1)[0]),
@@ -901,7 +911,7 @@ def selftest():
           lambda: [TXT.max_width(), GGA.max_width(), RMC.max_width(),
                    GSV.max_width(), GSA.max_width(), GLL.max_width(),
                    VTG.max_width(), ZDA.max_width()]
-                  == [82, 81, 77, 72, 68, 53, 42, 39])
+                  == [82, 81, 77, 76, 68, 53, 42, 39])
 
     print("")
     if _FAILS:
