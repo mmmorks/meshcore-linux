@@ -978,6 +978,9 @@ class NmeaCollector:
         self.counts = {}
         self.lines = []
         self.records = {}
+        # Per-talker satellite table, accumulated across a GSV group's parts
+        # rather than overwritten like `records` above -- see _absorb_sky.
+        self.sky = {}
         self.bad_checksums = 0
         self.keep = keep
 
@@ -1021,9 +1024,41 @@ class NmeaCollector:
                 # not abort the read loop, so this is load-bearing, not
                 # defensive boilerplate.
                 try:
-                    self.records.setdefault(name, {})[tag[:2]] = sentence.parse(body)
+                    rec = sentence.parse(body)
                 except Exception:
                     pass
+                else:
+                    self.records.setdefault(name, {})[tag[:2]] = rec
+                    self._absorb_sky(tag[:2], rec)
+
+    def _absorb_sky(self, talker, rec):
+        """Merge one sentence's per-satellite rows into the running sky table.
+
+        Detected structurally -- a "sats" repeat block whose rows are
+        per-satellite detail dicts -- rather than by matching the sentence's
+        name: GSA also declares a "sats" repeat block (§2.2.4), but with a
+        single field, so Sentence.parse's own repeat-block handling stores
+        its rows as plain satellite IDs, not dicts. Only GSV's shape (four
+        fields per row) qualifies.
+
+        A GSV sky is reported across up to four sentences (<TotalNumSen>,
+        §2.2.3), each carrying at most four satellites; `records` above keeps
+        only the LAST one per talker, so reading it for a sky table would show
+        at most four satellites no matter how many are actually in view. This
+        accumulates across the group instead, starting a fresh table when
+        <SenNum> is 1 -- the group's first line -- so a table missing that
+        first line (a window boundary, a dropped byte) comes up a satellite
+        short rather than silently mixing two epochs together forever.
+        """
+        sats = rec.get("sats")
+        if not sats or not isinstance(sats[0], dict) or "satID" not in sats[0]:
+            return
+        if rec.get("senNum") == 1:
+            self.sky[talker] = {}
+        bucket = self.sky.setdefault(talker, {})
+        for row in sats:
+            if row.get("satID"):
+                bucket[row["satID"]] = row
 
     def take_lines(self):
         out, self.lines = self.lines, []
@@ -1081,6 +1116,27 @@ class Observation:
     def constellations(self):
         seen = {"GP": "GPS", "GL": "GLO", "BD": "BDS"}
         return frozenset(seen[t] for t in self.sats_in_view if t in seen)
+
+    def records(self, name):
+        """Parsed sentences of `name`, keyed by talker.
+
+        A general accessor for renderers that need more than sats_in_view/
+        constellations above (which only ever look at GSV): render_show wants
+        GGA and GSA too. Returns whatever NmeaCollector has kept -- the LAST
+        parsed sentence per talker, which is exactly right for a one-line
+        fix report like GGA/GSA and exactly wrong for GSV's multi-line
+        groups, which is why GSV has its own accumulation (see `sky` below).
+        """
+        return self._nmea.records.get(name, {})
+
+    @property
+    def sky(self):
+        """Per-talker satellite table, accumulated across a GSV group.
+
+        Copied out rather than handed back live, so a caller mutating the
+        result cannot corrupt NmeaCollector's own bookkeeping.
+        """
+        return {t: dict(sats) for t, sats in self._nmea.sky.items()}
 
 
 def listen(port, seconds):
@@ -2141,6 +2197,308 @@ def cmd_probe(port, args):
     return 0 if any(productive(results) for _, results in sweeps) else 2
 
 
+# --------------------------------------------------------------------------
+# show, monitor, bandwidth -- the operator-facing read-only views
+#
+# The trap these renderers face is the one the README already carries a scar
+# for: gpsd synthesizes NMEA for its clients from binary data, so sentences
+# the receiver never sent still appear downstream, and measuring that stream
+# while calling it "the receiver" gets the conclusion exactly backwards. A
+# CFG-PRT/CFG-RATE Get is a readback -- a real answer from the receiver, right
+# now. Sentence rates and constellations are inferred by tallying what
+# arrived (Session.current_rates/current_constellations). The fix itself is
+# neither asked for nor counted -- GGA/GSA/GSV stream unsolicited -- so it is
+# reported as observed, not read back. Every line below says which of the
+# three it is, in brackets, so a reader cannot mistake one for another.
+# --------------------------------------------------------------------------
+
+_FIX_MODE = {1: "no fix", 2: "2D", 3: "3D"}  # NMEA-0183 GSA <FixMode>, §2.2.4
+
+
+def _or_unknown(value):
+    """str(value), except a missing field (None or empty) says so.
+
+    A parsed record may be incomplete -- Sentence.parse fills a missing field
+    with "" or None rather than guessing -- and 0 is a real, present value
+    (GGA <Quality> 0 is "no fix", not "field absent"), so this must not treat
+    it as missing.
+    """
+    if value is None or value == "":
+        return "unknown"
+    return str(value)
+
+
+def _one(bucket):
+    """One (talker, record) from a talker-keyed dict.
+
+    Does not prefer a talker by name -- the design rules rule that out (see
+    "no name-based special-casing"). This receiver emits one combined-solution
+    talker per epoch in practice, so there is normally exactly one entry;
+    if more than one is present this returns whichever a plain dict yields
+    first, which is not a policy choice, just a deterministic one.
+    """
+    if not bucket:
+        return None
+    return next(iter(bucket.items()))
+
+
+def _field_describe(message, raw):
+    """Field labels for an already-parsed reply, e.g. from Session.get().
+
+    Message.describe() re-parses a payload's bytes; get() only ever hands
+    back the parsed dict, not the frame it came from, so describe() cannot be
+    reused directly. This mirrors it field-by-field over that dict instead.
+    """
+    return {f.name: f.describe(raw[f.name]) for f in message.fields}
+
+
+def render_show(session, obs):
+    """Current configuration and fix -- see the module comment above for the
+    provenance rule every line here follows.
+
+    session may be None: current_rates/current_constellations need no live
+    connection (they only ever look at obs), so the observed section renders
+    the same with or without one, exactly as Session(None) already does in
+    --selftest for the same methods. Only the two Gets below need a real
+    session; without one they render as "not read back", never silently
+    omitted.
+    """
+    out = []
+    w = out.append
+    w("gnssctl show")
+    w("-" * 60)
+
+    # current_rates/current_constellations touch no port state (see their own
+    # docstrings) -- Session(None) is what --selftest already uses to call
+    # them with no hardware, so the same construction covers session=None
+    # here without a second implementation to drift out of step.
+    inferrer = session if session is not None else Session(None)
+
+    prt = session.get(CFG_PRT) if session is not None else None
+    if prt is not None:
+        d = _field_describe(CFG_PRT, prt)
+        w("  port            %d baud, %s, %s  [readback: CFG-PRT]" % (
+            prt["baudRate"], d["mode"], ", ".join(d["protoMask"]) or "no protocols"))
+    else:
+        w("  port            unknown -- no CFG-PRT reply  [not read back]")
+
+    rate = session.get(CFG_RATE) if session is not None else None
+    if rate is not None and rate.get("interval"):
+        w("  fix interval    %d ms (%.3g Hz)  [readback: CFG-RATE]" % (
+            rate["interval"], 1000.0 / rate["interval"]))
+    else:
+        w("  fix interval    unknown -- no CFG-RATE reply  [not read back]")
+
+    rates = inferrer.current_rates(obs)
+    on = ", ".join("%s@%d" % kv for kv in sorted(rates.items())) or "none seen"
+    w("  sentence rates  %s  [observed: tallied from the wire, +-1 epoch]" % on)
+
+    cons = inferrer.current_constellations(obs)
+    if obs.constellations:
+        note = "observed: GSV talkers seen"
+    else:
+        note = "assumed: no GSV counted, so all of §2.3.4 is possible"
+    w("  constellations  %s  [%s]" % ("+".join(sorted(cons)), note))
+
+    w("")
+    gga = _one(obs.records("GGA"))
+    gsa = _one(obs.records("GSA"))
+    if gga is None and gsa is None:
+        w("  fix             none observed yet  [observed]")
+    else:
+        if gsa is not None:
+            _, rec = gsa
+            fm = rec.get("fixMode")
+            w("  fix type        %s  [observed: GSA <FixMode>]" % (
+                _FIX_MODE.get(fm, "unknown (%r)" % (fm,))))
+            w("  DOP (P/H/V)     %s / %s / %s  [observed: GSA]" % (
+                _or_unknown(rec.get("pdop")), _or_unknown(rec.get("hdop")),
+                _or_unknown(rec.get("vdop"))))
+        if gga is not None:
+            _, rec = gga
+            w("  quality         %s (GGA <Quality>)  [observed: GGA]" % (
+                _or_unknown(rec.get("quality"))))
+            w("  satellites used %s  [observed: GGA <NumSatUsed>]" % (
+                _or_unknown(rec.get("numSatUsed"))))
+            w("  HDOP            %s  [observed: GGA <HDOP>]" % (
+                _or_unknown(rec.get("hdop"))))
+            w("  position        %s%s %s%s  alt %s%s  [observed: GGA]" % (
+                _or_unknown(rec.get("lat")), rec.get("ns") or "",
+                _or_unknown(rec.get("lon")), rec.get("ew") or "",
+                _or_unknown(rec.get("alt")), rec.get("altUnit") or ""))
+    return "\n".join(out)
+
+
+def render_sky(obs):
+    """The satellites currently in view -- entirely an observation.
+
+    GSV and GSA both stream unsolicited; there is no Get to contrast them
+    with, so unlike render_show this needs no line-by-line source tag -- the
+    whole table is [observed].
+    """
+    sky = obs.sky
+    if not sky:
+        return "  sky  [observed: GSV]\n    none observed yet"
+
+    # GSA's satID is a single-field repeat block, which Sentence.parse stores
+    # as the raw field text rather than running it through IntC's decode (see
+    # the "GSA parses..." vendor-vector check, which pins ["10","13",...] with
+    # "" padding, not ints with None) -- the same text GSV's own Num-decoded
+    # satID already is, so comparing them as strings, unconverted, is correct
+    # rather than a shortcut.
+    used = set()
+    for rec in obs.records("GSA").values():
+        for sid in rec.get("sats") or []:
+            if sid:
+                used.add(sid)
+
+    out = ["  sky  [observed: GSV, cross-checked against GSA's used list]",
+           "  %-6s %-4s %5s %5s %5s  %s" % (
+               "talker", "sat", "elev", "az", "cn0", "used")]
+    for talker in sorted(sky):
+        for satid in sorted(sky[talker], key=lambda s: (len(s), s)):
+            row = sky[talker][satid]
+            out.append("  %-6s %-4s %5s %5s %5s  %s" % (
+                talker, satid, _or_unknown(row.get("elev")),
+                _or_unknown(row.get("az")), _or_unknown(row.get("cn0")),
+                "yes" if satid in used else "-"))
+    return "\n".join(out)
+
+
+def _clear_screen():
+    # print(), not sys.stdout.write(): _write_sites() (the read-only-guarantee
+    # check) flags ANY function containing a .write() call, transmit or not --
+    # see its own docstring -- and this is cosmetic, not a wire write.
+    print("\x1b[2J\x1b[H", end="")
+
+
+def cmd_show(port, args):
+    """Read-only snapshot: current configuration (readback) and fix (observed).
+
+    Session built allow_apply=False. render_show's own Gets (CFG-PRT,
+    CFG-RATE) are the query convention §3.1 defines, not the apply() path --
+    see Session's own docstring for why that is structural, not a promise.
+    """
+    session = Session(port, allow_apply=False)
+    seconds = getattr(args, "listen_seconds", None) or session.observe_seconds
+    print("Listening at %d baud for %.1fs, plus CFG-PRT and CFG-RATE Gets..."
+          % (port.baud, seconds))
+    obs = session.observe(seconds)
+    print("")
+    print(render_show(session, obs))
+    print("")
+    print(render_sky(obs))
+    return 0
+
+
+def cmd_monitor(port, args):
+    """Live view: reads, feeds one long-lived Observation, redraws on a timer
+    until Ctrl-C.
+
+    Session built allow_apply=False -- read-only by construction, matching
+    show and bandwidth. Port.read already selects on the serial fd for
+    `interval` seconds, so this loop is one port.read() call per redraw with
+    no separate wait step. Port.fd is public so a future interactive mode
+    could select() on it alongside stdin for pause/toggle keys -- an open
+    question with the human, deliberately not built here -- without
+    restructuring this loop; it would replace the single port.read() call
+    with a select() over {port.fd, stdin} and dispatch on which fired.
+    """
+    session = Session(port, allow_apply=False)
+    obs = Observation(port.baud)
+    raw = bool(getattr(args, "raw", False))
+    interval = getattr(args, "interval", None) or 1.0
+    scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS} if raw else {}
+
+    print("Watching %s at %d baud (nothing sent). Ctrl-C to stop."
+          % (port.path, port.baud))
+    try:
+        while True:
+            data = port.read(interval)
+            if data:
+                obs.absorb(data)
+                if raw:
+                    for sc in scanners.values():
+                        sc.feed(data)
+                        for fr in sc.take():
+                            detail = Session._decode(fr)
+                            print("  %-9s %02x-%02x  %s" % (
+                                fr.framing, fr.cls, fr.mid,
+                                detail if detail else hexdump(fr.payload, 24)))
+            _clear_screen()
+            print(render_show(session, obs))
+            print("")
+            print(render_sky(obs))
+    except KeyboardInterrupt:
+        print("")
+        return 0
+
+
+def _parse_rate_overrides(text):
+    """{'GGA': 1, ...} from 'GGA=1,GSV=2'.
+
+    Reuses SetSentences' own validation -- names from PCAS03's field table,
+    the 0-9 bound from OptInt -- so a typo in --sentences is refused the same
+    way it would be on the wire, rather than drifting from it. The instance
+    is never sent; only .rates is read, and cmd_bandwidth is the only caller.
+    """
+    out = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError("%r: expected NAME=RATE" % item)
+        out[name.strip().upper()] = int(value)
+    return SetSentences(out).rates
+
+
+def cmd_bandwidth(port, args):
+    """Bandwidth arithmetic for the current configuration, or a hypothetical
+    one given --rate/--baud/--sentences. Sends nothing at all: session.observe
+    is a passive listen, and that is the only thing this function does with
+    the port -- no Get, no poll, no apply. (See the design doc: "prints the
+    arithmetic ... without sending anything.")
+    """
+    session = Session(port, allow_apply=False)
+    seconds = getattr(args, "listen_seconds", None) or session.observe_seconds
+    print("Listening at %d baud for %.1fs (sending nothing)..."
+          % (port.baud, seconds))
+    obs = session.observe(seconds)
+
+    rates = session.current_rates(obs)
+    sentences = getattr(args, "sentences", None)
+    if sentences:
+        # Only what the width model can price enters the budget -- see
+        # SetSentences.projected's identical filter and its comment on ANT.
+        rates.update({k: v for k, v in _parse_rate_overrides(sentences).items()
+                      if k in STANDARD_SENTENCES})
+
+    constellations = session.current_constellations(obs)
+    baud = getattr(args, "baud", None) or port.baud
+
+    rate = getattr(args, "rate", None)
+    if rate:
+        hz = float(rate)
+        hz_note = "given by --rate"
+    else:
+        # No CFG-RATE Get: this command sends nothing at all, so the real
+        # rate cannot be read back. Assuming the fastest documented rate is
+        # the same asymmetry Session.current_hz() applies when ITS Get fails
+        # -- over-stating hz costs a refusal --force can override;
+        # under-stating waves through exactly the overload the guard exists
+        # to catch.
+        hz = 1000.0 / min(NAV_INTERVALS)
+        hz_note = "assumed: fastest documented rate (%.3g Hz) -- no Get sent" % hz
+
+    bud = budget(rates, baud, hz, obs.sats_in_view, constellations)
+    print("")
+    print("  fix rate                %s" % hz_note)
+    print(bud.render())
+    return 0 if bud.ok else 1
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -2199,6 +2557,73 @@ def _write_sites():
                     and isinstance(inner.func, ast.Attribute)
                     and inner.func.attr == "write"):
                 out.add(node.name)
+    return out
+
+
+def _uses_apply():
+    """Names of every function in this file that can call something's apply(.
+
+    Same AST-walk approach as _write_sites, turned on Session.apply instead
+    of write(): used to confirm cmd_show/cmd_monitor/cmd_bandwidth -- all
+    three declared read-only in the design -- never reach it, the one path
+    that can put a Change on the wire.
+    """
+    import ast  # only used here, and this is the only caller
+    with open(__file__) as fh:
+        tree = ast.parse(fh.read())
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "apply"):
+                out.add(node.name)
+    return out
+
+
+def _reaches(func_name, attrs):
+    """True if the top-level function `func_name` calls obj.<attr>(...) for
+    any attr in `attrs`.
+
+    AST-based rather than a source-text search over inspect.getsource(): this
+    file's own docstrings explain, in prose, exactly which of these
+    cmd_bandwidth does NOT call (to justify why it sends nothing) -- a
+    substring search would match that explanation and pass whether or not the
+    code agrees with it.
+    """
+    import ast  # only used here, and this is the only caller
+    with open(__file__) as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            return any(isinstance(inner, ast.Call)
+                      and isinstance(inner.func, ast.Attribute)
+                      and inner.func.attr in attrs
+                      for inner in ast.walk(node))
+    return False
+
+
+def _session_calls(func_name):
+    """The keyword args of every Session(...) call inside the top-level
+    function `func_name`, as {arg: constant value} dicts.
+
+    AST-based for the same reason _reaches is: read-only-ness has to be
+    checked from the call itself, not from a docstring's prose about it.
+    """
+    import ast  # only used here, and this is the only caller
+    with open(__file__) as fh:
+        tree = ast.parse(fh.read())
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Name)
+                        and inner.func.id == "Session"):
+                    out.append({kw.arg: getattr(kw.value, "value", None)
+                               for kw in inner.keywords})
     return out
 
 
@@ -2873,6 +3298,78 @@ def selftest():
     # it is what makes cmd_probe try the next framing instead of stopping.
     check("an all-NAK sweep is not productive -- that is what triggers the fallback",
           lambda: not productive([ProbeResult(p, "nak") for p in _BIN_POLLS]))
+
+    print("")
+    print("show and monitor rendering:")
+    _OBS = _observe(b"$GPGSV,1,1,07,02,49,123,43,0*5A\r\n"
+                    b"$GNGGA,071556.000,3149.29103,N,11706.92916,E,1,21,0.7,"
+                    b"75.7,M,-5.0,M,,*69\r\n"
+                    b"$GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1*35\r\n")
+    check("show reports the fix quality from GGA",
+          lambda: "3D" in render_show(None, _OBS) or "fix" in render_show(None, _OBS))
+    check("show reports satellites used and HDOP",
+          lambda: "21" in render_show(None, _OBS) and "0.7" in render_show(None, _OBS))
+    check("show states when a value was observed rather than read back",
+          lambda: "observed" in render_show(None, _OBS))
+    check("the sky table lists a satellite with its elevation and C/N0",
+          lambda: all(t in render_sky(_OBS) for t in ("02", "49", "43")))
+    check("an empty observation renders without raising",
+          lambda: isinstance(render_show(None, Observation(9600)), str))
+
+    check("render_sky renders without raising when nothing has been observed",
+          lambda: isinstance(render_sky(Observation(9600)), str))
+    # NmeaCollector.records keeps only the LAST parsed sentence per talker,
+    # which for a multi-line GSV group (§2.2.3) is at most four satellites --
+    # one line's worth. A real sky of more than four needs several lines, so
+    # a sky table built from records["GSV"] directly would show at most four
+    # satellites no matter how many are in view. obs.sky exists precisely to
+    # not do that; this pins the accumulation across _EPOCH's three-line group.
+    check("a satellite reported across multiple GSV lines is not lost to the "
+          "last line's overwrite",
+          lambda: set(_observe(_EPOCH).sky.get("GP", {})) == {"02", "05", "06"})
+
+    _MIXED_SKY = _observe(
+        nmea_wrap("GPGSV,1,1,08,10,49,123,43,02,30,050,22,0")
+        + nmea_wrap("GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1"))
+    check("the sky table's used column reflects GSA, not just whichever "
+          "satellite GSV happens to list",
+          lambda: (lambda lines:
+                   any("GP" in l and "10" in l and "yes" in l for l in lines)
+                   and any("GP" in l and "02" in l and "yes" not in l
+                          for l in lines))(render_sky(_MIXED_SKY).splitlines()))
+
+    # The session=None checks above cover the observed section; this covers
+    # the other half -- that a session which CAN answer is labelled
+    # "readback", distinctly from both "observed" and an unanswered Get.
+    _PRT_REPLY = CASIC.encode(*CFG_PRT.key, CFG_PRT.build(
+        portID=0, protoMask=0x33, mode=0x08C0, baudRate=115200))
+    _SHOW_WITH_SESSION = render_show(
+        Session(_FakePort(115200, _PRT_REPLY), allow_apply=False,
+               timeout=_TEST_WINDOW), _OBS)
+    check("with a session, a CFG-PRT readback, an unanswered CFG-RATE Get and "
+          "the observed sentence rates each carry a distinct label",
+          lambda: "readback: CFG-PRT" in _SHOW_WITH_SESSION
+                  and "not read back" in _SHOW_WITH_SESSION
+                  and "observed: tallied" in _SHOW_WITH_SESSION)
+
+    check("a --sentences override parses NAME=RATE pairs via SetSentences' "
+          "own validation",
+          lambda: _parse_rate_overrides("GGA=1,GSV=0") == {"GGA": 1, "GSV": 0})
+    check("a --sentences override rejects what SetSentences itself would reject",
+          lambda: _raises(lambda: _parse_rate_overrides("GSV=11"), ValueError))
+
+    check("show, monitor and bandwidth never call .apply(",
+          lambda: not ({"cmd_show", "cmd_monitor", "cmd_bandwidth"}
+                       & _uses_apply()))
+    check("show, monitor and bandwidth build their Session read-only",
+          lambda: all(calls and all(c.get("allow_apply", False) is False
+                                    for c in calls)
+                      for calls in (_session_calls(n) for n in
+                                   ("cmd_show", "cmd_monitor", "cmd_bandwidth"))))
+    check("bandwidth sends nothing -- no Get, current_hz, poll or apply "
+          "reachable from its own body",
+          lambda: not _reaches("cmd_bandwidth",
+                               {"get", "current_hz", "poll", "apply"}))
 
     print("")
     if _FAILS:
