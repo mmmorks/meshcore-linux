@@ -9,9 +9,15 @@
 Protocol source: Quectel L76K GNSS Protocol Specification V1.1. Section marks
 (§) throughout this file refer to it.
 """
+import errno
 import math
+import os
+import select
 import struct
+import subprocess
 import sys
+import termios
+import time
 
 _FAILS = []
 
@@ -891,6 +897,318 @@ def budget(rates, baud, hz, sats_now, constellations):
     return Budget(rates, baud, hz, now, ceiling)
 
 
+DEFAULT_DEVICE = "/dev/ttyAMA0"
+GPSD_DEFAULTS = "/etc/default/gpsd"
+
+# 115200 first: that is where a configured node sits. The receiver returns to
+# 9600 whenever it loses power and there is no way to ask which it is on.
+BAUD_CANDIDATES = (115200, 9600)
+
+BAUD_CONST = {4800: termios.B4800, 9600: termios.B9600, 19200: termios.B19200,
+              38400: termios.B38400, 57600: termios.B57600,
+              115200: termios.B115200}
+
+
+class NmeaCollector:
+    """Tallies and parses NMEA sentences seen on the wire."""
+
+    def __init__(self, keep=40):
+        self.buf = bytearray()
+        self.counts = {}
+        self.lines = []
+        self.records = {}
+        self.bad_checksums = 0
+        self.keep = keep
+
+    def feed(self, data):
+        self.buf.extend(data)
+        while True:
+            i = self.buf.find(b"\n")
+            if i < 0:
+                if len(self.buf) > 1024:
+                    del self.buf[:-1024]
+                return
+            raw = bytes(self.buf[:i])
+            del self.buf[:i + 1]
+            # Resync to the last '$' rather than assuming the sentence starts at
+            # the head of the buffer. Binary frames and NMEA share this wire and
+            # binary payloads contain no newline, so whatever binary arrived
+            # before a sentence is still sitting in front of it. rfind, not
+            # find: a sentence carries one '$', but preceding binary may contain
+            # 0x24 bytes.
+            start = raw.rfind(b"$")
+            if start < 0:
+                continue
+            text = raw[start:].decode("ascii", "replace").strip()
+            body, ok = nmea_split(text)
+            if body is None:
+                continue
+            if not ok:
+                self.bad_checksums += 1
+                continue
+            tag = body.split(",")[0]
+            self.counts[tag] = self.counts.get(tag, 0) + 1
+            if len(self.lines) < self.keep:
+                self.lines.append(text)
+            name = tag[2:] if len(tag) == 5 and not tag.startswith("P") else tag
+            sentence = STANDARD_SENTENCES.get(name)
+            if sentence is not None:
+                # Live serial data contains truncated sentences routinely --
+                # a partial read, line noise, a receiver mid-reconfiguration --
+                # and Sentence.parse() now raises on one rather than guessing
+                # (see GSV's repeat-block check). One malformed sentence must
+                # not abort the read loop, so this is load-bearing, not
+                # defensive boilerplate.
+                try:
+                    self.records.setdefault(name, {})[tag[:2]] = sentence.parse(body)
+                except Exception:
+                    pass
+
+    def take_lines(self):
+        out, self.lines = self.lines, []
+        return out
+
+
+class Observation:
+    def __init__(self, baud):
+        self.baud = baud
+        self.sync_hits = {}
+        self.valid_frames = {}
+        self.frame_ids = {}
+        self.nmea_counts = {}
+        self.nmea_sample = []
+        self.raw_bytes = 0
+        self.raw_head = b""
+        self._scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS}
+        self._nmea = NmeaCollector()
+
+    def absorb(self, data):
+        self.raw_bytes += len(data)
+        if len(self.raw_head) < 512:
+            self.raw_head += data[:512 - len(self.raw_head)]
+        self._nmea.feed(data)
+        for sc in self._scanners.values():
+            sc.feed(data)
+        self.finish()
+        return self
+
+    def finish(self):
+        for name, sc in self._scanners.items():
+            self.sync_hits[name] = sc.sync_hits
+            ids = self.frame_ids.setdefault(name, {})
+            for fr in sc.take():
+                self.valid_frames[name] = self.valid_frames.get(name, 0) + 1
+                k = "%02x-%02x" % (fr.cls, fr.mid)
+                ids[k] = ids.get(k, 0) + 1
+        self.nmea_counts = dict(self._nmea.counts)
+        self.nmea_sample = self._nmea.lines[:10]
+
+    @property
+    def recognised(self):
+        return bool(self.nmea_counts) or any(self.valid_frames.values())
+
+    @property
+    def sats_in_view(self):
+        """Satellites per GSV talker -- the 'sky now' input to the budget."""
+        out = {}
+        for talker, rec in (self._nmea.records.get("GSV") or {}).items():
+            if rec.get("totalNumSat") is not None:
+                out[talker] = rec["totalNumSat"]
+        return out
+
+    @property
+    def constellations(self):
+        seen = {"GP": "GPS", "GL": "GLO", "BD": "BDS"}
+        return frozenset(seen[t] for t in self.sats_in_view if t in seen)
+
+
+def listen(port, seconds):
+    """Read the device without transmitting anything."""
+    obs = Observation(port.baud)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        data = port.read(min(0.5, max(0.05, deadline - time.monotonic())))
+        if data:
+            obs.absorb(data)
+    return obs
+
+
+def _parse_gpsd_defaults(text):
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("DEVICES="):
+            continue
+        val = line.split("=", 1)[1].strip().strip('"').strip("'").split()
+        if val and val[0].startswith("/dev/"):
+            return val[0]
+    return None
+
+
+def device_from_gpsd_defaults():
+    try:
+        with open(GPSD_DEFAULTS) as fh:
+            return _parse_gpsd_defaults(fh.read())
+    except OSError:
+        return None
+
+
+class Port:
+    """Raw 8N1 access to the serial device at a chosen speed."""
+
+    def __init__(self, path, baud):
+        self.path = path
+        self.baud = baud
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            self.saved = termios.tcgetattr(self.fd)
+            self._configure(baud)
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def _configure(self, baud):
+        speed = BAUD_CONST[baud]
+        iflag, oflag, cflag, lflag, _, _, cc = termios.tcgetattr(self.fd)
+        iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK |
+                   termios.ISTRIP | termios.INLCR | termios.IGNCR |
+                   termios.ICRNL | termios.IXON)
+        oflag &= ~termios.OPOST
+        lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON |
+                   termios.ISIG | termios.IEXTEN)
+        cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)
+        cflag |= termios.CS8 | termios.CLOCAL | termios.CREAD
+        cc = list(cc)
+        cc[termios.VMIN] = 0
+        cc[termios.VTIME] = 0
+        termios.tcsetattr(self.fd, termios.TCSANOW,
+                          [iflag, oflag, cflag, lflag, speed, speed, cc])
+        termios.tcflush(self.fd, termios.TCIOFLUSH)
+
+    def set_baud(self, baud):
+        """Re-clock the port in place, so 'set baud' can confirm at the new speed."""
+        self._configure(baud)
+        self.baud = baud
+
+    def flush_input(self):
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+
+    def read(self, timeout):
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if not r:
+            return b""
+        try:
+            return os.read(self.fd, 4096)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return b""
+            raise
+
+    def write(self, data):
+        os.write(self.fd, data)
+        termios.tcdrain(self.fd)
+
+    def close(self):
+        try:
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+        except Exception:
+            pass
+        os.close(self.fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def systemctl(*args):
+    try:
+        return subprocess.run(("systemctl",) + args,
+                              capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def unit_active(unit):
+    r = systemctl("is-active", "--quiet", unit)
+    return bool(r) and r.returncode == 0
+
+
+class ServiceGuard:
+    """Stops gpsd and restores whatever state it found.
+
+    Restores the PRIOR state, not "running": if gpsd was already stopped, it
+    stays stopped. Both gpsd.socket and gpsd.service are stopped: gpsd is
+    socket-activated, and meshcored reconnects to it with backoff, so
+    stopping the service alone gets it respawned mid-operation and it takes
+    the port back.
+    """
+
+    UNITS = ("gpsd.socket", "gpsd.service")
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.was_active = {}
+        self._armed = False
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        for unit in self.UNITS:
+            self.was_active[unit] = unit_active(unit)
+        stopping = [u for u in self.UNITS if self.was_active.get(u)]
+        if stopping:
+            print("Stopping %s." % ", ".join(stopping))
+            print("The GNSS clock source drops until this finishes; chrony "
+                  "falls back to the pool\nand takes a couple of minutes to "
+                  "return to stratum 1 afterwards.\n")
+            for unit in self.UNITS:
+                if self.was_active.get(unit):
+                    systemctl("stop", unit)
+            time.sleep(1.0)
+        self._armed = True
+        return self
+
+    def restore(self):
+        if not self._armed:
+            return
+        self._armed = False
+        started = []
+        for unit in reversed(self.UNITS):
+            if self.was_active.get(unit):
+                systemctl("start", unit)
+                started.append(unit)
+        if started:
+            print("\nRestarted %s." % ", ".join(started))
+
+    def __exit__(self, *exc):
+        self.restore()
+        return False
+
+
+def port_holder(path):
+    """Who still has the device open, if anyone. Best effort."""
+    try:
+        r = subprocess.run(("fuser", path), capture_output=True, text=True,
+                           timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    pids = r.stdout.split() + r.stderr.replace(path + ":", "").split()
+    names = []
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % pid) as fh:
+                names.append(fh.read().strip())
+        except OSError:
+            pass
+    return names or None
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -923,6 +1241,18 @@ def _scan(framing, *chunks):
     for chunk in chunks:
         sc.feed(chunk)
     return sc.take()
+
+
+def _collect(data, keep=40):
+    nc = NmeaCollector(keep=keep)
+    nc.feed(data)
+    return nc
+
+
+def _observe(data):
+    obs = Observation(115200)
+    obs.absorb(data)
+    return obs
 
 
 def selftest():
@@ -1195,6 +1525,39 @@ def selftest():
           lambda: GSV.repeat({}, ("GP", "GL", "BD")) == 0)
     check("capacity refuses a nonsensical baud rather than dividing by zero",
           lambda: _raises(lambda: capacity(0)))
+
+    print("")
+    print("wire observation:")
+    check("sentences are counted by talker and type",
+          lambda: (lambda c: c.counts.get("GPGSV") == 2 and c.counts.get("GNRMC") == 1)(
+              _collect(b"$GPGSV,1,1,04,02,49,123,43,0*59\r\n"
+                       b"$GPGSV,1,1,04,05,60,005,43,0*50\r\n"
+                       b"$GNRMC,071556.000,A,,,,,,,250420,,,N,V*3F\r\n")))
+    check("a sentence behind leftover binary bytes still parses",
+          lambda: _collect(CASIC.encode(0x06, 0x04, b"\x24\x01\x02\x03")
+                           + b"$GNZDA,053712.000,21,10,2021,00,00*49\r\n"
+                           ).counts.get("GNZDA") == 1)
+    check("a bad checksum is counted separately, not silently accepted",
+          lambda: (lambda c: c.counts.get("GNZDA") is None and c.bad_checksums == 1)(
+              _collect(b"$GNZDA,053712.000,21,10,2021,00,00*4A\r\n")))
+    check("the line buffer honours its cap without capping the counts",
+          lambda: (lambda c: sum(c.counts.values()) == 3 and len(c.lines) == 2)(
+              _collect(b"$GPGGA,1*4B\r\n$GPRMC,2*55\r\n$GPGSV,3*4A\r\n", keep=2)))
+    check("satellites in view are tallied per talker from GSV",
+          lambda: _observe(b"$GPGSV,1,1,07,02,49,123,43,0*5A\r\n"
+                           b"$BDGSV,1,1,05,01,43,135,36,0*45\r\n"
+                           ).sats_in_view == {"GP": 7, "BD": 5})
+    check("the constellation set is inferred from the talkers seen",
+          lambda: _observe(b"$GPGSV,1,1,07,02,49,123,43,0*5A\r\n"
+                           b"$BDGSV,1,1,05,01,43,135,36,0*45\r\n"
+                           ).constellations == frozenset(("GPS", "BDS")))
+    check("the gpsd defaults parser takes the first device",
+          lambda: _parse_gpsd_defaults('DEVICES="/dev/ttyAMA0 /dev/ttyS0"\n')
+                  == "/dev/ttyAMA0")
+    check("the gpsd defaults parser ignores non-device values",
+          lambda: _parse_gpsd_defaults('DEVICES=""\nGPSD_OPTIONS="-n"\n') is None)
+    check("every baud candidate has a termios constant",
+          lambda: all(b in BAUD_CONST for b in BAUD_CANDIDATES))
 
     print("")
     if _FAILS:
