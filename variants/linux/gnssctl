@@ -9,6 +9,7 @@
 Protocol source: Quectel L76K GNSS Protocol Specification V1.1. Section marks
 (§) throughout this file refer to it.
 """
+import atexit
 import errno
 import json
 import math
@@ -2207,12 +2208,24 @@ def cmd_probe(port, args):
     guarantee. That is the whole reason probe can be trusted on a live node:
     see Session's docstring and the --selftest check that walks this file's
     own syntax tree to confirm nothing outside {write, poll, apply, _exchange,
-    _probe_binary} can reach the wire.
+    _probe_binary} can reach the wire. The sweep itself is _probe_view,
+    shared with the REPL's 'probe' command -- see the module comment above
+    _repl_set for why the Session construction stays HERE, as this
+    function's own first statement, rather than moving into the shared body.
     """
     session = Session(port, allow_apply=False)
+    return _probe_view(session, args.listen_seconds, args.json)
+
+
+def _probe_view(session, seconds, json_path):
+    """The sweep-and-report body shared by cmd_probe (fresh read-only
+    Session per one-shot run) and _repl_probe (the REPL's one shared
+    session). Neither caller does anything to the port beyond handing in a
+    Session; this is the entire probe.
+    """
     print("Listening at %d baud for %.0fs (sending nothing)..."
-          % (port.baud, args.listen_seconds))
-    obs = session.observe(args.listen_seconds)
+          % (session.port.baud, seconds))
+    obs = session.observe(seconds)
 
     # PROBE_ORDER puts CASIC first unconditionally -- not because phase 1
     # suggests it, but because it is the documented finding this tool exists
@@ -2231,12 +2244,12 @@ def cmd_probe(port, args):
             print("  every binary poll refused; trying the next framing")
 
     print("")
-    print(render_probe(obs, sweeps, port.path))
+    print(render_probe(obs, sweeps, session.port.path))
 
-    if args.json:
-        with open(args.json, "w") as fh:
-            json.dump(probe_json(obs, sweeps, port.path), fh, indent=2)
-        print("JSON written to %s" % args.json)
+    if json_path:
+        with open(json_path, "w") as fh:
+            json.dump(probe_json(obs, sweeps, session.port.path), fh, indent=2)
+        print("JSON written to %s" % json_path)
 
     return 0 if any(productive(results) for _, results in sweeps) else 2
 
@@ -2460,17 +2473,25 @@ def cmd_show(port, args):
     Session built allow_apply=False. render_show's own Gets (CFG-PRT,
     CFG-RATE) are the query convention §3.1 defines, not the apply() path --
     see Session's own docstring for why that is structural, not a promise.
+    The report itself is _show_view, shared with the REPL's 'show' command.
     """
     session = Session(port, allow_apply=False)
     seconds = getattr(args, "listen_seconds", None) or session.observe_seconds
+    _show_view(session, seconds)
+    return 0
+
+
+def _show_view(session, seconds):
+    """The report body shared by cmd_show (fresh read-only Session per
+    one-shot run) and _repl_show (the REPL's one shared session).
+    """
     print("Listening at %d baud for %.1fs, plus CFG-PRT and CFG-RATE Gets..."
-          % (port.baud, seconds))
+          % (session.port.baud, seconds))
     obs = session.observe(seconds)
     print("")
     print(render_show(session, obs))
     print("")
     print(render_sky(obs))
-    return 0
 
 
 def cmd_monitor(port, args):
@@ -2478,10 +2499,28 @@ def cmd_monitor(port, args):
     Observation purely by watching, redrawing on a timer until Ctrl-C.
 
     Session built allow_apply=False -- read-only by construction, matching
-    show and bandwidth. The one-time readback above is the ONLY thing this
-    function ever transmits; every redraw inside the loop calls
-    render_show(None, obs, readback=...) rather than handing the loop a live
-    session, so a redraw can never re-send a Get.
+    show and bandwidth. The loop itself is _monitor_loop, shared with the
+    REPL's 'monitor' command; see its docstring for why the readback happens
+    once, before the loop, rather than on every redraw.
+    """
+    # timeout overridable the same way listen_seconds is elsewhere in this
+    # file -- not a production knob, but without it --selftest could only
+    # drive this loop's real code at the production 1.5s-per-Get pace.
+    session = Session(port, allow_apply=False,
+                      timeout=getattr(args, "timeout", None) or PROBE_TIMEOUT)
+    return _monitor_loop(session, bool(getattr(args, "raw", False)),
+                         getattr(args, "interval", None) or 1.0)
+
+
+def _monitor_loop(session, raw, interval):
+    """The readback-once/redraw-loop body shared by cmd_monitor (fresh
+    read-only Session per one-shot run) and _repl_monitor (the REPL's one
+    shared session).
+
+    Reads CFG-PRT/CFG-RATE ONCE; the redraw loop below is the ONLY other
+    thing this function ever transmits, and it doesn't transmit at all --
+    every redraw calls render_show(None, obs, readback=...) rather than
+    handing the loop a live session, so a redraw can never re-send a Get.
 
     That distinction is not cosmetic. An earlier version called
     render_show(session, obs) from inside the loop. render_show does its own
@@ -2505,24 +2544,17 @@ def cmd_monitor(port, args):
     it would replace the single port.read() call with a select() over
     {port.fd, stdin} and dispatch on which fired.
     """
-    # timeout overridable the same way listen_seconds is elsewhere in this
-    # file -- not a production knob, but without it --selftest could only
-    # drive this loop's real code at the production 1.5s-per-Get pace.
-    session = Session(port, allow_apply=False,
-                      timeout=getattr(args, "timeout", None) or PROBE_TIMEOUT)
     print("Reading CFG-PRT and CFG-RATE once...")
     readback = (session.get(CFG_PRT), session.get(CFG_RATE))
 
-    obs = Observation(port.baud)
-    raw = bool(getattr(args, "raw", False))
-    interval = getattr(args, "interval", None) or 1.0
+    obs = Observation(session.port.baud)
     scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS} if raw else {}
 
     print("Watching %s at %d baud -- nothing else is sent. Ctrl-C to stop."
-          % (port.path, port.baud))
+          % (session.port.path, session.port.baud))
     try:
         while True:
-            data = port.read(interval)
+            data = session.port.read(interval)
             # Decoded fresh each iteration, not accumulated: these are
             # printed AFTER the clear and the panels below, appended under
             # the sky table, so they are visible for this redraw's `interval`
@@ -2554,7 +2586,7 @@ def cmd_monitor(port, args):
                     print("    none")
     except KeyboardInterrupt:
         print("")
-        return 0
+    return 0
 
 
 def _parse_rate_overrides(text):
@@ -2582,16 +2614,27 @@ def cmd_bandwidth(port, args):
     one given --rate/--baud/--sentences. Sends nothing at all: session.observe
     is a passive listen, and that is the only thing this function does with
     the port -- no Get, no poll, no apply. (See the design doc: "prints the
-    arithmetic ... without sending anything.")
+    arithmetic ... without sending anything.") The arithmetic itself is
+    _bandwidth_view, shared with the REPL's 'bandwidth' command.
     """
     session = Session(port, allow_apply=False)
     seconds = getattr(args, "listen_seconds", None) or session.observe_seconds
+    return _bandwidth_view(session, seconds, rate=getattr(args, "rate", None),
+                           baud=getattr(args, "baud", None),
+                           sentences=getattr(args, "sentences", None))
+
+
+def _bandwidth_view(session, seconds, rate=None, baud=None, sentences=None):
+    """The arithmetic shared by cmd_bandwidth (fresh read-only Session per
+    one-shot run) and _repl_bandwidth (the REPL's one shared session). Sends
+    nothing, in either case: session.observe is a passive listen, and that
+    is the only thing this does with the port.
+    """
     print("Listening at %d baud for %.1fs (sending nothing)..."
-          % (port.baud, seconds))
+          % (session.port.baud, seconds))
     obs = session.observe(seconds)
 
     rates = session.current_rates(obs)
-    sentences = getattr(args, "sentences", None)
     if sentences:
         # Only what the width model can price enters the budget -- see
         # SetSentences.projected's identical filter and its comment on ANT.
@@ -2599,9 +2642,8 @@ def cmd_bandwidth(port, args):
                       if k in STANDARD_SENTENCES})
 
     constellations = session.current_constellations(obs)
-    baud = getattr(args, "baud", None) or port.baud
+    baud = baud or session.port.baud
 
-    rate = getattr(args, "rate", None)
     if rate:
         hz = float(rate)
         hz_note = "given by --rate"
@@ -2633,18 +2675,28 @@ def cmd_bandwidth(port, args):
 # the port, runs ServiceGuard, builds this one Session, and only then calls
 # repl(session, args).
 #
-# Every _repl_* handler below takes that same `session` and does nothing
-# else with the port -- no second Session, read-only or otherwise. That is
-# NOT the same function as cmd_show/cmd_monitor/cmd_probe/cmd_bandwidth
-# above: those are pinned by --selftest's own AST checks (_session_calls) to
-# build their OWN read-only Session(port, allow_apply=False) as their first
-# line, for the one-shot CLI path where each invocation is a fresh process.
-# Making them take a session instead would break that pin for no reason --
-# the one-shot path is correct to open read-only every time it runs, once.
-# So the logic below duplicates cmd_show/cmd_monitor/cmd_probe/cmd_bandwidth
-# rather than sharing their bodies: the alternative is extracting Session
-# construction out of functions whose read-only-ness is asserted by it being
-# there, which trades a few duplicated lines for a weakened guarantee.
+# show/monitor/probe/bandwidth each have TWO entry points now: cmd_* for the
+# one-shot CLI path (a fresh process, a fresh Session per invocation) and
+# _repl_* for this REPL (one Session shared for the whole run). Both call
+# the SAME shared view function -- _show_view, _monitor_loop, _probe_view,
+# _bandwidth_view, defined next to their cmd_* caller above -- with a
+# session already in hand. That sharing is what "the REPL dispatches
+# read-only commands through the one session it was given, not a second
+# one" actually looks like in code: the alternative, kept out on purpose,
+# was two independent copies of each loop that a future fix (like Task 11's
+# monitor-transmits-on-every-redraw bug) would have to be found and applied
+# twice.
+#
+# cmd_show/cmd_monitor/cmd_bandwidth keep their OWN
+# Session(port, allow_apply=False, ...) construction as their literal first
+# statement -- NOT delegated into the shared view -- because --selftest's
+# _session_calls(name) asserts read-only-ness by finding that exact call
+# inside each of THEIR OWN function bodies; moving it into a function they
+# merely call would make that assertion find nothing rather than something
+# wrong. Every _repl_* handler below, conversely, contains NO Session(...)
+# call anywhere in its own body -- also asserted by _session_calls -- because
+# it is handed the REPL's one session directly and passes it straight into
+# the same shared view its cmd_* counterpart uses.
 # --------------------------------------------------------------------------
 
 
@@ -2762,23 +2814,18 @@ def _repl_restart(session, rest):
 
 
 def _repl_show(session, rest):
-    """Same report as cmd_show, against the session repl() was handed."""
+    """'show' -> _show_view, the same body cmd_show uses, against the
+    session repl() was handed.
+    """
     if rest:
         raise ValueError("show takes no arguments")
-    seconds = session.observe_seconds
-    print("Listening at %d baud for %.1fs, plus CFG-PRT and CFG-RATE Gets..."
-          % (session.port.baud, seconds))
-    obs = session.observe(seconds)
-    print("")
-    print(render_show(session, obs))
-    print("")
-    print(render_sky(obs))
+    _show_view(session, session.observe_seconds)
 
 
 def _repl_monitor(session, rest):
-    """Same loop as cmd_monitor (see its docstring for why the CFG-PRT/
-    CFG-RATE readback happens ONCE, before the loop, and every redraw passes
-    readback= instead of a live session), against the session repl() was
+    """'monitor [--raw] [--interval N]' -> _monitor_loop, the same body
+    cmd_monitor uses (see its docstring for why the CFG-PRT/CFG-RATE
+    readback happens ONCE, before the loop), against the session repl() was
     handed.
     """
     positional, flags = _parse_flags(rest.split(), {"raw": False, "interval": True})
@@ -2787,108 +2834,32 @@ def _repl_monitor(session, rest):
                          "--raw / --interval")
     raw = bool(flags.get("raw", False))
     interval = float(flags["interval"]) if "interval" in flags else 1.0
-
-    print("Reading CFG-PRT and CFG-RATE once...")
-    readback = (session.get(CFG_PRT), session.get(CFG_RATE))
-
-    obs = Observation(session.port.baud)
-    scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS} if raw else {}
-
-    print("Watching %s at %d baud -- nothing else is sent. Ctrl-C to stop."
-          % (session.port.path, session.port.baud))
-    try:
-        while True:
-            data = session.port.read(interval)
-            raw_lines = []
-            if data:
-                obs.absorb(data)
-                if raw:
-                    for sc in scanners.values():
-                        sc.feed(data)
-                        for fr in sc.take():
-                            detail = Session._decode(fr)
-                            raw_lines.append("  %-9s %02x-%02x  %s" % (
-                                fr.framing, fr.cls, fr.mid,
-                                detail if detail else hexdump(fr.payload, 24)))
-            _clear_screen()
-            print(render_show(None, obs, readback=readback))
-            print("")
-            print(render_sky(obs))
-            if raw:
-                print("")
-                print("  raw frames this cycle:")
-                for line in raw_lines:
-                    print(line)
-                if not raw_lines:
-                    print("    none")
-    except KeyboardInterrupt:
-        print("")
+    _monitor_loop(session, raw, interval)
 
 
 def _repl_probe(session, rest):
-    """Same report as cmd_probe, against the session repl() was handed."""
+    """'probe [--json PATH]' -> _probe_view, the same body cmd_probe uses,
+    against the session repl() was handed.
+    """
     positional, flags = _parse_flags(rest.split(), {"json": True})
     if positional:
         raise ValueError("probe takes no positional arguments -- only --json")
-    seconds = session.observe_seconds
-    print("Listening at %d baud for %.0fs (sending nothing)..."
-          % (session.port.baud, seconds))
-    obs = session.observe(seconds)
-
-    sweeps = []
-    for framing in PROBE_ORDER:
-        print("Sweeping %s framing..." % framing.name)
-        results = sweep(session, framing)
-        sweeps.append((framing, results))
-        if productive(results):
-            break
-        if framing is not PROBE_ORDER[-1]:
-            print("  every binary poll refused; trying the next framing")
-
-    print("")
-    print(render_probe(obs, sweeps, session.port.path))
-
-    json_path = flags.get("json")
-    if json_path:
-        with open(json_path, "w") as fh:
-            json.dump(probe_json(obs, sweeps, session.port.path), fh, indent=2)
-        print("JSON written to %s" % json_path)
+    _probe_view(session, session.observe_seconds, flags.get("json"))
 
 
 def _repl_bandwidth(session, rest):
-    """Same arithmetic as cmd_bandwidth, against the session repl() was
-    handed. Sends nothing, same as cmd_bandwidth: no Get, no poll, no apply.
+    """'bandwidth [--rate N] [--baud N] [--sentences ...]' -> _bandwidth_view,
+    the same body cmd_bandwidth uses, against the session repl() was handed.
+    Sends nothing, same as cmd_bandwidth: no Get, no poll, no apply.
     """
     positional, flags = _parse_flags(
         rest.split(), {"rate": True, "baud": True, "sentences": True})
     if positional:
         raise ValueError("bandwidth takes no positional arguments -- only "
                          "--rate / --baud / --sentences")
-    seconds = session.observe_seconds
-    print("Listening at %d baud for %.1fs (sending nothing)..."
-          % (session.port.baud, seconds))
-    obs = session.observe(seconds)
-
-    rates = session.current_rates(obs)
-    if "sentences" in flags:
-        rates.update({k: v for k, v in
-                      _parse_rate_overrides(flags["sentences"]).items()
-                      if k in STANDARD_SENTENCES})
-
-    constellations = session.current_constellations(obs)
-    baud = int(flags["baud"]) if "baud" in flags else session.port.baud
-
-    if "rate" in flags:
-        hz = float(flags["rate"])
-        hz_note = "given by --rate"
-    else:
-        hz = 1000.0 / min(NAV_INTERVALS)
-        hz_note = "assumed: fastest documented rate (%.3g Hz) -- no Get sent" % hz
-
-    bud = budget(rates, baud, hz, obs.sats_in_view, constellations)
-    print("")
-    print("  fix rate                %s" % hz_note)
-    print(bud.render())
+    baud = int(flags["baud"]) if "baud" in flags else None
+    _bandwidth_view(session, session.observe_seconds, rate=flags.get("rate"),
+                    baud=baud, sentences=flags.get("sentences"))
 
 
 # Keyed by the first word of every COMMANDS entry except "help"/"quit" -- see
@@ -2933,7 +2904,10 @@ def repl(session, args):
     stripped of the readline module still runs one-shot commands -- the
     module-level code never imports it, only this function does, and this
     function is only reached for interactive use), persistent history in
-    HISTFILE, Tab completion via `completer`, Ctrl-D to exit.
+    HISTFILE, Tab completion via `completer`, Ctrl-D to exit, and history
+    saved via atexit -- not only on a clean loop exit -- so an exception
+    that escapes the loop still leaves the session's history on disk, the
+    same guarantee meshcorectl.interactive() gives its own history file.
 
     `args` is accepted for signature parity with the CLI entry point this
     file will grow (a parse_args() Namespace); nothing here reads it yet.
@@ -2943,6 +2917,7 @@ def repl(session, args):
         readline.read_history_file(HISTFILE)
     except OSError:
         pass
+    atexit.register(lambda: _save_history(readline))
     readline.set_history_length(1000)
     readline.set_completer_delims("")
     readline.set_completer(completer)
@@ -2985,11 +2960,14 @@ def repl(session, args):
         except OSError as exc:
             print("gnssctl: %s: %s" % (type(exc).__name__, exc))
 
+    return 0
+
+
+def _save_history(readline):
     try:
         readline.write_history_file(HISTFILE)
     except OSError:
         pass
-    return 0
 
 
 def check(name, fn):
@@ -4100,6 +4078,39 @@ def selftest():
           "the needs_yes gate holds through dispatch, not only through "
           "apply() directly",
           lambda: _dispatch_capture("restart", "cold")[0].writes == [])
+    check("cmd_show/cmd_monitor/cmd_probe/cmd_bandwidth each still construct "
+          "their own read-only Session as their own first statement -- "
+          "sharing _show_view/_monitor_loop/_probe_view/_bandwidth_view with "
+          "the REPL did not move that construction out from under them",
+          lambda: all(calls and all(c.get("allow_apply", False) is False
+                                    for c in calls)
+                      for calls in (_session_calls(n) for n in
+                                   ("cmd_show", "cmd_monitor", "cmd_probe",
+                                    "cmd_bandwidth"))))
+    check("'show' dispatches through the shared session and prints a "
+          "report without raising",
+          lambda: "gnssctl show" in _dispatch_capture("show", "")[2])
+    check("'bandwidth' dispatches through the shared session and prints "
+          "the budget arithmetic without raising",
+          lambda: "fix rate" in _dispatch_capture("bandwidth", "")[2])
+
+    # Same anti-regression shape as cmd_monitor's own check above (see its
+    # comment for why the comparison is against a same-readback/zero-redraw
+    # run rather than a bare 0), driven through _repl_monitor instead of
+    # cmd_monitor -- proof that the fix Task 11 made once now holds on BOTH
+    # entry points that share _monitor_loop, not only the one the earlier
+    # regression check happened to drive.
+    def _repl_monitor_writes(iterations):
+        port = _QuietThenInterrupt(iterations)
+        session = Session(port, allow_apply=True, timeout=_TEST_WINDOW)
+        _repl_monitor(session, "--interval %s" % _TEST_WINDOW)
+        return port.writes
+
+    check("the REPL's monitor path sends nothing beyond its one-time "
+          "CFG-PRT/CFG-RATE readback either -- same _monitor_loop as "
+          "cmd_monitor, driven through the REPL dispatcher this time",
+          lambda: len(_repl_monitor_writes(2)) == 2  # readback only, 0 redraws
+                  and len(_repl_monitor_writes(4)) == 2)  # readback + 2 redraws
 
     print("")
     if _FAILS:
