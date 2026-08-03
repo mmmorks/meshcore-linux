@@ -444,6 +444,249 @@ NMEA_MSG_ID = {"GGA": (0x4E, 0x00), "GLL": (0x4E, 0x01), "GSA": (0x4E, 0x02),
                "ZDA": (0x4E, 0x08)}
 
 
+class TextCodec:
+    """One NMEA field, sized from the spec's Format/Description columns.
+
+    max_width feeds the bandwidth model as well as parse/build, so a field's
+    documented maximum is stated once and used for all three.
+    """
+
+    __slots__ = ("name", "max_width", "_as_int")
+
+    def __init__(self, name, max_width, as_int=False):
+        self.name = name
+        self.max_width = max_width
+        self._as_int = as_int
+
+    def decode(self, text):
+        if self._as_int:
+            return int(text) if text else None
+        return text
+
+    def encode(self, value):
+        if value is None:
+            return ""
+        return str(value)
+
+
+def Num(max):
+    """A numeric field bounded by the widest value the spec permits."""
+    return TextCodec("Num", len(max))
+
+
+def IntC(width):
+    return TextCodec("Int", width, as_int=True)
+
+
+def EnumC(*values):
+    return TextCodec("Enum", max(len(v) for v in values))
+
+
+def Const(text):
+    c = TextCodec("Const", len(text))
+    c.fixed = text
+    return c
+
+
+# Widths taken directly from the spec's Format column.
+Utc = TextCodec("hhmmss.sss", 10)
+LatitudeC = TextCodec("ddmm.mmmmm", 10)
+LongitudeC = TextCodec("dddmm.mmmmm", 11)
+DateC = TextCodec("ddmmyy", 6)
+CharC = TextCodec("Character", 1)
+EmptyC = TextCodec("Empty", 0)
+# <MagVar>, <MagVarDir>, <DiffAge>, <DiffStation>, <COGM>: documented "Not
+# supported", so they are always empty on the wire and cost only their comma.
+Unsupported = TextCodec("Unsupported", 0)
+# §2.2.7 <TextMsg> is free text with no documented maximum. Bounded by the
+# NMEA 0183 82-byte sentence limit minus this sentence's fixed overhead.
+TextC = TextCodec("String", 61)
+
+
+class F:
+    __slots__ = ("name", "codec")
+
+    def __init__(self, name, codec):
+        self.name = name
+        self.codec = codec
+
+
+class Repeat:
+    """A repeat block. `times` is a fixed count, or (min, max) if variable."""
+
+    __slots__ = ("times", "fields", "key")
+
+    def __init__(self, times, key, *fields):
+        self.times = times
+        self.key = key
+        self.fields = fields
+
+    @property
+    def max_times(self):
+        return self.times if isinstance(self.times, int) else self.times[1]
+
+
+class Sentence:
+    def __init__(self, name, *parts):
+        self.name = name
+        self.parts = parts
+
+    def _flat_fields(self, count=None):
+        """Expand repeat blocks for a body with `count` data fields."""
+        out = []
+        for part in self.parts:
+            if isinstance(part, F):
+                out.append(part)
+                continue
+            times = part.times
+            if not isinstance(times, int):
+                # Variable block: everything not accounted for by the fixed
+                # fields belongs to it. GSV is header(3) + 4n + signalID(1).
+                fixed = sum(1 for p in self.parts if isinstance(p, F))
+                times = max(0, (count - fixed)) // len(part.fields)
+            out.append((part, times))
+        return out
+
+    def parse(self, body):
+        fields = body.split(",")[1:]
+        out = {}
+        idx = 0
+        for item in self._flat_fields(len(fields)):
+            if isinstance(item, F):
+                out[item.name] = item.codec.decode(
+                    fields[idx] if idx < len(fields) else "")
+                idx += 1
+                continue
+            block, times = item
+            rows = []
+            for _ in range(times):
+                if len(block.fields) == 1:
+                    rows.append(fields[idx] if idx < len(fields) else "")
+                    idx += 1
+                else:
+                    row = {}
+                    for f in block.fields:
+                        row[f.name] = f.codec.decode(
+                            fields[idx] if idx < len(fields) else "")
+                        idx += 1
+                    rows.append(row)
+            out[block.key] = rows
+        return out
+
+    def build(self, **kw):
+        parts = [self.name]
+        for item in self._flat_fields():
+            if isinstance(item, F):
+                codec = item.codec
+                if hasattr(codec, "fixed"):
+                    parts.append(codec.fixed)
+                else:
+                    parts.append(codec.encode(kw.get(item.name)))
+                continue
+            block, times = item
+            rows = kw.get(block.key) or []
+            for i in range(times):
+                row = rows[i] if i < len(rows) else None
+                for f in block.fields:
+                    if len(block.fields) == 1:
+                        parts.append(f.codec.encode(row))
+                    else:
+                        parts.append(f.codec.encode(
+                            (row or {}).get(f.name)))
+        return ",".join(parts)
+
+    def max_width(self):
+        """Worst-case bytes on the wire: '$' + address + fields + '*CS' + CRLF.
+
+        Clamped to the NMEA 0183 82-byte sentence limit, which is a hard ceiling
+        no conforming sentence can exceed.
+        """
+        n_fields = 0
+        width = 0
+        for part in self.parts:
+            if isinstance(part, F):
+                n_fields += 1
+                width += part.codec.max_width
+            else:
+                n_fields += part.max_times * len(part.fields)
+                width += part.max_times * sum(f.codec.max_width
+                                              for f in part.fields)
+        total = 1 + len(self.name) + 2 + n_fields + width + 3 + 2
+        return min(total, 82)
+
+
+RMC = Sentence("RMC",                                          # §2.2.1
+               F("utc", Utc), F("status", EnumC("A", "V", "D")),
+               F("lat", LatitudeC), F("ns", CharC),
+               F("lon", LongitudeC), F("ew", CharC),
+               F("sog", Num("999.99")), F("cog", Num("359.9")),
+               F("date", DateC),
+               F("magVar", Unsupported), F("magVarDir", Unsupported),
+               F("modeInd", EnumC("A", "D", "E", "N")),
+               F("navStatus", EnumC("S", "C", "U", "V")))
+
+# <Alt> and <Sep> are both documented as bare "Numeric, Meter" with no range
+# (§2.2.2) -- worst case is a judgment call, not a spec lookup. They give the
+# same judgment call the same bound rather than let <Sep> arbitrarily undercut
+# <Alt> by a digit.
+GGA = Sentence("GGA",                                          # §2.2.2
+               F("utc", Utc), F("lat", LatitudeC), F("ns", CharC),
+               F("lon", LongitudeC), F("ew", CharC),
+               F("quality", IntC(1)), F("numSatUsed", IntC(2)),
+               F("hdop", Num("99.0")), F("alt", Num("-1000.0")),
+               F("altUnit", CharC), F("sep", Num("-1000.0")),
+               F("sepUnit", CharC),
+               F("diffAge", Unsupported), F("diffStation", Unsupported))
+
+# <SatID> is documented only as "Numeric" (§2.2.3), pointing at Table 16 for
+# the actual range -- QZSS is 193-197, three digits, and the spec's own worked
+# example (§2.2.3, sentence 3 of 3) carries satID 193 and 195. IntC(2) would
+# silently truncate those on decode and undercount the sentence's true worst
+# case, so satID/cn0 decode as text (leading zeros on cn0 are data, not noise).
+GSV = Sentence("GSV",                                          # §2.2.3
+               F("totalNumSen", IntC(1)), F("senNum", IntC(1)),
+               F("totalNumSat", IntC(2)),
+               Repeat((1, 4), "sats",
+                      F("satID", Num("999")), F("elev", IntC(2)),
+                      F("az", IntC(3)), F("cn0", Num("99"))),
+               F("signalID", IntC(1)))
+
+GSA = Sentence("GSA",                                          # §2.2.4
+               F("mode", EnumC("M", "A")), F("fixMode", IntC(1)),
+               # <SatID> here has the same 3-digit QZSS range as GSV's (Table
+               # 16), but §2.2.4's own worked example never exceeds 2 digits,
+               # so nothing exercises the gap. Left at IntC(2) pending the same
+               # width reconciliation GSV needed -- see that sentence's note.
+               Repeat(12, "sats", F("satID", IntC(2))),
+               F("pdop", Num("99.0")), F("hdop", Num("99.0")),
+               F("vdop", Num("99.0")), F("systemID", IntC(1)))
+
+VTG = Sentence("VTG",                                          # §2.2.5
+               F("cogt", Num("359.9")), F("t", CharC),
+               F("cogm", Unsupported), F("m", CharC),
+               F("sogn", Num("999.99")), F("n", CharC),
+               F("sogk", Num("999.99")), F("k", CharC),
+               F("modeInd", EnumC("A", "E", "N")))
+
+GLL = Sentence("GLL",                                          # §2.2.6
+               F("lat", LatitudeC), F("ns", CharC),
+               F("lon", LongitudeC), F("ew", CharC),
+               F("utc", Utc), F("status", EnumC("A", "V")),
+               F("modeInd", EnumC("A", "E", "N")))
+
+TXT = Sentence("TXT",                                          # §2.2.7
+               F("totalNumSen", IntC(2)), F("senNum", IntC(2)),
+               F("textID", IntC(2)), F("textMsg", TextC))
+
+ZDA = Sentence("ZDA",                                          # §2.2.8
+               F("utc", Utc), F("day", IntC(2)), F("month", IntC(2)),
+               F("year", IntC(4)), F("localHour", IntC(2)),
+               F("localMin", IntC(2)))
+
+STANDARD_SENTENCES = {s.name: s for s in
+                      (RMC, GGA, GSV, GSA, VTG, GLL, TXT, ZDA)}
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -612,6 +855,53 @@ def selftest():
           lambda: CFG_RATE.parse(CFG_RATE.build(interval=1000, res=0)
                                  + b"\xde\xad\xbe\xef")["interval"] == 1000
                   and _raises(lambda: CFG_RATE.parse(b"\x01\x02")))
+
+    print("")
+    print("NMEA sentence tables (§2.2):")
+    check("RMC parses the spec's example",
+          lambda: (lambda r: r["lat"] == "3149.29103" and r["status"] == "A"
+                   and r["date"] == "250420" and r["navStatus"] == "V")(
+              RMC.parse(SPEC_NMEA[5].rsplit("*", 1)[0][5:])))
+    check("GGA parses quality, satellites and HDOP",
+          lambda: (lambda r: r["quality"] == 1 and r["numSatUsed"] == 21
+                   and r["hdop"] == "0.7" and r["alt"] == "75.7")(
+              GGA.parse(SPEC_NMEA[6].rsplit("*", 1)[0][5:])))
+    check("GSA reads exactly 12 satellite slots, blanks included (§2.2.4)",
+          lambda: (lambda r: r["sats"] == ["10", "13", "15", "20"] + [""] * 8
+                   and r["systemID"] == 1 and r["pdop"] == "2.5")(
+              GSA.parse(SPEC_NMEA[14].rsplit("*", 1)[0][5:])))
+    check("GSV reads a four-satellite repeat block and the trailing signal ID",
+          lambda: (lambda r: len(r["sats"]) == 4 and r["sats"][0]["satID"] == "02"
+                   and r["sats"][0]["cn0"] == "43" and r["signalID"] == 0
+                   and r["totalNumSat"] == 12)(
+              GSV.parse(SPEC_NMEA[7].rsplit("*", 1)[0][5:])))
+    check("GSV reads a short final sentence",
+          lambda: len(GSV.parse(SPEC_NMEA[9].rsplit("*", 1)[0][5:])["sats"]) == 4)
+    check("VTG, GLL, ZDA and TXT all parse their examples",
+          lambda: all(s.parse(SPEC_NMEA[i].rsplit("*", 1)[0][5:]) for i, s in
+                      ((15, VTG), (16, GLL), (19, ZDA), (17, TXT))))
+    check("TXT keeps a message containing '=' intact (§2.2.7)",
+          lambda: TXT.parse(SPEC_NMEA[17].rsplit("*", 1)[0][5:])["textMsg"]
+                  == "MA=CASIC")
+    check("every standard sentence round-trips its own example",
+          lambda: all(s.build(**s.parse(body[5:])) == body[5:]
+                      for s, body in ((RMC, SPEC_NMEA[5].rsplit("*", 1)[0]),
+                                      (GGA, SPEC_NMEA[6].rsplit("*", 1)[0]),
+                                      (GSA, SPEC_NMEA[14].rsplit("*", 1)[0]),
+                                      (VTG, SPEC_NMEA[15].rsplit("*", 1)[0]),
+                                      (GLL, SPEC_NMEA[16].rsplit("*", 1)[0]),
+                                      (ZDA, SPEC_NMEA[19].rsplit("*", 1)[0]))))
+    check("max_width bounds every vendor example of that sentence",
+          lambda: [s.name for s in STANDARD_SENTENCES.values()
+                   for ex in SPEC_NMEA
+                   if ex[2:5] == s.name and len(ex) + 3 > s.max_width()] == [])
+    check("max_width never exceeds the NMEA 0183 82-byte sentence limit",
+          lambda: all(s.max_width() <= 82 for s in STANDARD_SENTENCES.values()))
+    check("the derived widths match the design's bandwidth table",
+          lambda: [TXT.max_width(), GGA.max_width(), RMC.max_width(),
+                   GSV.max_width(), GSA.max_width(), GLL.max_width(),
+                   VTG.max_width(), ZDA.max_width()]
+                  == [82, 81, 77, 72, 68, 53, 42, 39])
 
     print("")
     if _FAILS:
