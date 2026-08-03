@@ -1941,6 +1941,17 @@ def productive(results):
                for r in results if r.poll.kind == "bin")
 
 
+# CASIC first, always. This receiver EMITS u-blox b5 62 and ignores Allystar
+# f1 d9 entirely, but the protocol it ANSWERS is CASIC ba ce, which it never
+# emits. Sweeping only the framing seen on the wire finds nothing but
+# refusals -- that finding is why this tool exists, and the order below is
+# the whole of its expression in code. A module-level constant rather than a
+# local in cmd_probe so --selftest can pin it: this is pure, has no I/O
+# dependency, and a future accidental reordering (or an ALL_FRAMINGS that no
+# longer starts with CASIC) would otherwise pass the whole suite unnoticed.
+PROBE_ORDER = (CASIC,) + tuple(f for f in ALL_FRAMINGS if f is not CASIC)
+
+
 def hexdump(data, limit=64):
     if not data:
         return ""
@@ -2103,21 +2114,20 @@ def cmd_probe(port, args):
           % (port.baud, args.listen_seconds))
     obs = session.observe(args.listen_seconds)
 
-    # CASIC first, unconditionally -- not because phase 1 suggests it, but
-    # because it is the documented finding this tool exists to act on: this
-    # receiver EMITS u-blox framing and ACCEPTS CASIC framing, and those are
-    # different questions. Falling back through the rest of ALL_FRAMINGS
-    # covers the case that finding does not hold on whatever chip is actually
-    # attached today.
-    order = (CASIC,) + tuple(f for f in ALL_FRAMINGS if f is not CASIC)
+    # PROBE_ORDER puts CASIC first unconditionally -- not because phase 1
+    # suggests it, but because it is the documented finding this tool exists
+    # to act on: this receiver EMITS u-blox framing and ACCEPTS CASIC framing,
+    # and those are different questions. Falling back through the rest of
+    # PROBE_ORDER covers the case that finding does not hold on whatever chip
+    # is actually attached today.
     sweeps = []
-    for framing in order:
+    for framing in PROBE_ORDER:
         print("Sweeping %s framing..." % framing.name)
         results = sweep(session, framing)
         sweeps.append((framing, results))
         if productive(results):
             break
-        if framing is not order[-1]:
+        if framing is not PROBE_ORDER[-1]:
             print("  every binary poll refused; trying the next framing")
 
     print("")
@@ -2817,6 +2827,52 @@ def selftest():
               Observation(9600), [], "/dev/null"))
     check("the JSON carries the raw window so silence is falsifiable",
           lambda: "raw_head_hex" in probe_json(Observation(9600), [], "/dev/null"))
+    # PROBE_ORDER is pure and has no I/O dependency, but it is the whole
+    # expression in code of the finding this tool exists for -- CASIC is what
+    # this receiver answers, never what it emits, so it goes first
+    # unconditionally rather than being inferred from what phase 1 saw on the
+    # wire. Pinned here so an accidental reordering (or an ALL_FRAMINGS that
+    # stops starting with CASIC) fails the suite instead of only a live probe.
+    check("the sweep tries CASIC first, then every other framing",
+          lambda: PROBE_ORDER[0] is CASIC
+                  and set(PROBE_ORDER) == set(ALL_FRAMINGS)
+                  and len(PROBE_ORDER) == len(ALL_FRAMINGS))
+
+    # render_probe's per-poll branch (everything but the "no sweeps"
+    # fallback) has no coverage above: both checks so far pass sweeps=[].
+    # ProbeResult built directly rather than through a fake port -- what is
+    # under test is the rendering, not the wire.
+    _BIN_POLLS = [p for p in POLLS if p.kind == "bin"]
+    _MIXED_SWEEP = [
+        ProbeResult(_BIN_POLLS[0], "reply", {"baudRate": 9600},
+                   answered_in=CASIC.name),
+        ProbeResult(_BIN_POLLS[1], "nak"),
+        ProbeResult(_BIN_POLLS[2], "silence", window=b"\x00\x01",
+                   window_total=137,
+                   seen={"casic 06-00": 2, "ubx 0a-04": 1}),
+        # A reply that arrived in a framing other than the one being swept --
+        # the exact case that matters most: scoring it as silence would turn
+        # "it answered, just not how we expected" into "not supported".
+        ProbeResult(_BIN_POLLS[3], "reply", {"note": "cross-framing"},
+                   answered_in=UBX.name),
+    ]
+    _MIXED_REPORT = render_probe(Observation(9600), [(CASIC, _MIXED_SWEEP)],
+                                 "/dev/null")
+    check("every poll's label appears, and a reply's decoded fields render",
+          lambda: all(p.label in _MIXED_REPORT for p in _BIN_POLLS[:4])
+                  and "baudRate=9600" in _MIXED_REPORT)
+    check("a NAK renders as unsupported, not folded into silence",
+          lambda: "not supported on this chip" in _MIXED_REPORT)
+    check("a silence line reports both its byte count and its frame tally",
+          lambda: "137 bytes arrived" in _MIXED_REPORT
+                  and "casic 06-00 x2" in _MIXED_REPORT)
+    check("a reply answered outside the swept framing is annotated",
+          lambda: "ANSWERED IN UBX FRAMING" in _MIXED_REPORT)
+    # ...and the mirror image: a wall of refusals, which is what a u-blox
+    # emulation layer produces and is exactly what must NOT read as success --
+    # it is what makes cmd_probe try the next framing instead of stopping.
+    check("an all-NAK sweep is not productive -- that is what triggers the fallback",
+          lambda: not productive([ProbeResult(p, "nak") for p in _BIN_POLLS]))
 
     print("")
     if _FAILS:
