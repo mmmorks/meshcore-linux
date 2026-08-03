@@ -451,7 +451,12 @@ class TextCodec:
     documented maximum is stated once and used for all three.
     """
 
-    __slots__ = ("name", "max_width", "_as_int")
+    # "fixed", "lo" and "hi" are left out of __init__ on purpose: they are
+    # optional, set only by the factories that need them (Const; OptInt
+    # below), and their absence is what lets build() and validation tell an
+    # ordinary field apart from one of those via hasattr/getattr rather than
+    # a name check.
+    __slots__ = ("name", "max_width", "_as_int", "fixed", "lo", "hi")
 
     def __init__(self, name, max_width, as_int=False):
         self.name = name
@@ -711,6 +716,57 @@ STANDARD_SENTENCES = {s.name: s for s in
                       (RMC, GGA, GSV, GSA, VTG, GLL, TXT, ZDA)}
 
 
+def OptInt(lo, hi):
+    """A $PCAS03 rate field.
+
+    None encodes as empty, which the spec defines as "keep the previous
+    configuration" (§2.3.3) -- distinct from 0, "no output". Collapsing the two
+    would silently rewrite the seven sentences a caller did not name.
+    """
+    codec = TextCodec("OptInt", 1, as_int=True)
+    codec.lo, codec.hi = lo, hi
+    return codec
+
+
+PCAS01 = Sentence("PCAS01", F("cmd", IntC(1)))                 # §2.3.1
+PCAS02 = Sentence("PCAS02", F("interval", IntC(4)))            # §2.3.2
+PCAS03 = Sentence("PCAS03",                                    # §2.3.3
+                  F("nGGA", OptInt(0, 9)), F("nGLL", OptInt(0, 9)),
+                  F("nGSA", OptInt(0, 9)), F("nGSV", OptInt(0, 9)),
+                  F("nRMC", OptInt(0, 9)), F("nVTG", OptInt(0, 9)),
+                  F("nZDA", OptInt(0, 9)), F("nANT", OptInt(0, 9)),
+                  # The trailing reserved fields are positional and not
+                  # interchangeable: two "0", two empty, two "0" (§2.3.3 table,
+                  # matching the worked example).
+                  F("res1", Const("0")), F("res2", Const("0")),
+                  F("res3", Const("")), F("res4", Const("")),
+                  F("res5", Const("0")), F("res6", Const("0")))
+PCAS04 = Sentence("PCAS04", F("mode", IntC(1)))                # §2.3.4
+# Undocumented -- the spec lists only 01/02/03/04/10. Retained because it
+# demonstrably answers on this hardware. Its reply is a $GPTXT carrying SW=,
+# the *software* field, which is not a part number (§2.2.7's own example is
+# MA=CASIC).
+PCAS06 = Sentence("PCAS06", F("query", IntC(1)))
+PCAS10 = Sentence("PCAS10", F("flag", IntC(1)))                # §2.3.5
+
+BAUD_CODE = {4800: 0, 9600: 1, 19200: 2, 38400: 3, 57600: 4, 115200: 5}
+
+# §2.3.4. QZSS is always enabled and cannot be configured (§1 note 1), so it is
+# not a member of any set here. There is no Galileo mode at all.
+MODE_CONSTELLATION = {
+    1: frozenset(("GPS",)),
+    2: frozenset(("BDS",)),
+    3: frozenset(("GPS", "BDS")),
+    4: frozenset(("GLO",)),
+    5: frozenset(("GPS", "GLO")),
+    6: frozenset(("BDS", "GLO")),
+    7: frozenset(("GPS", "BDS", "GLO")),
+}
+CONSTELLATION_MODE = {v: k for k, v in MODE_CONSTELLATION.items()}
+
+RESTART_FLAG = {"hot": 0, "warm": 1, "cold": 2, "factory": 3}   # §2.3.5
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -932,6 +988,39 @@ def selftest():
                    GSV.max_width(), GSA.max_width(), GLL.max_width(),
                    VTG.max_width(), ZDA.max_width()]
                   == [82, 81, 77, 76, 80, 53, 42, 39])
+
+    print("")
+    print("$PCAS command tables (§2.3):")
+    check("PCAS01 builds the spec's 9600 example",
+          lambda: nmea_wrap(PCAS01.build(cmd=1)) == b"$PCAS01,1*1D\r\n")
+    check("PCAS01 builds the sentence gnss-set-baud sent for 115200",
+          lambda: nmea_wrap(PCAS01.build(cmd=BAUD_CODE[115200])) == b"$PCAS01,5*19\r\n")
+    check("PCAS02 builds the spec's 1 Hz example",
+          lambda: nmea_wrap(PCAS02.build(interval=1000)) == b"$PCAS02,1000*2E\r\n")
+    check("PCAS02 builds the 5 Hz sentence gnss-set-baud sent",
+          lambda: nmea_wrap(PCAS02.build(interval=200)) == b"$PCAS02,200*1D\r\n")
+    check("PCAS03 builds the spec's all-on example",
+          lambda: nmea_wrap(PCAS03.build(**dict.fromkeys(
+              ("nGGA", "nGLL", "nGSA", "nGSV", "nRMC", "nVTG", "nZDA", "nANT"), 1)))
+                  == b"$PCAS03,1,1,1,1,1,1,1,1,0,0,,,0,0*02\r\n")
+    check("PCAS03 leaves unnamed sentences null, meaning keep (§2.3.3)",
+          lambda: PCAS03.build(nGSV=1) == "PCAS03,,,,1,,,,,0,0,,,0,0")
+    check("PCAS03 distinguishes 'keep' from 'off'",
+          lambda: PCAS03.build(nGSV=0) == "PCAS03,,,,0,,,,,0,0,,,0,0")
+    check("PCAS04 builds the spec's GPS+BeiDou default",
+          lambda: nmea_wrap(PCAS04.build(mode=3)) == b"$PCAS04,3*1A\r\n")
+    check("PCAS10 builds the spec's hot-start example",
+          lambda: nmea_wrap(PCAS10.build(flag=0)) == b"$PCAS10,0*1C\r\n")
+    check("the constellation map covers all seven modes and no more (§2.3.4)",
+          lambda: sorted(MODE_CONSTELLATION) == [1, 2, 3, 4, 5, 6, 7])
+    check("there is no Galileo mode (§2.3.4)",
+          lambda: not any("GAL" in c for s in MODE_CONSTELLATION.values() for c in s))
+    check("GPS+BeiDou+GLONASS is mode 7",
+          lambda: CONSTELLATION_MODE[frozenset(("GPS", "BDS", "GLO"))] == 7)
+    check("baud codes cover exactly the six documented rates (§2.3.1)",
+          lambda: sorted(BAUD_CODE) == [4800, 9600, 19200, 38400, 57600, 115200])
+    check("restart flags cover the four documented modes (§2.3.5)",
+          lambda: sorted(RESTART_FLAG) == ["cold", "factory", "hot", "warm"])
 
     print("")
     if _FAILS:
