@@ -674,6 +674,19 @@ GGA = Sentence("GGA",                                          # §2.2.2
                F("sepUnit", CharC),
                F("diffAge", Unsupported), F("diffStation", Unsupported))
 
+# §2.2.2 <Quality> ("GPS quality indicator"). Only 0, 1, 2 and 6 are assigned
+# by this specification's own parameter table -- 3, 4, 5 and 7+ are gaps in
+# the spec, not omissions here, and are NOT filled in from generic NMEA-0183
+# knowledge (which assigns some of those numbers to RTK modes this receiver's
+# own documentation never claims). render_show renders a code missing from
+# this dict as undocumented rather than guessing what it means.
+GGA_QUALITY = {
+    0: "fix not available or invalid",
+    1: "GPS SPS mode, fix valid",
+    2: "differential GPS/SBAS, fix valid",
+    6: "estimated (dead reckoning) mode",
+}
+
 # <SatID> is documented only as "Numeric" (§2.2.3), pointing at Table 16 for
 # the actual range -- QZSS is 193-197, three digits, and the spec's own worked
 # example (§2.2.3, sentence 3 of 3) carries satID 193 and 195. IntC(2) would
@@ -712,6 +725,10 @@ GSA = Sentence("GSA",                                          # §2.2.4
                # One per constellation in the solution, each carrying its
                # own <SystemID> (§2.2.4).
                repeat=lambda sats, talkers: len(talkers))
+
+# §2.2.4 <FixMode>. Only 1, 2 and 3 are documented; render_show renders
+# anything else as undocumented rather than guessing, same as GGA_QUALITY.
+GSA_FIX_MODE = {1: "fix not available", 2: "2D", 3: "3D"}
 
 VTG = Sentence("VTG",                                          # §2.2.5
                F("cogt", Num("359.9")), F("t", CharC),
@@ -2212,7 +2229,30 @@ def cmd_probe(port, args):
 # three it is, in brackets, so a reader cannot mistake one for another.
 # --------------------------------------------------------------------------
 
-_FIX_MODE = {1: "no fix", 2: "2D", 3: "3D"}  # NMEA-0183 GSA <FixMode>, §2.2.4
+
+def _code_text(table, code):
+    """(code, text) for a documented spec code, or (code, None) if it is not
+    in `table` -- an undocumented code renders as the raw number with a
+    marker, not as a guess. code=None (field absent) renders as `(None, None)`
+    so the caller's own "unknown" handling applies uniformly.
+    """
+    if code is None or code == "":
+        return None, None
+    return code, table.get(code)
+
+
+def _render_code(table, code):
+    """"unknown" for a missing field, "N (text)" for a code `table` documents,
+    or "N (undocumented code)" for one it does not -- see _code_text. The raw
+    code stays visible either way: an operator reading a bug report is better
+    served by "quality 2 (differential/SBAS, fix valid)" than by prose alone.
+    """
+    code, text = _code_text(table, code)
+    if code is None:
+        return "unknown"
+    if text is None:
+        return "%s (undocumented code)" % (code,)
+    return "%s (%s)" % (code, text)
 
 
 def _or_unknown(value):
@@ -2308,16 +2348,15 @@ def render_show(session, obs):
     else:
         if gsa is not None:
             _, rec = gsa
-            fm = rec.get("fixMode")
             w("  fix type        %s  [observed: GSA <FixMode>]" % (
-                _FIX_MODE.get(fm, "unknown (%r)" % (fm,))))
+                _render_code(GSA_FIX_MODE, rec.get("fixMode"))))
             w("  DOP (P/H/V)     %s / %s / %s  [observed: GSA]" % (
                 _or_unknown(rec.get("pdop")), _or_unknown(rec.get("hdop")),
                 _or_unknown(rec.get("vdop"))))
         if gga is not None:
             _, rec = gga
-            w("  quality         %s (GGA <Quality>)  [observed: GGA]" % (
-                _or_unknown(rec.get("quality"))))
+            w("  quality         %s  [observed: GGA <Quality>]" % (
+                _render_code(GGA_QUALITY, rec.get("quality"))))
             w("  satellites used %s  [observed: GGA <NumSatUsed>]" % (
                 _or_unknown(rec.get("numSatUsed"))))
             w("  HDOP            %s  [observed: GGA <HDOP>]" % (
@@ -3315,6 +3354,30 @@ def selftest():
           lambda: all(t in render_sky(_OBS) for t in ("02", "49", "43")))
     check("an empty observation renders without raising",
           lambda: isinstance(render_show(None, Observation(9600)), str))
+
+    # GGA_QUALITY and GSA_FIX_MODE pinned against the spec's own tables
+    # (§2.2.2, §2.2.4) -- gaps (3/4/5/7+ for quality) are deliberate, not an
+    # oversight, and this fails loudly if one is ever "helpfully" filled in
+    # from generic NMEA-0183 knowledge the receiver's own spec does not claim.
+    check("GGA_QUALITY and GSA_FIX_MODE match exactly the codes the spec "
+          "documents, no more",
+          lambda: GGA_QUALITY == {0: "fix not available or invalid",
+                                  1: "GPS SPS mode, fix valid",
+                                  2: "differential GPS/SBAS, fix valid",
+                                  6: "estimated (dead reckoning) mode"}
+                  and GSA_FIX_MODE == {1: "fix not available", 2: "2D", 3: "3D"})
+    check("a documented code shows the raw number next to its text",
+          lambda: _render_code(GGA_QUALITY, 2) == "2 (differential GPS/SBAS, "
+                                                    "fix valid)")
+    check("an undocumented code is marked undocumented, not silently mapped "
+          "to something",
+          lambda: _render_code(GGA_QUALITY, 5) == "5 (undocumented code)"
+                  and _render_code(GSA_FIX_MODE, 9) == "9 (undocumented code)"
+                  and _render_code(GGA_QUALITY, None) == "unknown")
+    check("show renders the documented quality/fix-mode text next to the "
+          "raw code",
+          lambda: "1 (GPS SPS mode, fix valid)" in render_show(None, _OBS)
+                  and "3 (3D)" in render_show(None, _OBS))
 
     check("render_sky renders without raising when nothing has been observed",
           lambda: isinstance(render_sky(Observation(9600)), str))
