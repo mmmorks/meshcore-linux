@@ -49,6 +49,70 @@ R4 = Codec("R4", 4, "f")
 R8 = Codec("R8", 8, "d")
 
 
+# Every worked NMEA example the specification prints. These are vendor bytes,
+# so they check this implementation against the spec rather than against our
+# reading of it. §2.2.1-2.2.8 (standard) and §2.3.1-2.3.5 (PCAS).
+SPEC_NMEA = (
+    "PCAS01,1*1D",                                                  # §2.3.1
+    "PCAS02,1000*2E",                                               # §2.3.2
+    "PCAS03,1,1,1,1,1,1,1,1,0,0,,,0,0*02",                          # §2.3.3
+    "PCAS04,3*1A",                                                  # §2.3.4
+    "PCAS10,0*1C",                                                  # §2.3.5
+    "GNRMC,071556.000,A,3149.29103,N,11706.92916,E,0.00,0.00,"
+    "250420,,,A,V*09",                                              # §2.2.1
+    "GNGGA,071556.000,3149.29103,N,11706.92916,E,1,21,0.7,75.7,M,"
+    "-5.0,M,,*69",                                                  # §2.2.2
+    "GPGSV,3,1,12,02,49,123,43,05,60,005,43,06,06,127,29,07,05,"
+    "042,33,0*66",                                                  # §2.2.3
+    "GPGSV,3,2,12,13,79,139,44,15,55,225,44,18,12,314,36,20,44,"
+    "055,42,0*6C",
+    "GPGSV,3,3,12,29,48,275,42,30,20,069,38,193,69,062,42,195,46,"
+    "160,42,0*6A",
+    "BDGSV,4,1,16,01,43,135,36,03,54,193,36,04,31,120,34,06,43,"
+    "189,35,0*7B",
+    "BDGSV,4,2,16,07,06,196,28,08,63,008,35,09,30,194,32,10,09,"
+    "210,29,0*74",
+    "BDGSV,4,3,16,13,59,342,38,16,50,184,37,27,57,183,40,30,53,"
+    "295,39,0*77",
+    "BDGSV,4,4,16,32,65,305,41,38,68,046,40,39,59,181,38,41,40,"
+    "042,38,0*78",
+    "GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1*35",               # §2.2.4
+    "GNVTG,0.00,T,,M,0.00,N,0.00,K,A*23",                           # §2.2.5
+    "GNGLL,3149.29103,N,11706.92916,E,071556.000,A,A*45",           # §2.2.6
+    "GPTXT,01,01,02,MA=CASIC*27",                                   # §2.2.7
+    "GPTXT,01,01,01,ANTENNA OPEN*25",
+    "GNZDA,053712.000,21,10,2021,00,00*49",                         # §2.2.8
+)
+
+
+def nmea_checksum(body):
+    """The 8-bit XOR of everything between '$' and '*', exclusive (§2.1)."""
+    ck = 0
+    for byte in body.encode("ascii"):
+        ck ^= byte
+    return "%02X" % ck
+
+
+def nmea_wrap(body):
+    return ("$%s*%s\r\n" % (body, nmea_checksum(body))).encode("ascii")
+
+
+def nmea_split(line):
+    """(body, checksum_ok) for '$BODY*CS'; (None, False) if not a sentence.
+
+    rpartition, not partition: no standard sentence carries a '*' in its data,
+    but $GPTXT's <TextMsg> is free text (§2.2.7) and splitting on the first one
+    would corrupt any message containing it.
+    """
+    text = line.strip()
+    if not text.startswith("$") or "*" not in text:
+        return None, False
+    body, _, given = text[1:].rpartition("*")
+    if not body:
+        return None, False
+    return body, given.strip().upper() == nmea_checksum(body)
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -91,6 +155,22 @@ def selftest():
           lambda: all(c.unpack(c.pack(v)) == v
                       for c, v in ((U1, 255), (I1, -128), (U2, 65535),
                                    (I2, -32768), (U4, 4294967295), (I4, -1))))
+
+    print("")
+    print("NMEA framing against the spec's own examples (§2.2, §2.3):")
+    check("all 20 vendor checksums verify",
+          lambda: [s for s in SPEC_NMEA
+                   if nmea_checksum(s.rsplit("*", 1)[0]) != s.rsplit("*", 1)[1]] == [])
+    check("wrap produces the sentence gnss-set-baud sent",
+          lambda: nmea_wrap("PCAS01,5") == b"$PCAS01,5*19\r\n")
+    check("split round-trips a wrapped sentence",
+          lambda: nmea_split(nmea_wrap("PCAS02,1000").decode()) == ("PCAS02,1000", True))
+    check("split rejects a corrupted checksum",
+          lambda: nmea_split("$PCAS01,5*1A") == ("PCAS01,5", False))
+    check("split rejects a line that is not a sentence",
+          lambda: nmea_split("garbage") == (None, False))
+    check("checksum covers neither $ nor * (§2.1)",
+          lambda: nmea_checksum("GPTXT,01,01,02,MA=CASIC") == "27")
 
     print("")
     if _FAILS:
