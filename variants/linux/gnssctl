@@ -575,24 +575,26 @@ class Sentence:
 
     def build(self, **kw):
         parts = [self.name]
-        for item in self._flat_fields():
-            if isinstance(item, F):
-                codec = item.codec
-                if hasattr(codec, "fixed"):
-                    parts.append(codec.fixed)
-                else:
-                    parts.append(codec.encode(kw.get(item.name)))
+        for part in self.parts:
+            if isinstance(part, F):
+                codec = part.codec
+                parts.append(codec.fixed if hasattr(codec, "fixed")
+                             else codec.encode(kw.get(part.name)))
                 continue
-            block, times = item
-            rows = kw.get(block.key) or []
+            # A variable repeat emits exactly as many blocks as the caller
+            # supplied rows: on the wire a GSV sentence carries 1-4 satellites
+            # and the count is implicit in the field count, so there is nothing
+            # else it could mean. A fixed repeat always emits its full width --
+            # GSA pads unused satellite slots with empty fields (§2.2.4).
+            rows = kw.get(part.key) or []
+            times = part.times if isinstance(part.times, int) else len(rows)
             for i in range(times):
                 row = rows[i] if i < len(rows) else None
-                for f in block.fields:
-                    if len(block.fields) == 1:
+                for f in part.fields:
+                    if len(part.fields) == 1:
                         parts.append(f.codec.encode(row))
                     else:
-                        parts.append(f.codec.encode(
-                            (row or {}).get(f.name)))
+                        parts.append(f.codec.encode((row or {}).get(f.name)))
         return ",".join(parts)
 
     def max_width(self):
@@ -651,8 +653,11 @@ GSV = Sentence("GSV",                                          # §2.2.3
                       # 193-197, and the spec's own GSV example carries
                       # satellites 193 and 195. GSV repeats per satellite per
                       # talker, so this width dominates the bandwidth model.
-                      F("satID", Num("999")), F("elev", IntC(2)),
-                      F("az", IntC(3)), F("cn0", Num("99"))),
+                      # satID/elev/az/cn0 all decode as text: each is zero-
+                      # padded on the wire (examples carry "05", "005"), and
+                      # nothing does arithmetic on a satellite's own numbers.
+                      F("satID", Num("999")), F("elev", Num("99")),
+                      F("az", Num("999")), F("cn0", Num("99"))),
                F("signalID", IntC(1)))
 
 GSA = Sentence("GSA",                                          # §2.2.4
@@ -678,9 +683,12 @@ GLL = Sentence("GLL",                                          # §2.2.6
                F("utc", Utc), F("status", EnumC("A", "V")),
                F("modeInd", EnumC("A", "E", "N")))
 
+# <TotalNumSen>/<SenNum>/<TextID> are zero-padded two-digit fields (examples:
+# "01", "02"); text-decoded like ZDA's fields, for the same reason -- IntC
+# would drop the padding on re-encode.
 TXT = Sentence("TXT",                                          # §2.2.7
-               F("totalNumSen", IntC(2)), F("senNum", IntC(2)),
-               F("textID", IntC(2)), F("textMsg", TextC))
+               F("totalNumSen", Num("99")), F("senNum", Num("99")),
+               F("textID", Num("99")), F("textMsg", TextC))
 
 # <Day>/<Month>/<LocalHour>/<LocalMin> are zero-padded on the wire (e.g. "00");
 # IntC would decode "00" to 0 and re-encode it as "0", losing the padding and
@@ -891,16 +899,15 @@ def selftest():
     check("TXT keeps a message containing '=' intact (§2.2.7)",
           lambda: TXT.parse(SPEC_NMEA[17].rsplit("*", 1)[0][5:])["textMsg"]
                   == "MA=CASIC")
-    # body[2:] strips the two-character talker ID and keeps the three-character
-    # sentence name, because build() emits that name as its first field.
-    check("every standard sentence round-trips its own example",
-          lambda: all(s.build(**s.parse(body[2:])) == body[2:]
-                      for s, body in ((RMC, SPEC_NMEA[5].rsplit("*", 1)[0]),
-                                      (GGA, SPEC_NMEA[6].rsplit("*", 1)[0]),
-                                      (GSA, SPEC_NMEA[14].rsplit("*", 1)[0]),
-                                      (VTG, SPEC_NMEA[15].rsplit("*", 1)[0]),
-                                      (GLL, SPEC_NMEA[16].rsplit("*", 1)[0]),
-                                      (ZDA, SPEC_NMEA[19].rsplit("*", 1)[0]))))
+    # Driven off SPEC_NMEA rather than a hand-listed tuple, so no sentence can
+    # be silently omitted. An earlier hand-listed version covered six of the
+    # eight and the two it skipped were both broken.
+    check("every vendor example round-trips through its sentence table",
+          lambda: [e for e in SPEC_NMEA
+                   if e[2:5] in STANDARD_SENTENCES
+                   and STANDARD_SENTENCES[e[2:5]].build(
+                       **STANDARD_SENTENCES[e[2:5]].parse(
+                           e.rsplit("*", 1)[0][2:])) != e.rsplit("*", 1)[0][2:]] == [])
     check("max_width bounds every vendor example of that sentence",
           lambda: [s.name for s in STANDARD_SENTENCES.values()
                    for ex in SPEC_NMEA
