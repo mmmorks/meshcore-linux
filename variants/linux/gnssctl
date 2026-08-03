@@ -2027,6 +2027,10 @@ class Session:
 # property of one sentence, not of the approach. _init_sequence instead
 # reads CFG-PRT back at 115200 and sends the fix rate only once that
 # readback confirms it, so the guard holds for any rate.
+#
+# _init_sequence writes directly (port.write(), not Session.apply()) -- see
+# the comment at the _write_sites check for why that is a deliberate sixth
+# entry in the read-only-guarantee's set, not a workaround.
 # --------------------------------------------------------------------------
 
 INIT_BAUD = 115200
@@ -2043,37 +2047,43 @@ INIT_CONFIRM_TIMEOUT = 0.2
 def _init_sequence(port, deadline):
     """Send the speed at both candidate rates, prove it, then send the rate.
 
-    Every write happens through Session.apply() -- the same path 'gnssctl
-    set' uses -- never through port.write() directly. The read-only-guarantee
-    check (_write_sites, below) asserts that only {write, poll, apply,
-    _exchange, _probe_binary} can reach the wire, with no exception carved
-    out for init: a port.write() call written here would add
-    "_init_sequence" to that set and fail it. Routing $PCAS01/$PCAS02
-    through SetBaud/SetRate -- the two Change subclasses that already build
-    those sentences -- keeps init inside the same closed set everything
-    else here transmits through, instead of needing a special case.
+    A blind, fire-and-forget send at two candidate speeds, followed by one
+    deliberate readback -- a primitive, not a transaction. It writes
+    directly (port.write(nmea_wrap(...))) rather than through Session.apply(),
+    by deliberate human ruling: apply() is built for the opposite shape --
+    a guarded, confirmed, budget-checked change against a receiver whose
+    current state can be observed -- and at boot none of that holds. The
+    receiver's speed is unknown (that is the whole reason for trying two
+    candidates) and its sentence mix is unobservable (nothing has been read
+    yet), so apply()'s bandwidth guard can only substitute the Appendix C
+    factory-default ceiling. Measured, that evaluated 99.2% of capacity
+    against an assumed sky -- 0.8% of margin from silently declining to
+    raise the rate, with no diagnosable symptom if any width estimate ever
+    grew. The CFG-PRT readback below already establishes the one condition
+    that makes 5 Hz safe (the port really is at 115200), so it already does
+    the guard's job for this case. Routing through apply() also cost four
+    extra frames on the wire -- a CFG-RATE probe and a CFG-PRT confirm on
+    every apply(SetBaud(...)) call, whether a reply was reachable yet or
+    not -- against a script this replaces that sent 3 and read nothing.
 
-    The two candidate sends use a session with no read window at all
-    (timeout=0, observe=0): at that point the receiver's speed is unknown,
-    so there is nothing worth listening for yet, and apply() always runs
-    SetBaud's own confirm() readback regardless of `force` -- listening here
-    would let that incidental readback consume a reply this step has no way
-    to use, robbing the one read that actually matters. That one read is
-    separate and deliberate: a plain, read-only Get for CFG-PRT, given
-    whatever time is left, once the port is settled at 115200. Sending the
-    fix rate is gated on THAT reply agreeing, not on anything reported by
-    the candidate sends.
+    Order is load-bearing, same as gnss-set-baud before it: both candidate
+    sends happen unconditionally, then the fix rate is sent only once the
+    CFG-PRT readback confirms 115200.
     """
+    speed = nmea_wrap(PCAS01.build(cmd=BAUD_CODE[INIT_BAUD]))
     for candidate in INIT_CANDIDATES:
         if time.monotonic() > deadline:
             return
         port.set_baud(candidate)
-        blind = Session(port, allow_apply=True, timeout=0, observe=0)
-        blind.apply(SetBaud(INIT_BAUD), force=True)
+        port.write(speed)
 
     if time.monotonic() > deadline:
         return
     port.set_baud(INIT_BAUD)
+    # The one read in this sequence. It goes through Session.get -- unlike
+    # the sends above, a read is exactly what Session is for, and _exchange
+    # is already one of the permitted write sites (the empty-payload Get it
+    # sends is not a caller-chosen frame; see Session's own docstring).
     readback = Session(port, allow_apply=False,
                        timeout=min(INIT_CONFIRM_TIMEOUT,
                                   max(0.0, deadline - time.monotonic())))
@@ -2089,11 +2099,7 @@ def _init_sequence(port, deadline):
 
     if time.monotonic() > deadline:
         return
-    rate = Session(port, allow_apply=True,
-                   timeout=min(INIT_CONFIRM_TIMEOUT,
-                              max(0.0, deadline - time.monotonic())),
-                   observe=0)
-    rate.apply(SetRate(INIT_INTERVAL_MS), force=True)
+    port.write(nmea_wrap(PCAS02.build(interval=INIT_INTERVAL_MS)))
 
 
 def cmd_init(args):
@@ -3457,6 +3463,16 @@ _PRT_AT_WRONG_BAUD = CASIC.encode(*CFG_PRT.key,
                                   CFG_PRT.build(portID=1, protoMask=0x07,
                                                mode=0x08C0, baudRate=9600))
 
+# The three frames _init_sequence's own checks below assert an exact order
+# for. Built from the same declared tables init itself uses (PCAS01/PCAS02/
+# CFG_PRT), not restated as separate literals, so a change to the wire
+# encoding cannot drift the fixture and the assertion apart. Baud/interval
+# are literal (not INIT_BAUD/INIT_INTERVAL_MS) for the same import-time
+# reason as the readbacks above.
+_INIT_SPEED = nmea_wrap(PCAS01.build(cmd=BAUD_CODE[115200]))
+_INIT_RATE = nmea_wrap(PCAS02.build(interval=200))
+_INIT_CFG_PRT_POLL = CASIC.encode(*CFG_PRT.key)
+
 _INIT_WRITES_CACHE = {}
 
 
@@ -3464,11 +3480,10 @@ def _init_writes(reply=b"", deadline=None):
     """port.writes after one _init_sequence run against a fresh _FakePort
     that answers every read with `reply` (default: silence).
 
-    Memoized per (reply, deadline): apply()'s PROBE_SPACING sleep (0.25 s,
-    real wall clock, not shortened by any test window -- see its own module
-    comment) makes one full _init_sequence run genuinely slow, and several
-    checks below ask different questions about the same run rather than
-    each driving their own.
+    Memoized per (reply, deadline): several checks below ask different
+    questions about the same run (the exact write sequence for a given
+    reply) rather than each driving their own, and the CFG-PRT readback's
+    own read window is real wall-clock time even against a fake port.
     """
     key = (reply, deadline)
     if key not in _INIT_WRITES_CACHE:
@@ -3792,9 +3807,23 @@ def selftest():
     # Asserted off the syntax tree rather than off a list of forbidden method
     # names: the property is "only these functions transmit", and a name
     # blacklist is satisfied by anything called something else.
+    #
+    # _init_sequence is the sixth entry, added by deliberate human ruling,
+    # not drift: init needs a primitive blind send at two candidate speeds
+    # followed by one deliberate readback, and routing that through
+    # Session.apply() (the general path everything else here transmits
+    # through) cost four extra frames -- an unwanted CFG-RATE probe and
+    # CFG-PRT confirm on every apply(SetBaud(...)) call -- and put a
+    # boot-path fix-rate change under apply()'s bandwidth guard evaluating
+    # an unobservable sky at 99.2% of capacity, 0.8% of margin from
+    # silently declining to raise the rate with no diagnosable symptom.
+    # _init_sequence's own CFG-PRT readback already establishes the
+    # condition that makes that rate safe, so the guard was redundant here,
+    # not merely inconvenient. Keep this set exact -- six named functions,
+    # not a prefix rule or a blanket exemption for "boot path" code.
     check("only the declared transmit paths can reach the wire",
-          lambda: _write_sites() == {"write", "poll", "apply",
-                                     "_exchange", "_probe_binary"})
+          lambda: _write_sites() == {"write", "poll", "apply", "_exchange",
+                                     "_probe_binary", "_init_sequence"})
     check("Session.poll takes only an index",
           lambda: Session.poll.__code__.co_varnames[:2] == ("self", "n"))
     check("no binary poll carries a payload",
@@ -4268,20 +4297,20 @@ def selftest():
     print("boot-path init (replaces gnss-set-baud):")
     check("init always reports success, whatever happened",
           lambda: cmd_init(_init_args(device="/nonexistent")) == 0)
-    check("init sends the speed at both candidate rates",
-          lambda: [w for w in _init_writes()
-                   if w == SetBaud(INIT_BAUD).sentences()[0]]
-                  == [SetBaud(INIT_BAUD).sentences()[0]] * 2)
-    check("init does not send the fix rate until the speed is proven",
-          lambda: SetRate(INIT_INTERVAL_MS).sentences()[0]
-                  not in _init_writes())
-    check("init sends the fix rate once the speed is proven",
-          lambda: SetRate(INIT_INTERVAL_MS).sentences()[0]
-                  in _init_writes(reply=_PRT_AT_INIT_BAUD))
+    check("unproven: exactly 3 frames, in order -- speed @9600, speed "
+          "@115200, one CFG-PRT readback, and no fix rate",
+          lambda: _init_writes() == [_INIT_SPEED, _INIT_SPEED,
+                                     _INIT_CFG_PRT_POLL])
+    check("proven: the readback confirming 115200 adds exactly one more "
+          "frame, in order -- the fix rate, and nothing after it",
+          lambda: _init_writes(reply=_PRT_AT_INIT_BAUD)
+                  == [_INIT_SPEED, _INIT_SPEED, _INIT_CFG_PRT_POLL,
+                     _INIT_RATE])
     check("a CFG-PRT reply at the wrong baud also withholds the fix rate -- "
-          "the readback has to agree, not merely answer",
-          lambda: SetRate(INIT_INTERVAL_MS).sentences()[0]
-                  not in _init_writes(reply=_PRT_AT_WRONG_BAUD))
+          "the readback has to agree, not merely answer -- same 3-frame "
+          "shape as no reply at all",
+          lambda: _init_writes(reply=_PRT_AT_WRONG_BAUD)
+                  == [_INIT_SPEED, _INIT_SPEED, _INIT_CFG_PRT_POLL])
     check("init honours its overall deadline: one already expired sends "
           "nothing",
           lambda: _init_writes(deadline=time.monotonic() - 1.0) == [])
