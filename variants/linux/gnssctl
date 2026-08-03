@@ -9,6 +9,7 @@
 Protocol source: Quectel L76K GNSS Protocol Specification V1.1. Section marks
 (§) throughout this file refer to it.
 """
+import math
 import struct
 import sys
 
@@ -766,6 +767,111 @@ CONSTELLATION_MODE = {v: k for k, v in MODE_CONSTELLATION.items()}
 
 RESTART_FLAG = {"hot": 0, "warm": 1, "cold": 2, "factory": 3}   # §2.3.5
 
+# Satellites in view per GSV talker at the theoretical ceiling. Sizes from
+# §5 Table 16 (GPS 1-32 plus QZSS 193-197 on the same GP talker, GLONASS 65-88,
+# BeiDou 1-63), each clamped to GSV's documented <TotalNumSat> maximum of 32
+# (§2.2.3). This is a ceiling, not a forecast -- see budget() for why that
+# distinction has to be built in rather than assumed away.
+TALKER_CEILING = {"GP": 32, "GL": 24, "BD": 32}
+
+_TALKER = {"GPS": "GP", "GLO": "GL", "BDS": "BD"}
+
+
+def capacity(baud):
+    """Bytes per second the link can carry.
+
+    8N1 framing is 1 start + 8 data + 1 stop = 10 bits per byte, so this is
+    exact rather than an estimate.
+    """
+    return baud / 10.0
+
+
+def talkers_for(constellations):
+    """Which GSV/GSA talker IDs a constellation set produces (§2.2 Table 2).
+
+    QZSS shares the GP talker with GPS and is always enabled (§1 note 1), so it
+    adds no talker of its own.
+    """
+    return tuple(_TALKER[c] for c in ("GPS", "GLO", "BDS") if c in constellations)
+
+
+def epoch_bytes(rates, sats, talkers):
+    """Worst-case bytes emitted per position fix.
+
+    GSV emits ceil(sats/4) sentences per talker (§2.2.3); GSA emits one per
+    constellation, each carrying its own <SystemID> (§2.2.4). Everything else is
+    one sentence per fix. A rate of N means once every N fixes (§2.3.3).
+    """
+    total = 0.0
+    for name, rate in rates.items():
+        if not rate:
+            continue
+        sentence = STANDARD_SENTENCES[name]
+        if name == "GSV":
+            per_fix = sum(math.ceil(sats.get(t, 0) / 4.0)
+                          for t in talkers) * sentence.max_width()
+        elif name == "GSA":
+            per_fix = len(talkers) * sentence.max_width()
+        else:
+            per_fix = sentence.max_width()
+        total += per_fix / float(rate)
+    return total
+
+
+class Budget:
+    def __init__(self, rates, baud, hz, now_bps, ceiling_bps):
+        self.rates = rates
+        self.baud = baud
+        self.hz = hz
+        self.now_bps = now_bps
+        self.ceiling_bps = ceiling_bps
+        self.capacity_bps = capacity(baud)
+
+    @property
+    def now_pct(self):
+        return 100.0 * self.now_bps / self.capacity_bps
+
+    @property
+    def ceiling_pct(self):
+        return 100.0 * self.ceiling_bps / self.capacity_bps
+
+    @property
+    def ok(self):
+        """False means physically impossible at the current sky -- a hard error."""
+        return self.now_bps <= self.capacity_bps
+
+    @property
+    def warn(self):
+        """True means no headroom if every enabled constellation fills the sky."""
+        return self.ceiling_bps > self.capacity_bps
+
+    def render(self):
+        on = ", ".join("%s@%d" % (k, v) for k, v in sorted(self.rates.items()) if v)
+        return "\n".join((
+            "  bandwidth check (8N1, 10 bits/byte):",
+            "    link capacity         %6d baud -> %7.0f B/s" % (
+                self.baud, self.capacity_bps),
+            "    %-22s %5.1f Hz -> %7.0f B/s  %6.1f%%  (sky now)" % (
+                on or "nothing enabled", self.hz, self.now_bps, self.now_pct),
+            "    %-22s %5s    -> %7.0f B/s  %6.1f%%  (ceiling)" % (
+                "all constellations", "", self.ceiling_bps, self.ceiling_pct),
+        ))
+
+
+def budget(rates, baud, hz, sats_now, constellations):
+    """Two operating points, because one number cannot do both jobs.
+
+    At the ceiling the vendor's own factory default -- all eight sentences,
+    1 Hz, 9600 baud (§6 Appendix C) -- computes to 238% and would be refused. At
+    a realistic sky it is 95.6%, which both passes and explains why the vendor
+    ships 1 Hz rather than faster. So "sky now" is the hard error and the
+    ceiling is the headroom warning.
+    """
+    talkers = talkers_for(constellations)
+    now = epoch_bytes(rates, sats_now, talkers) * hz
+    ceiling = epoch_bytes(rates, TALKER_CEILING, talkers) * hz
+    return Budget(rates, baud, hz, now, ceiling)
+
 
 def check(name, fn):
     """Record one assertion.
@@ -1021,6 +1127,48 @@ def selftest():
           lambda: sorted(BAUD_CODE) == [4800, 9600, 19200, 38400, 57600, 115200])
     check("restart flags cover the four documented modes (§2.3.5)",
           lambda: sorted(RESTART_FLAG) == ["cold", "factory", "hot", "warm"])
+
+    print("")
+    print("bandwidth model (derived, not measured):")
+    _T3 = frozenset(("GPS", "BDS", "GLO"))
+    _ALL8 = dict.fromkeys(("RMC", "GGA", "GSV", "GSA", "VTG", "GLL", "TXT", "ZDA"), 1)
+    _SKY = {"GP": 6, "GL": 4, "BD": 4}
+    check("8N1 capacity is baud/10 bytes per second",
+          lambda: capacity(115200) == 11520.0 and capacity(9600) == 960.0)
+    check("the ceiling is Table 16 clamped by GSV's 32-satellite maximum",
+          lambda: TALKER_CEILING == {"GP": 32, "GL": 24, "BD": 32})
+    check("the factory default passes at a real sky (design table: 95.6%)",
+          lambda: (lambda b: b.ok and 94.0 < b.now_pct < 97.0)(
+              budget(_ALL8, 9600, 1, _SKY, _T3)))
+    check("the factory default warns at the ceiling (design table: 238%)",
+          lambda: (lambda b: b.warn and 236.0 < b.ceiling_pct < 240.0)(
+              budget(_ALL8, 9600, 1, _SKY, _T3)))
+    check("pimesh's configuration passes clean (design table: 23.6% / 83.0%)",
+          lambda: (lambda b: b.ok and not b.warn
+                   and 22.0 < b.now_pct < 25.0 and 81.5 < b.ceiling_pct < 84.5)(
+              budget({"GSA": 1, "GSV": 1}, 115200, 5, _SKY, _T3)))
+    check("5 Hz at 9600 is refused (design table: 283%)",
+          lambda: (lambda b: not b.ok and 281.0 < b.now_pct < 285.0)(
+              budget({"GSA": 1, "GSV": 1}, 9600, 5, _SKY, _T3)))
+    # 99.2% at the ceiling: it fits, but with nothing to spare. The check pins
+    # both that it passes and that it is inside the last percent, because a
+    # width error in GSV or GSA would push it over and change the verdict.
+    check("all eight at 5 Hz on 115200 passes (design table: 39.8% / 99.2%)",
+          lambda: (lambda b: b.ok and 38.5 < b.now_pct < 41.0
+                   and 98.0 < b.ceiling_pct < 100.0)(
+              budget(_ALL8, 115200, 5, _SKY, _T3)))
+    check("a rate divisor reduces demand proportionally",
+          lambda: budget({"GSV": 5}, 115200, 5, _SKY, _T3).now_bps
+                  < budget({"GSV": 1}, 115200, 5, _SKY, _T3).now_bps / 4)
+    check("rate 0 costs nothing",
+          lambda: budget({"GSV": 0}, 9600, 5, _SKY, _T3).now_bps == 0.0)
+    check("dropping a constellation drops its GSV and GSA sentences",
+          lambda: budget({"GSA": 1, "GSV": 1}, 115200, 5, _SKY,
+                         frozenset(("GPS",))).now_bps
+                  < budget({"GSA": 1, "GSV": 1}, 115200, 5, _SKY, _T3).now_bps)
+    check("the report shows its arithmetic",
+          lambda: all(t in budget(_ALL8, 9600, 1, _SKY, _T3).render()
+                      for t in ("9600", "B/s", "%", "ceiling")))
 
     print("")
     if _FAILS:
