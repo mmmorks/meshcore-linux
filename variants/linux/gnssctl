@@ -1209,6 +1209,522 @@ def port_holder(path):
     return names or None
 
 
+# Pause between writes. driver_allystar.c:1800 warns that "some parts get
+# cranky when they get too many configuration changes at once" and spaces its
+# own polls four parse cycles apart. Rushing risks reading a chip that has
+# fallen behind as "unsupported", which poisons every result at once.
+PROBE_SPACING = 0.25
+PROBE_TIMEOUT = 1.5
+
+# How long apply() watches the wire before it decides whether a change fits.
+# One second is not enough at 1 Hz to see a whole epoch of GSV.
+OBSERVE_SECONDS = 1.5
+
+# Bytes of each read window kept as evidence. Enough to show several frames and
+# a few sentences without hauling the whole stream around.
+RAW_WINDOW = 256
+
+
+class Change:
+    """One documented configuration change.
+
+    Subclasses are the ONLY things Session.apply accepts. There is deliberately
+    no way to express a frame outside this set -- that is what keeps "gnssctl
+    probe cannot write" a structural fact rather than a promise.
+
+    Validation lives in __init__ rather than in Sentence.build(): build() is a
+    thin trusted internal API driven by the spec's field table, and this is the
+    layer that accepts input from a person. If a range is not enforced here,
+    nothing else stops a malformed command reaching the receiver.
+    """
+
+    needs_yes = False
+
+    def describe(self):
+        raise NotImplementedError
+
+    def sentences(self):
+        raise NotImplementedError
+
+    def confirm(self, session):
+        """(ok, detail) -- read the setting back and say whether it took.
+
+        ok is None for "cannot tell from here", which is a third answer and not
+        a failure: reporting an unreadable setting as applied would be a claim
+        this tool cannot support.
+        """
+        return None, "no readback available"
+
+    def projected(self, session, obs):
+        """(rates, baud, hz, constellations) after this change, for the budget.
+
+        None means this change cannot alter what the link has to carry, so
+        there is nothing to weigh.
+        """
+        return None
+
+
+class SetBaud(Change):
+    def __init__(self, baud):
+        if baud not in BAUD_CODE:
+            raise ValueError("baud must be one of %s (§2.3.1)"
+                             % ", ".join(str(b) for b in sorted(BAUD_CODE)))
+        self.baud = baud
+
+    def describe(self):
+        return "port speed -> %d" % self.baud
+
+    def sentences(self):
+        return [nmea_wrap(PCAS01.build(cmd=BAUD_CODE[self.baud]))]
+
+    def confirm(self, session):
+        # Re-clock the port and read CFG-PRT *there*: "the receiver moved" and
+        # "we followed it" are separate claims and both need establishing.
+        session.port.set_baud(self.baud)
+        got = session.get(CFG_PRT)
+        if got is None:
+            return False, "no CFG-PRT reply at %d" % self.baud
+        return got["baudRate"] == self.baud, "CFG-PRT reads %d" % got["baudRate"]
+
+    def projected(self, session, obs):
+        # A speed change moves the denominator, not the load, and dropping to
+        # 9600 with GSV at 5 Hz is exactly the way to make a node mute. The
+        # budget is the only thing that catches that, so it runs here too --
+        # at the NEW speed, against the traffic already on the wire.
+        return (session.current_rates(obs), self.baud,
+                session.current_hz(), obs.constellations)
+
+
+# §2.3.2 and §3.2.2.4 Table 13. The only navigation intervals the spec lists.
+NAV_INTERVALS = (200, 500, 1000)
+
+
+class SetRate(Change):
+    def __init__(self, interval_ms):
+        if interval_ms not in NAV_INTERVALS:
+            raise ValueError("interval must be %s ms (§2.3.2, §3.2.2.4 Table 13)"
+                             % " or ".join(str(i) for i in NAV_INTERVALS))
+        self.interval = interval_ms
+
+    def describe(self):
+        return "fix interval -> %d ms (%.3g Hz)" % (self.interval,
+                                                    1000.0 / self.interval)
+
+    def sentences(self):
+        return [nmea_wrap(PCAS02.build(interval=self.interval))]
+
+    def confirm(self, session):
+        got = session.get(CFG_RATE)
+        if got is None:
+            return None, "CFG-RATE did not answer"
+        return got["interval"] == self.interval, ("CFG-RATE reads %d ms"
+                                                  % got["interval"])
+
+    def projected(self, session, obs):
+        return (session.current_rates(obs), session.port.baud,
+                1000.0 / self.interval, obs.constellations)
+
+
+# Which sentences $PCAS03 can address, read off the command's own field table
+# (§2.3.3) rather than restated: the rate fields are exactly the ones built by
+# OptInt, and a separately maintained list would drift into accepting a name
+# build() then refuses. TXT is a standard sentence and is NOT one of them --
+# the antenna status arrives as a $GPTXT (§2.2.7) but is configured under
+# <nANT>, so a validator checking STANDARD_SENTENCES would accept "TXT" and
+# fail two lines later.
+PCAS03_FIELD = {f.name[1:]: f for f in PCAS03.parts
+                if isinstance(f, F) and f.codec.name == "OptInt"}
+
+
+class SetSentences(Change):
+    def __init__(self, rates):
+        for name, rate in rates.items():
+            field = PCAS03_FIELD.get(name)
+            if field is None:
+                raise ValueError("$PCAS03 cannot address %s; it sets %s (§2.3.3)"
+                                 % (name, ", ".join(sorted(PCAS03_FIELD))))
+            # Bounds come from the field's own codec, so the range is stated
+            # once, where the field is declared.
+            lo, hi = field.codec.lo, field.codec.hi
+            if not isinstance(rate, int) or not lo <= rate <= hi:
+                raise ValueError("%s: rate must be %d-%d (§2.3.3)" % (name, lo, hi))
+        self.rates = dict(rates)
+
+    def describe(self):
+        return "sentence rates -> " + ", ".join(
+            "%s=%d" % kv for kv in sorted(self.rates.items()))
+
+    def sentences(self):
+        kw = {PCAS03_FIELD[k].name: v for k, v in self.rates.items()}
+        return [nmea_wrap(PCAS03.build(**kw))]
+
+    def projected(self, session, obs):
+        rates = session.current_rates(obs)
+        # Only what the width model can price enters the budget. ANT has no
+        # sentence table of its own, so its cost is whatever $GPTXT already
+        # costs and is counted there or not at all.
+        rates.update({k: v for k, v in self.rates.items()
+                      if k in STANDARD_SENTENCES})
+        return rates, session.port.baud, session.current_hz(), obs.constellations
+
+
+class SetConstellation(Change):
+    def __init__(self, constellations):
+        key = frozenset(constellations)
+        if key not in CONSTELLATION_MODE:
+            raise ValueError("no such combination (§2.3.4 lists seven; there is "
+                             "no Galileo mode)")
+        self.constellations = key
+
+    def describe(self):
+        return "constellations -> %s (QZSS always on)" % "+".join(
+            sorted(self.constellations))
+
+    def sentences(self):
+        return [nmea_wrap(PCAS04.build(
+            mode=CONSTELLATION_MODE[self.constellations]))]
+
+    def projected(self, session, obs):
+        return (session.current_rates(obs), session.port.baud,
+                session.current_hz(), self.constellations)
+
+
+class Restart(Change):
+    def __init__(self, kind, bbr_mask=None):
+        if kind not in RESTART_FLAG:
+            raise ValueError("restart must be one of %s (§2.3.5)"
+                             % ", ".join(sorted(RESTART_FLAG)))
+        self.kind = kind
+        # $PCAS10 carries no mask; CFG-RST's <navBbrMask> (§3.2.2.3 Table 12) is
+        # where a partial clear would go, and this carries the caller's choice
+        # for it.
+        self.bbr_mask = bbr_mask
+        # A cold start discards the almanac and costs minutes of reacquisition;
+        # a factory reset additionally returns the constellation set to the
+        # Appendix C default of GPS + BeiDou. Nothing in this repository
+        # re-applies GLONASS, so that would silently drop a constellation.
+        self.needs_yes = kind in ("cold", "factory")
+
+    def describe(self):
+        return "%s restart" % self.kind
+
+    def sentences(self):
+        return [nmea_wrap(PCAS10.build(flag=RESTART_FLAG[self.kind]))]
+
+
+CHANGES = (SetBaud, SetRate, SetSentences, SetConstellation, Restart)
+
+
+class Poll:
+    __slots__ = ("label", "kind", "cls", "mid", "payload", "why")
+
+    def __init__(self, label, kind, cls, mid, payload, why):
+        self.label = label
+        self.kind = kind
+        self.cls = cls
+        self.mid = mid
+        self.payload = payload
+        self.why = why
+
+
+# The frozen poll table. An empty payload IS the Get convention (§3.1), and
+# every binary entry here has one -- but the table is explicit rather than a
+# length check, because the reverse rule would not be safe: the per-port CFG-PRT
+# poll legitimately carries a one-byte port ID in gpsd's Allystar driver, so
+# "empty means harmless" is not a property of the protocol.
+POLLS = (
+    Poll("CFG-PRT", "bin", 0x06, 0x00, b"", "port ID, framing and baud readback"),
+    Poll("CFG-RATE", "bin", 0x06, 0x04, b"", "navigation interval"),
+    Poll("CFG-MSG", "bin", 0x06, 0x01, b"", "message rates"),
+    Poll("$PCAS06", "nmea", None, None, "PCAS06,0",
+         "version, over the NMEA path that works"),
+    Poll("MON-VER", "bin", 0x0A, 0x04, b"", "chip and firmware -- expect NAK"),
+    Poll("CFG-NAVSAT", "bin", 0x06, 0x0C, b"", "constellation mask -- expect NAK"),
+    Poll("CFG-PPS", "bin", 0x06, 0x07, b"", "pulse period and polarity"),
+    Poll("CFG-SBAS", "bin", 0x06, 0x0E, b"", "SBAS PRNs -- expect NAK"),
+)
+
+
+class ProbeResult:
+    def __init__(self, poll, outcome, detail=None, raw=None,
+                 answered_in=None, window=b"", window_total=0, seen=None):
+        self.poll = poll
+        self.outcome = outcome        # ack | nak | reply | silence
+        self.detail = detail
+        self.raw = raw
+        # Which framing the answer actually arrived in. Usually the one we
+        # asked in; if it differs, that is a major finding, not a footnote.
+        self.answered_in = answered_in
+        # Bytes seen during the probe window. Without this a "silence" verdict
+        # is unfalsifiable: on a wire that is never quiet, "no matching frame"
+        # and "nothing arrived" are completely different claims and only one
+        # of them supports concluding the message is unsupported.
+        self.window = window
+        self.window_total = window_total
+        # Tally of EVERY frame the scanners decoded in this window, across all
+        # framings, matching or not. The raw window is capped at RAW_WINDOW
+        # bytes and so is only a sample; this covers the whole window. It is
+        # what makes "no answer" checkable -- specifically, whether any ACK or
+        # NAK appeared at all, rather than only one naming the polled message.
+        self.seen = seen or {}
+
+
+class Verdict:
+    def __init__(self, status, detail, budget=None):
+        self.status = status          # ok | nak | unconfirmed | refused
+        self.detail = detail
+        self.budget = budget
+
+    def __str__(self):
+        return "%-12s %s" % (self.status.upper(), self.detail)
+
+
+class Session:
+    """The only transmit paths in this file.
+
+    poll(n) indexes a frozen table. apply(change) takes an instance of a closed
+    set of Change classes. There is no method that accepts a class, id and
+    payload from a caller -- get() takes a declared Message and sends the empty
+    payload that §3.1 defines as a query, so even the read path has nothing for
+    a caller to fill in. That is what makes `probe` read-only by construction
+    rather than by convention, and why --selftest can assert it.
+    """
+
+    def __init__(self, port, allow_apply=False):
+        self.port = port
+        self.allow_apply = allow_apply
+        self.framing = CASIC
+        # Scan for EVERY framing, not just the one being asked in. A chip with
+        # one command parser and one output formatter may well answer a foreign
+        # request in its own dialect, and a single-framing scanner would score
+        # that as silence -- turning "it answered, just not how we expected"
+        # into "it does not support this", which is the opposite conclusion.
+        self.scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS}
+        self.nmea = NmeaCollector()
+        self._window = b""
+        self._window_total = 0
+
+    # -- reads ------------------------------------------------------------
+    def observe(self, seconds):
+        """Watch the wire without transmitting."""
+        return listen(self.port, seconds)
+
+    def get(self, message):
+        """Send an empty-payload Get and return the parsed reply, or None."""
+        frame = self._exchange(message)
+        if frame is None or frame.key != message.key:
+            return None
+        try:
+            return message.parse(frame.payload)
+        except ValueError:
+            # Message.parse refuses a short payload rather than guessing at the
+            # missing fields; a reply we cannot read is not a reading.
+            return None
+
+    def current_rates(self, obs):
+        """Sentence rates inferred from what is actually arriving.
+
+        Labelled "observed" wherever it is printed: CFG-MSG's Get returns one
+        message's rate, not the whole set, so the full picture can only come
+        from counting the wire. Reporting an inference as a readback is the
+        same trap the README records about measuring gpsd's synthesized NMEA.
+        """
+        epochs = max(1, max((n for n in obs.nmea_counts.values()), default=1))
+        rates = {}
+        for tag, count in obs.nmea_counts.items():
+            name = tag[2:] if len(tag) == 5 and not tag.startswith("P") else tag
+            if name in STANDARD_SENTENCES and count:
+                rates[name] = max(1, int(round(float(epochs) / count)))
+        return rates
+
+    def current_hz(self):
+        """Fix rate, read back from CFG-RATE.
+
+        When the readback fails this assumes the FASTEST documented rate rather
+        than the 1 Hz factory default. The number feeds the bandwidth guard, and
+        the two ways of being wrong are not symmetric: over-stating the rate
+        costs a refusal the operator can override with --force, while
+        under-stating it waves through exactly the change the guard exists to
+        catch. A node already running at 5 Hz is the normal case here.
+        """
+        got = self.get(CFG_RATE)
+        if got and got.get("interval"):
+            return 1000.0 / got["interval"]
+        return 1000.0 / min(NAV_INTERVALS)
+
+    def poll(self, n):
+        """Send POLLS[n]. Takes an index, never a message."""
+        p = POLLS[n]
+        if p.kind == "nmea":
+            # Drain first rather than slicing from a mark: NmeaCollector caps
+            # how many lines it retains, and by this point earlier polls' read
+            # windows have already filled it. Slicing would silently see
+            # nothing.
+            self.port.flush_input()
+            self.nmea.take_lines()
+            self.port.write(nmea_wrap(p.payload))
+            self._read_window(PROBE_TIMEOUT)
+            # A reply is any sentence that is not routine positioning data --
+            # and routine positioning data is exactly what $PCAS03 meters, so
+            # the set comes from that command's field table rather than from a
+            # hand-kept list. STANDARD_SENTENCES would be the wrong set: it
+            # contains TXT, and $GPTXT is precisely what $PCAS06 answers with.
+            new = [ln for ln in self.nmea.take_lines()
+                   if ln[3:6] not in PCAS03_FIELD]
+            if new:
+                return ProbeResult(p, "reply", {"sentences": new[:4]},
+                                   answered_in="nmea", window=self._window,
+                                   window_total=self._window_total)
+            return ProbeResult(p, "silence", window=self._window,
+                               window_total=self._window_total)
+        return self._probe_binary(p)
+
+    # -- writes -----------------------------------------------------------
+    def apply(self, change, force=False, yes=False):
+        if not self.allow_apply:
+            raise PermissionError(
+                "this session is read-only; apply() is not available")
+        if not isinstance(change, Change):
+            raise TypeError("apply() takes a Change, not %r" % (change,))
+        if change.needs_yes and not yes:
+            return Verdict("refused", "%s needs --yes" % change.describe())
+
+        # The budget needs to know what the sky looks like right now, so this
+        # reads before it writes -- and refuses before it writes, because a
+        # guard that runs after the write is not a guard. A change that cannot
+        # alter what the link carries returns no projection and skips it.
+        #
+        # projected() may itself poll (current_hz reads CFG-RATE back), so a Get
+        # can reach the receiver before the refusal. A Get is not a change:
+        # what the guard stands in front of is change.sentences(), and none of
+        # those is written until the budget has passed or been overridden.
+        bud = None
+        obs = self.observe(OBSERVE_SECONDS)
+        projection = change.projected(self, obs)
+        if projection is not None:
+            rates, baud, hz, constellations = projection
+            bud = budget(rates, baud, hz, obs.sats_in_view, constellations)
+            if not bud.ok and not force:
+                return Verdict(
+                    "refused",
+                    "%s: %.0f%% of the link -- the stream would never drain. "
+                    "Cut the load or raise the speed first, or --force." % (
+                        change.describe(), bud.now_pct),
+                    bud)
+
+        for sentence in change.sentences():
+            self.port.write(sentence)
+            time.sleep(PROBE_SPACING)
+
+        ok, detail = change.confirm(self)
+        if ok is None:
+            return Verdict("unconfirmed", "%s; %s" % (change.describe(), detail),
+                           bud)
+        return Verdict("ok" if ok else "nak",
+                       "%s; %s" % (change.describe(), detail), bud)
+
+    # -- wire -------------------------------------------------------------
+    def _read_window(self, timeout):
+        """Read until `timeout`, returning every frame decoded in that window.
+
+        Also records the window's bytes and their count, so a "silence" result
+        carries its own evidence. Reads in short slices so the timeout is
+        honoured reasonably tightly rather than to the nearest whole read.
+        """
+        end = time.monotonic() + timeout
+        seen = []
+        raw = bytearray()
+        total = 0
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            data = self.port.read(min(0.2, max(0.02, left)))
+            if not data:
+                continue
+            total += len(data)
+            if len(raw) < RAW_WINDOW:
+                raw.extend(data[:RAW_WINDOW - len(raw)])
+            self.nmea.feed(data)
+            for sc in self.scanners.values():
+                sc.feed(data)
+                seen.extend(sc.take())
+        self._window = bytes(raw)
+        self._window_total = total
+        return seen
+
+    def _exchange(self, message):
+        """Write one empty-payload Get and return the first matching frame.
+
+        Takes a declared Message rather than a class, id and payload: the empty
+        payload is the whole of the Get convention (§3.1), so there is nothing
+        for a caller to supply -- and therefore no way through here to put bytes
+        of their choosing on the wire.
+        """
+        self.port.flush_input()
+        for sc in self.scanners.values():
+            sc.take()
+        self.port.write(self.framing.encode(message.cls, message.mid, b""))
+        for frame in self._read_window(PROBE_TIMEOUT):
+            if frame.key == message.key:
+                return frame
+            if (frame.key == ACK_NACK.key
+                    and frame.payload[:2] == bytes(message.key)):
+                return None
+        return None
+
+    def _probe_binary(self, p):
+        self.port.flush_input()
+        for sc in self.scanners.values():
+            sc.take()
+
+        def classify(fr):
+            if fr.key == (p.cls, p.mid):
+                return "reply"
+            if (fr.key in (ACK_ACK.key, ACK_NACK.key) and len(fr.payload) >= 2
+                    and (fr.payload[0], fr.payload[1]) == (p.cls, p.mid)):
+                return "ack" if fr.key == ACK_ACK.key else "nak"
+            return None
+
+        self.port.write(self.framing.encode(p.cls, p.mid, p.payload))
+        frames = self._read_window(PROBE_TIMEOUT)
+
+        tally = {}
+        for fr in frames:
+            k = "%s %02x-%02x" % (fr.framing, fr.cls, fr.mid)
+            tally[k] = tally.get(k, 0) + 1
+
+        for fr in frames:
+            kind = classify(fr)
+            if kind is None:
+                continue
+            return ProbeResult(p, kind,
+                               self._decode(fr) if kind == "reply" else None,
+                               fr.payload, answered_in=fr.framing,
+                               window=self._window,
+                               window_total=self._window_total, seen=tally)
+        return ProbeResult(p, "silence", window=self._window,
+                           window_total=self._window_total, seen=tally)
+
+    @staticmethod
+    def _decode(frame):
+        """Field detail for a reply, when its message is declared.
+
+        Looked up in the message table rather than dispatched on the poll's
+        label, so a poll for a message this file does not describe reports the
+        raw payload instead of nothing at all.
+        """
+        message = CASIC_MESSAGES.get(frame.key)
+        if message is None:
+            return None
+        try:
+            return message.describe(frame.payload)
+        except ValueError:
+            # Short payload: parse refuses rather than guessing, and an
+            # undecodable reply is still a reply worth reporting as one.
+            return None
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -1228,12 +1744,91 @@ def check(name, fn):
         _FAILS.append(name)
 
 
-def _raises(fn):
+def _raises(fn, expect=Exception):
+    """True if fn() raised `expect`.
+
+    NameError and AttributeError are re-raised rather than swallowed: those mean
+    the check itself is broken -- a renamed or missing symbol -- and a safety
+    assertion that passes because its subject vanished is worse than no
+    assertion at all. Several of the checks below use this to assert that a
+    write is refused.
+    """
     try:
         fn()
-    except Exception:
+    except (NameError, AttributeError):
+        raise
+    except expect:
         return True
     return False
+
+
+def _methods(cls):
+    """Every Python-level function reachable on `cls`, for structural checks.
+
+    Includes the private ones on purpose: "there is no third transmit path" is a
+    claim about the whole class, and a helper taking a caller-supplied payload
+    would break it just as thoroughly as a public send().
+    """
+    out = []
+    for name in dir(cls):
+        attr = getattr(cls, name)
+        if hasattr(attr, "__code__"):
+            out.append(attr)
+    return out
+
+
+class _FakePort:
+    """A quiet port that records what was written to it. Not hardware.
+
+    Enough of Port's surface for the checks that exercise apply()'s ordering:
+    what matters there is what reaches write(), and for a refusal that nothing
+    does. read() sleeps rather than returning immediately, because a real port
+    blocks and a busy spin would burn a core for the length of every window.
+    """
+
+    def __init__(self, baud=9600, data=b""):
+        self.baud = baud
+        self.writes = []
+        self._data = data
+
+    def read(self, timeout):
+        if self._data:
+            out, self._data = self._data, b""
+            return out
+        time.sleep(timeout)
+        return b""
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def flush_input(self):
+        pass
+
+    def set_baud(self, baud):
+        self.baud = baud
+
+
+def _apply_on_quiet_port(change, **kw):
+    """(port, verdict) for one apply() against a port showing one epoch of sky.
+
+    Twelve GPS satellites and a GSA at 9600 baud: enough for the budget to have
+    a real "sky now" to work from, so a refusal is the bandwidth model refusing
+    rather than an empty observation defaulting to zero.
+    """
+    port = _FakePort(9600, nmea_wrap("GPGSV,1,1,12,02,49,123,43,0")
+                     + nmea_wrap("GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1"))
+    return port, Session(port, allow_apply=True).apply(change, **kw)
+
+
+def _poll_on_quiet_port(n, data):
+    """(port, result) for one poll against a port that answers once, then quiets.
+
+    On a read-only session, which is where a poll belongs. Costs a whole
+    PROBE_TIMEOUT of wall clock: the read window runs its course rather than
+    stopping at the first answer, so silence and an answer cost the same.
+    """
+    port = _FakePort(9600, data)
+    return port, Session(port).poll(n)
 
 
 def _scan(framing, *chunks):
@@ -1558,6 +2153,102 @@ def selftest():
           lambda: _parse_gpsd_defaults('DEVICES=""\nGPSD_OPTIONS="-n"\n') is None)
     check("every baud candidate has a termios constant",
           lambda: all(b in BAUD_CONST for b in BAUD_CANDIDATES))
+
+    print("")
+    print("session structure (the read-only guarantee):")
+    check("Session exposes no arbitrary-send method",
+          lambda: not [n for n in dir(Session)
+                       if n in ("send", "send_raw", "write", "transmit", "raw")])
+    check("no Session method accepts a caller-supplied payload",
+          lambda: [f.__name__ for f in _methods(Session)
+                   if "payload" in f.__code__.co_varnames[:f.__code__.co_argcount]]
+                  == [])
+    check("Session.poll takes only an index",
+          lambda: Session.poll.__code__.co_varnames[:2] == ("self", "n"))
+    check("no binary poll carries a payload",
+          lambda: all(p.payload == b"" for p in POLLS if p.kind == "bin"))
+    check("the only NMEA poll is a query, never a setter",
+          lambda: all(p.payload.startswith("PCAS06")
+                      for p in POLLS if p.kind == "nmea"))
+    check("every poll entry is well formed",
+          lambda: all(p.kind in ("bin", "nmea") and p.label and p.why for p in POLLS))
+    check("apply raises on a read-only session",
+          lambda: _raises(lambda: Session(None, allow_apply=False)
+                          .apply(SetRate(200)), PermissionError))
+    check("apply refuses anything that is not a declared Change",
+          lambda: _raises(lambda: Session(None, allow_apply=True)
+                          .apply(("CFG-RATE", b"\xf4\x01\x00\x00")), TypeError))
+    check("every Change subclass is reachable from the closed set",
+          lambda: set(CHANGES) == set(Change.__subclasses__())
+                  == {SetBaud, SetRate, SetSentences, SetConstellation, Restart})
+    check("a session scans every framing, not only the one it asks in",
+          lambda: set(Session(None).scanners) == {f.name for f in ALL_FRAMINGS})
+
+    print("")
+    print("change construction:")
+    check("SetBaud emits the documented $PCAS01 sentence",
+          lambda: SetBaud(115200).sentences() == [b"$PCAS01,5*19\r\n"])
+    check("SetRate emits the documented $PCAS02 sentence",
+          lambda: SetRate(200).sentences() == [b"$PCAS02,200*1D\r\n"])
+    check("SetConstellation maps GPS+BeiDou+GLONASS to mode 7",
+          lambda: SetConstellation(frozenset(("GPS", "BDS", "GLO"))).sentences()
+                  == [nmea_wrap("PCAS04,7")])
+    check("SetSentences changes only what it was given",
+          lambda: SetSentences({"GSV": 1}).sentences()
+                  == [nmea_wrap("PCAS03,,,,1,,,,,0,0,,,0,0")])
+    check("a cold restart requires --yes, a hot one does not",
+          lambda: Restart("cold").needs_yes and not Restart("hot").needs_yes)
+    check("a factory restart requires --yes",
+          lambda: Restart("factory").needs_yes)
+    check("SetBaud rejects an undocumented speed",
+          lambda: _raises(lambda: SetBaud(230400), ValueError))
+    check("SetRate rejects an interval the spec does not list (§3.2.2.4)",
+          lambda: _raises(lambda: SetRate(100), ValueError))
+    check("SetSentences rejects a rate outside 0-9 (§2.3.3)",
+          lambda: _raises(lambda: SetSentences({"GSV": 11}), ValueError))
+    # TXT is a standard sentence but $PCAS03 has no field for it -- the antenna
+    # status arrives as a $GPTXT (§2.2.7) and is configured under <nANT>. A
+    # validator listing sentence names rather than reading the command's own
+    # field table would accept it here and fail in build() instead.
+    check("SetSentences rejects a sentence $PCAS03 cannot address",
+          lambda: _raises(lambda: SetSentences({"TXT": 1}), ValueError)
+                  and _raises(lambda: SetSentences({"NOPE": 1}), ValueError))
+    check("SetConstellation rejects a combination the spec does not list (§2.3.4)",
+          lambda: _raises(lambda: SetConstellation(("GPS", "GAL")), ValueError))
+    check("Restart rejects an undocumented kind (§2.3.5)",
+          lambda: _raises(lambda: Restart("lukewarm"), ValueError))
+
+    print("")
+    print("poll (against a recording port, no hardware):")
+    # The one poll this hardware is known to answer, and its reply is a $GPTXT
+    # (§2.2.7 -- SW= is the software field, not a part number). Filtering
+    # replies against STANDARD_SENTENCES would discard it and report the
+    # working poll as silence.
+    _VER = "GPTXT,01,01,02,SW=URANUS5,V5.3.0.0"
+    _NMEA_POLL = [i for i, p in enumerate(POLLS) if p.kind == "nmea"]
+    check("there is exactly one NMEA poll", lambda: len(_NMEA_POLL) == 1)
+    check("the $PCAS06 poll collects the $GPTXT it exists to collect",
+          lambda: (lambda p, r: p.writes == [nmea_wrap("PCAS06,0")]
+                   and r.outcome == "reply"
+                   and r.detail["sentences"] == [nmea_wrap(_VER).decode().strip()])(
+              *_poll_on_quiet_port(
+                  _NMEA_POLL[0],
+                  nmea_wrap("GNRMC,071556.000,A,3149.29103,N,11706.92916,E,"
+                            "0.00,0.00,250420,,,A,V") + nmea_wrap(_VER))))
+
+    print("")
+    print("apply (against a recording port, no hardware):")
+    check("the bandwidth guard refuses before anything is written",
+          lambda: (lambda p, v: v.status == "refused" and p.writes == []
+                   and v.budget is not None and not v.budget.ok)(
+              *_apply_on_quiet_port(SetRate(200))))
+    check("a cold restart without --yes writes nothing",
+          lambda: (lambda p, v: v.status == "refused" and p.writes == [])(
+              *_apply_on_quiet_port(Restart("cold"))))
+    check("a change the budget does not object to reaches the port",
+          lambda: (lambda p, v: p.writes == [b"$PCAS10,0*1C\r\n"]
+                   and v.status == "unconfirmed")(
+              *_apply_on_quiet_port(Restart("hot"))))
 
     print("")
     if _FAILS:
