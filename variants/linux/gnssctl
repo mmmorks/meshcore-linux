@@ -3513,14 +3513,16 @@ def _open_with_baud_detection(device, forced_baud, seconds, port_factory=Port):
 def _on_interrupt(guard):
     """Restore the ServiceGuard, then exit EXIT_INTERRUPTED.
 
-    Named and factored out from where main() installs it
-    (signal.signal(SIGINT, lambda *_a: _on_interrupt(guard))) so --selftest
-    can call it directly against a fake guard and inspect what happened,
-    rather than installing a real OS signal handler (which --selftest must
-    not do -- there would be no safe way to fire it without either skipping
-    the assertion or raising SystemExit through the test harness itself).
-    Leaving gpsd stopped after a Ctrl-C would silently cost the node its
-    clock, so this runs before the exit, not after.
+    Named and factored out from where main() installs it -- for SIGTERM
+    only (signal.signal(SIGTERM, lambda *_a: _on_interrupt(guard));
+    SIGINT is deliberately left at Python's own default, see main()'s own
+    docstring) -- so --selftest can call it directly against a fake guard
+    and inspect what happened, rather than installing a real OS signal
+    handler (which --selftest must not do -- there would be no safe way to
+    fire it without either skipping the assertion or raising SystemExit
+    through the test harness itself). Leaving gpsd stopped after a SIGTERM
+    would silently cost the node its clock, so this runs before the exit,
+    not after.
     """
     guard.restore()
     sys.exit(EXIT_INTERRUPTED)
@@ -3556,6 +3558,23 @@ def main(argv, port_factory=Port):
     show/probe/bandwidth/set/restart, and baud auto-detection itself has
     none either), and restores the guard the same way _on_interrupt does
     for SIGTERM.
+
+    That outer net wraps `with guard:` itself, not just its body.
+    ServiceGuard.__enter__ blocks for a second or two -- two
+    systemctl("stop", ...) calls plus a settle sleep -- immediately after
+    printing that the GNSS clock source is about to drop, which is exactly
+    the moment an operator reconsidering reaches for Ctrl-C. Python does
+    not call __exit__ when __enter__ itself raises, so a KeyboardInterrupt
+    landing there would never reach restore() if the catch were only
+    around the body (confirmed by executing the module before this fix:
+    __enter__ raised, __exit__ was never called, gpsd stayed stopped, and
+    the process still exited 130 by CPython's own top-level handling, so
+    the exit code alone gave no sign anything had gone wrong). Catching
+    outside `with guard:` and calling guard.restore() explicitly covers
+    that window too; restore() is idempotent (its own _armed gate), so the
+    same call after an interrupt from inside the body -- where __exit__
+    already ran it once, normally, as part of the exception propagating
+    through the `with` statement -- is a harmless no-op there.
 
     Port.close() is not idempotent (a second call raises "Bad file
     descriptor" -- inherited from gnss-probe's own Port, see its own
@@ -3601,47 +3620,50 @@ def main(argv, port_factory=Port):
     guard = ServiceGuard(enabled=not args.no_service_control)
     signal.signal(signal.SIGTERM, lambda signum, frame: _on_interrupt(guard))
 
-    with guard:
-        port = None
-        try:
-            port, obs = _open_with_baud_detection(args.device, args.baud,
-                                                  OBSERVE_SECONDS,
-                                                  port_factory=port_factory)
-            if port is None:
-                bauds = [args.baud] if args.baud else list(BAUD_CANDIDATES)
-                print("gnssctl: no recognisable data at %s" %
-                      " or ".join(str(b) for b in bauds), file=sys.stderr)
+    try:
+        with guard:
+            port = None
+            try:
+                port, obs = _open_with_baud_detection(
+                    args.device, args.baud, OBSERVE_SECONDS,
+                    port_factory=port_factory)
+                if port is None:
+                    bauds = [args.baud] if args.baud else list(BAUD_CANDIDATES)
+                    print("gnssctl: no recognisable data at %s" %
+                          " or ".join(str(b) for b in bauds), file=sys.stderr)
+                    holders = port_holder(args.device)
+                    if holders:
+                        print("  held by: %s" % ", ".join(holders),
+                              file=sys.stderr)
+                    return EXIT_NO_FRAMING
+
+                if spec is None:
+                    session = Session(port, allow_apply=True)
+                    return repl(session, args)
+                return spec.fn(port, args)
+            except OSError as exc:
+                print("gnssctl: cannot open %s: %s" % (args.device, exc),
+                      file=sys.stderr)
                 holders = port_holder(args.device)
                 if holders:
-                    print("  held by: %s" % ", ".join(holders),
+                    print("  still held by: %s" % ", ".join(holders),
                           file=sys.stderr)
-                return EXIT_NO_FRAMING
-
-            if spec is None:
-                session = Session(port, allow_apply=True)
-                return repl(session, args)
-            return spec.fn(port, args)
-        except KeyboardInterrupt:
-            # Only reached if repl()'s or _monitor_loop's own, narrower
-            # handling did not catch it themselves -- e.g. during baud
-            # auto-detection (before either has started), or during a
-            # one-shot command with no handler of its own (show/probe/
-            # bandwidth/set/restart). Returning from inside `with guard:`
-            # still runs guard.__exit__ -> restore(), the same guarantee
-            # _on_interrupt gives SIGTERM explicitly.
-            print("")
-            return EXIT_INTERRUPTED
-        except OSError as exc:
-            print("gnssctl: cannot open %s: %s" % (args.device, exc),
-                  file=sys.stderr)
-            holders = port_holder(args.device)
-            if holders:
-                print("  still held by: %s" % ", ".join(holders),
-                      file=sys.stderr)
-            return EXIT_NO_PORT
-        finally:
-            if port is not None:
-                port.close()
+                return EXIT_NO_PORT
+            finally:
+                if port is not None:
+                    port.close()
+    except KeyboardInterrupt:
+        # Also covers an interrupt raised inside ServiceGuard.__enter__
+        # itself, which `with guard:`'s own exception handling cannot --
+        # see the __enter__-blocks-for-a-second-or-two paragraph above.
+        # guard.restore() is idempotent (its own _armed gate), so calling
+        # it here is a no-op on the (more common) path where __exit__
+        # already ran it while this exception was propagating out of the
+        # `with` statement, and the one thing that actually restores gpsd
+        # on the path where __exit__ never ran at all.
+        print("")
+        guard.restore()
+        return EXIT_INTERRUPTED
 
 
 def check(name, fn):
@@ -4273,6 +4295,70 @@ def _guard_interrupted_stop():
     finally:
         systemctl = real_systemctl
     return [c[1] for c in calls if c[0] == "start"]
+
+
+def _guard_enter_interrupted():
+    """(units started again, main()'s exit code) when a KeyboardInterrupt
+    lands inside ServiceGuard.__enter__'s own settle sleep, driven through
+    main() itself.
+
+    Distinct from _guard_interrupted_stop above: that one interrupts the
+    STOP call and asserts on ServiceGuard.restore() directly, which is
+    enough to pin round 1's arming-order fix but not this one. This drives
+    an interrupt through the __enter__ call THAT with guard: ITSELF makes,
+    inside main() -- because Python does not call __exit__ when __enter__
+    raises, `with guard: ... except KeyboardInterrupt:` (the body only)
+    never reaches restore() on this path at all, whether or not
+    __enter__'s own arming order is correct. Only a catch OUTSIDE `with
+    guard:` can. _main_interrupted's own systemctl fake reports both units
+    INACTIVE specifically so __enter__ returns immediately and never blocks
+    -- it exists to test a different escape point (baud auto-detection)
+    and would sidestep this window entirely, which is exactly why it did
+    not catch the regression this pins. Here, systemctl reports both units
+    ACTIVE, so __enter__ takes its stop-then-sleep branch, and time.sleep
+    itself is faked to raise instead of blocking -- the settle sleep is
+    the one and only time.sleep call reached before main()'s own dispatch
+    would begin, so a blanket patch lands exactly there without needing to
+    distinguish it from any other sleep in the file.
+    """
+    global systemctl
+    real_systemctl = systemctl
+    real_geteuid = os.geteuid
+    real_sleep = time.sleep
+
+    class _Result:
+        returncode = 0  # "active" -- both units, so __enter__ takes the
+                        # stop-then-sleep branch, not the immediate return
+
+    calls = []
+
+    def fake_systemctl(*args):
+        calls.append(args)
+        if args[0] == "is-active":
+            return _Result()
+        return None
+
+    def fake_sleep(seconds):
+        raise KeyboardInterrupt
+
+    systemctl = fake_systemctl
+    os.geteuid = lambda: 0
+    time.sleep = fake_sleep
+    try:
+        code = main([os.devnull, "show"],
+                   port_factory=_interrupting_port_factory)
+    except KeyboardInterrupt:
+        # Same defensive wrapping as _main_interrupted/_init_interrupted:
+        # an escaping interrupt would otherwise crash --selftest instead
+        # of reporting one clean FAIL, since check()'s `except Exception`
+        # cannot catch a BaseException sibling.
+        code = "escaped uncaught"
+    finally:
+        systemctl = real_systemctl
+        os.geteuid = real_geteuid
+        time.sleep = real_sleep
+    started = sorted(c[1] for c in calls if c[0] == "start")
+    return started, code
 
 
 def _signals_installed(func_name):
@@ -5528,6 +5614,14 @@ def selftest():
           "guard's own __exit__ still running",
           lambda: _main_interrupted([os.devnull, "show"])
                   == EXIT_INTERRUPTED)
+    check("a KeyboardInterrupt landing INSIDE ServiceGuard.__enter__'s own "
+          "settle sleep -- right after the operator is told the clock is "
+          "about to drop, the likeliest moment for a Ctrl-C -- still "
+          "starts every unit that was active back up and still exits "
+          "EXIT_INTERRUPTED, even though __exit__ is never called when "
+          "__enter__ itself raises",
+          lambda: _guard_enter_interrupted()
+                  == (["gpsd.service", "gpsd.socket"], EXIT_INTERRUPTED))
     check("cmd_init still returns 0, and still leaves the port at "
           "INIT_BAUD, when a write inside _init_sequence raises "
           "KeyboardInterrupt -- the except BaseException (not Exception) "
