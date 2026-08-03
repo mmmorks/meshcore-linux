@@ -113,6 +113,183 @@ def nmea_split(line):
     return body, given.strip().upper() == nmea_checksum(body)
 
 
+class Frame:
+    __slots__ = ("framing", "cls", "mid", "payload")
+
+    def __init__(self, framing, cls, mid, payload):
+        self.framing = framing
+        self.cls = cls
+        self.mid = mid
+        self.payload = payload
+
+    @property
+    def key(self):
+        return (self.cls, self.mid)
+
+    def __repr__(self):
+        return "<%s %02x-%02x len %d>" % (
+            self.framing, self.cls, self.mid, len(self.payload))
+
+
+class Framing:
+    """One binary protocol: sync bytes, field order, checksum.
+
+    The two layouts are NOT interchangeable.
+
+    "casic" -- what this receiver answers to (§3.1):
+
+        sync(2) len(U2 LE) class(1) id(1) payload ck(U4 LE)
+        ck = (id << 24) + (class << 16) + len, then += each LE u32 of payload
+
+    "ubx" -- u-blox, and Allystar which copies it byte for byte apart from the
+    sync pair. What this receiver *emits*:
+
+        sync(2) class(1) id(1) len(U2 LE) payload ck_a ck_b   (8-bit Fletcher)
+
+    Length precedes class/id in CASIC and follows it in u-blox, so reading a
+    CASIC frame with the u-blox layout consumes class+id as the length and gets
+    nonsense. The layout therefore travels with the framing and is never assumed.
+    """
+
+    def __init__(self, name, sync, layout):
+        self.name = name
+        self.sync = sync
+        self.layout = layout
+        self.header_len = 6
+        self.trailer_len = 2 if layout == "ubx" else 4
+
+    def payload_len(self, buf):
+        if self.layout == "ubx":
+            return int.from_bytes(buf[4:6], "little")
+        return int.from_bytes(buf[2:4], "little")
+
+    def frame_len(self, n):
+        return self.header_len + n + self.trailer_len
+
+    def plausible(self, n):
+        if n > 4096:
+            return False
+        if self.layout == "casic" and n % 4:
+            return False
+        return True
+
+    def _casic_ck(self, cls, mid, payload):
+        ck = (mid << 24) + (cls << 16) + len(payload)
+        for i in range(0, len(payload), 4):
+            ck = (ck + int.from_bytes(payload[i:i + 4], "little")) & 0xFFFFFFFF
+        return ck
+
+    def encode(self, cls, mid, payload=b""):
+        if self.layout == "ubx":
+            body = bytes([cls, mid]) + len(payload).to_bytes(2, "little") + payload
+            ck_a = ck_b = 0
+            for byte in body:
+                ck_a = (ck_a + byte) & 0xFF
+                ck_b = (ck_b + ck_a) & 0xFF
+            return self.sync + body + bytes([ck_a, ck_b])
+        if len(payload) % 4:
+            raise ValueError("CASIC payload must be a multiple of 4 bytes (§3.1)")
+        return (self.sync + len(payload).to_bytes(2, "little") + bytes([cls, mid])
+                + payload + self._casic_ck(cls, mid, payload).to_bytes(4, "little"))
+
+    def decode(self, frame):
+        """(cls, mid, payload), or None if the checksum fails."""
+        n = self.payload_len(frame)
+        if self.layout == "ubx":
+            body = frame[2:6 + n]
+            ck_a = ck_b = 0
+            for byte in body:
+                ck_a = (ck_a + byte) & 0xFF
+                ck_b = (ck_b + ck_a) & 0xFF
+            if (ck_a, ck_b) != (frame[6 + n], frame[7 + n]):
+                return None
+            return frame[2], frame[3], frame[6:6 + n]
+        cls, mid = frame[4], frame[5]
+        payload = frame[6:6 + n]
+        if self._casic_ck(cls, mid, payload) != int.from_bytes(
+                frame[6 + n:10 + n], "little"):
+            return None
+        return cls, mid, payload
+
+
+CASIC = Framing("casic", b"\xba\xce", "casic")
+UBX = Framing("ubx", b"\xb5\x62", "ubx")
+ALLY = Framing("allystar", b"\xf1\xd9", "ubx")
+ALL_FRAMINGS = (CASIC, UBX, ALLY)
+
+
+class Scanner:
+    """Pulls complete, checksum-valid frames of one framing out of a byte stream.
+
+    Resyncs only on checksum failure and otherwise steps over a validated frame
+    whole, so a payload containing the sync pair is never mistaken for a frame
+    boundary. Getting that wrong truncates frames, which on the wire is
+    indistinguishable from silence -- and silence reads as "unsupported".
+    """
+
+    def __init__(self, framing):
+        self.framing = framing
+        self.buf = bytearray()
+        self.frames = []
+        self.sync_hits = 0
+        self.bad_checksums = 0
+
+    def feed(self, data):
+        self.buf.extend(data)
+        while True:
+            i = self.buf.find(self.framing.sync)
+            if i < 0:
+                # Keep one trailing byte: the sync pair may straddle two reads.
+                if len(self.buf) > 1:
+                    del self.buf[:-1]
+                return
+            if i:
+                del self.buf[:i]
+            if len(self.buf) < self.framing.header_len:
+                return
+            self.sync_hits += 1
+            n = self.framing.payload_len(self.buf)
+            if not self.framing.plausible(n):
+                self.bad_checksums += 1
+                del self.buf[:2]
+                continue
+            total = self.framing.frame_len(n)
+            if len(self.buf) < total:
+                return
+            decoded = self.framing.decode(bytes(self.buf[:total]))
+            if decoded is None:
+                self.bad_checksums += 1
+                del self.buf[:2]
+                continue
+            cls, mid, payload = decoded
+            self.frames.append(Frame(self.framing.name, cls, mid, payload))
+            del self.buf[:total]
+
+    def take(self):
+        out, self.frames = self.frames, []
+        return out
+
+
+# Every worked CASIC frame the specification prints (§3.2). Vendor bytes, so
+# they check the 32-bit word checksum and the empty-payload Get convention
+# against the spec rather than against our arithmetic.
+SPEC_CASIC = {
+    "CFG-PRT get":        "bace0000060000000600",                    # §3.2.2.1
+    "CFG-PRT resp UART1": "bace0800060001 07c00800c2010009c9c708".replace(" ", ""),
+    "CFG-PRT resp UART0": "bace0800060000ffc008802500008824c708",
+    "CFG-PRT set 9600":   "bace080006 00ff33c0088025000087 59c608".replace(" ", ""),
+    "ACK-ACK CFG-PRT":    "bace04000501060000000a000501",            # §3.2.1.2
+    "CFG-MSG get":        "bace0000060100000601",                    # §3.2.2.2
+    "CFG-MSG resp":       "bace0400060103110000071106 01".replace(" ", ""),
+    "CFG-MSG set GGA":    "bace040006014e00010052000701",
+    "ACK-ACK CFG-MSG":    "bace04000501060100000a010501",
+    "CFG-RST clear cfg":  "bace040006 02ff01000003020602".replace(" ", ""),  # §3.2.2.3
+    "CFG-RATE get":       "bace0000060400000604",                    # §3.2.2.4
+    "CFG-RATE resp":      "bace04000604e8030000ec030604",
+    "CFG-RATE set 500":   "bace04000604f4010000f8010604",
+}
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -130,6 +307,21 @@ def check(name, fn):
     print(("  ok   " if ok else "  FAIL ") + name)
     if not ok:
         _FAILS.append(name)
+
+
+def _raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
+def _scan(framing, *chunks):
+    sc = Scanner(framing)
+    for chunk in chunks:
+        sc.feed(chunk)
+    return sc.take()
 
 
 def selftest():
@@ -171,6 +363,47 @@ def selftest():
           lambda: nmea_split("garbage") == (None, False))
     check("checksum covers neither $ nor * (§2.1)",
           lambda: nmea_checksum("GPTXT,01,01,02,MA=CASIC") == "27")
+
+    print("")
+    print("CASIC framing against the spec's own frames (§3.1, §3.2):")
+    check("the CFG-PRT Get poll matches the spec byte for byte",
+          lambda: CASIC.encode(0x06, 0x00) == bytes.fromhex(SPEC_CASIC["CFG-PRT get"]))
+    check("the CFG-MSG Get poll matches the spec byte for byte",
+          lambda: CASIC.encode(0x06, 0x01) == bytes.fromhex(SPEC_CASIC["CFG-MSG get"]))
+    check("the CFG-RATE Get poll matches the spec byte for byte",
+          lambda: CASIC.encode(0x06, 0x04) == bytes.fromhex(SPEC_CASIC["CFG-RATE get"]))
+    check("every vendor frame decodes with a valid checksum",
+          lambda: [k for k, v in SPEC_CASIC.items()
+                   if CASIC.decode(bytes.fromhex(v)) is None] == [])
+    check("the CFG-PRT UART0 response decodes to the documented payload",
+          lambda: CASIC.decode(bytes.fromhex(SPEC_CASIC["CFG-PRT resp UART0"]))
+                  == (0x06, 0x00, bytes.fromhex("00ffc00880250000")))
+    check("a corrupted checksum is rejected",
+          lambda: CASIC.decode(bytes.fromhex(SPEC_CASIC["CFG-RATE resp"])[:-1] + b"\xff")
+                  is None)
+    check("length is read from offset 2 in CASIC and offset 4 in u-blox",
+          lambda: CASIC.payload_len(bytes.fromhex(SPEC_CASIC["CFG-PRT resp UART0"])) == 8
+                  and UBX.payload_len(UBX.encode(0x06, 0x00, b"\x01\x02")) == 2)
+    check("a payload that is not a multiple of 4 is refused (§3.1)",
+          lambda: _raises(lambda: CASIC.encode(0x06, 0x00, b"\x01")))
+    check("u-blox and Allystar differ only in their sync bytes",
+          lambda: ALLY.encode(0x06, 0x0C)[2:] == UBX.encode(0x06, 0x0C)[2:])
+
+    print("")
+    print("scanner:")
+    _f = CASIC.encode(0x06, 0x04, bytes.fromhex("e8030000"))
+    check("one clean frame", lambda: len(_scan(CASIC, _f)) == 1)
+    check("garbage before a frame", lambda: len(_scan(CASIC, b"\x00\xff\x12junk" + _f)) == 1)
+    check("frame split across two reads",
+          lambda: _scan(CASIC, _f[:5], _f[5:]) and len(_scan(CASIC, _f[:5], _f[5:])) == 1)
+    check("sync pair straddling two reads",
+          lambda: len(_scan(CASIC, b"\xba", b"\xce" + _f[2:])) == 1)
+    check("sync bytes inside a payload do not truncate the frame",
+          lambda: [fr.payload for fr in
+                   _scan(CASIC, CASIC.encode(0x06, 0x04, b"\xba\xce\xba\xce"))]
+                  == [b"\xba\xce\xba\xce"])
+    check("a bad frame is skipped and the next one still found",
+          lambda: len(_scan(CASIC, bytes(bytearray(_f[:-1]) + b"\xff") + _f)) == 1)
 
     print("")
     if _FAILS:
