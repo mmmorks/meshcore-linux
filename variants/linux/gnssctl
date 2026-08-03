@@ -310,24 +310,39 @@ def _mode_flags(mode):
     """Decode CFG-PRT <Mode> into a '8N1'-style string (§3.2.2.1 Table 10)."""
     bits = {0: "5", 1: "6", 2: "7", 3: "8"}[(mode >> 6) & 3]
     par = (mode >> 9) & 7
-    parity = "N" if par & 4 else ("O" if par == 1 else "E")
+    # Table 10's rows are not mutually exclusive as written: x1x (Reserved)
+    # overlaps 10x (None), so Reserved has to be tested first or 110 and 111
+    # read as a real parity setting.
+    if par & 2:
+        parity = "?"
+    elif par & 4:
+        parity = "N"
+    elif par == 1:
+        parity = "O"
+    else:
+        parity = "E"
     stop = {0: "1", 1: "1.5", 2: "2"}.get((mode >> 12) & 3, "?")
     return bits + parity + stop
 
 
 class Field:
-    __slots__ = ("name", "codec", "bits", "enum", "unit")
+    __slots__ = ("name", "codec", "bits", "enum", "unit", "_describe")
 
-    def __init__(self, name, codec, bits=None, enum=None, unit=None):
+    def __init__(self, name, codec, bits=None, enum=None, unit=None,
+                 describe=None):
         self.name = name
         self.codec = codec
         self.bits = bits
         self.enum = enum
         self.unit = unit
+        self._describe = describe
 
     def describe(self, value):
-        if self.name == "mode":
-            return _mode_flags(value)
+        # Declared per-field rather than matched on the field's name: the
+        # whole point of the table is that a message's behaviour is
+        # declared once, in the table, and nowhere else.
+        if self._describe is not None:
+            return self._describe(value)
         if self.bits:
             return [label for bit, label in self.bits if value & (1 << bit)]
         if self.enum:
@@ -372,6 +387,11 @@ class Message:
         return bytes(out)
 
     def parse(self, payload):
+        # Short is fatal, long is not. This receiver emits payloads longer than
+        # the spec documents (an undocumented 44-byte CFG-PPS was observed on
+        # the same part), and refusing those would turn a readable reply into
+        # "no answer". Trailing bytes past the declared fields are therefore
+        # ignored, not an error.
         if len(payload) < self.size:
             raise ValueError("%s: payload %d bytes, need %d"
                              % (self.name, len(payload), self.size))
@@ -390,7 +410,7 @@ class Message:
 CFG_PRT = Message("CFG-PRT", 0x06, 0x00,                       # §3.2.2.1 Table 8
                   Field("portID", U1),
                   Field("protoMask", U1, bits=PROTO_MASK),
-                  Field("mode", U2),
+                  Field("mode", U2, describe=_mode_flags),
                   Field("baudRate", U4, unit="bps"))
 
 CFG_MSG = Message("CFG-MSG", 0x06, 0x01,                       # §3.2.2.2 Table 11
@@ -582,6 +602,16 @@ def selftest():
     check("NMEA message IDs use CASIC class 0x4E, not u-blox 0xf0 (Table 5)",
           lambda: NMEA_MSG_ID["GGA"] == (0x4E, 0x00)
                   and NMEA_MSG_ID["ZDA"] == (0x4E, 0x08))
+    check("every Table 10 parity encoding decodes, Reserved included",
+          lambda: [_mode_flags((0b11 << 6) | (p << 9))[1] for p in range(8)]
+                  == ["E", "O", "?", "?", "N", "N", "?", "?"])
+    check("describe is declared per field, not matched on the field's name",
+          lambda: CFG_PRT.describe(bytes.fromhex("00ffc00880250000"))["mode"] == "8N1"
+                  and Field("mode", U2).describe(0x08C0) == 0x08C0)
+    check("parse tolerates trailing bytes but refuses a short payload",
+          lambda: CFG_RATE.parse(CFG_RATE.build(interval=1000, res=0)
+                                 + b"\xde\xad\xbe\xef")["interval"] == 1000
+                  and _raises(lambda: CFG_RATE.parse(b"\x01\x02")))
 
     print("")
     if _FAILS:
