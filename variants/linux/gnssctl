@@ -9,12 +9,14 @@
 Protocol source: Quectel L76K GNSS Protocol Specification V1.1. Section marks
 (§) throughout this file refer to it.
 """
+import argparse
 import atexit
 import errno
 import json
 import math
 import os
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -3120,6 +3122,430 @@ def _save_history(readline):
         pass
 
 
+# --------------------------------------------------------------------------
+# main -- the front door. Wires argparse onto the cmd_*/repl entry points
+# above and owns the exit codes (see the design doc's "Exit status" table).
+#
+#   0   did what was asked, including a receiver NAK -- a NAK is an answer
+#   1   refused to run, or could not get the port
+#   2   ran, but recognised no framing at any speed
+#   3   a guard rail refused the operation (--force overrides)
+#   130 interrupted
+#
+# init is exempt: cmd_init always returns 0 (see its own section banner --
+# a failed ExecStartPre stops gpsd outright, which is worse than a
+# mis-tuned receiver).
+# --------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_NO_PORT = 1
+EXIT_NO_FRAMING = 2
+EXIT_REFUSED = 3
+EXIT_INTERRUPTED = 130
+
+# The seven CLI verbs, in the order the design lists them. Used both to
+# build the argparse tree and, in _split_device below, to tell a verb apart
+# from a device positional without a second, drifting copy of this list.
+COMMAND_NAMES = ("show", "monitor", "probe", "bandwidth", "set", "restart",
+                 "init")
+
+
+def _split_device(argv):
+    """(device_or_None, remaining_argv).
+
+    argparse cannot host an optional positional (device) ahead of
+    subparsers the way this file's own docstring and the design doc want:
+    verified empirically against a minimal reproduction of this exact tree
+    -- parsing a single leftover token resolves it to the LATER positional
+    (the subparsers command) before the earlier one (device), so a bare
+    'gnssctl /dev/ttyUSB0' -- meant to enter the REPL against that device,
+    same as bare 'gnssctl' does against the default one -- raises "invalid
+    choice: '/dev/ttyUSB0'" instead. The split is therefore done by hand,
+    here, before argparse ever sees argv: only argv[0] is inspected --
+    device, if given at all, must be the first argument, before any flag or
+    the subcommand (parse_args' own description says so) -- and it counts
+    as the device only when it is not itself a flag or one of the seven
+    known verbs.
+    """
+    if argv and not argv[0].startswith("-") and argv[0] not in COMMAND_NAMES:
+        return argv[0], argv[1:]
+    return None, argv
+
+
+def parse_args(argv):
+    """argparse.Namespace for one gnssctl invocation.
+
+    Every attribute a cmd_* function reads via args.NAME (see each cmd_*'s
+    own docstring, and the interface note at the top of this section) is
+    guaranteed present here, with a sensible default, whether or not the
+    corresponding flag was given on the command line -- see the --selftest
+    checks below that walk this function's own output and assert exactly
+    that for cmd_probe/cmd_monitor/cmd_bandwidth/cmd_init.
+
+    --force/--yes/--raw/--json/--interval reuse the REPL's own flag names
+    for the same meanings (see _parse_flags and the DISPATCH handlers above)
+    so a user moving between the REPL and one-shot commands finds the same
+    vocabulary. Each is attached only to the subparser(s) it actually means
+    something for -- exactly where the REPL itself accepts it -- rather than
+    promoted to a single top-level flag: argparse writes an UNGIVEN option's
+    own default into the shared namespace when ITS subparser runs, which
+    would silently overwrite a same-named top-level flag's value the moment
+    a subcommand that also declares it is chosen (verified empirically the
+    same way as _split_device's own docstring). --baud is the one exception,
+    global by construction rather than choice: it names the SAME port speed
+    either way -- what to open the device at, and (for 'bandwidth', which
+    reads it back out of args without a subparser-local copy) the
+    hypothetical link speed to price -- so one flag serves both without
+    that collision.
+    """
+    device, rest = _split_device(list(argv))
+
+    ap = argparse.ArgumentParser(
+        prog="gnssctl",
+        description="Read and configure the GNSS receiver on this node. "
+                    "DEVICE, if given, must be the first argument, before "
+                    "any flag or subcommand.")
+    ap.add_argument("--baud", type=int, choices=sorted(BAUD_CODE),
+                    default=None,
+                    help="force a speed instead of auto-detecting over %s; "
+                         "also prices 'bandwidth's hypothetical link" %
+                         " then ".join(str(b) for b in BAUD_CANDIDATES))
+    ap.add_argument("--no-service-control", action="store_true",
+                    help="do not stop/start gpsd; assume the port is "
+                         "already free")
+    ap.add_argument("--via", choices=("pcas", "casic"), default="pcas",
+                    help="protocol 'set'/'restart' write configuration "
+                         "through (§2.3 vs §3.2) -- casic is not yet "
+                         "implemented by any Change class in this file, "
+                         "which only builds the $PCAS path, so 'set'/"
+                         "'restart' refuse rather than silently falling "
+                         "back to pcas")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run built-in tests and exit; touches no hardware")
+
+    # --force/--yes: only 'set's four targets and 'restart' mean anything by
+    # them (needs_yes/the bandwidth guard -- see Change/Session.apply), so a
+    # shared parent is attached to just those subparsers below, matching
+    # exactly what the REPL's own _repl_set/_repl_restart accept.
+    force_yes = argparse.ArgumentParser(add_help=False)
+    force_yes.add_argument("--force", action="store_true",
+                           help="override the bandwidth guard")
+    force_yes.add_argument("--yes", action="store_true",
+                           help="confirm a destructive change")
+
+    sub = ap.add_subparsers(dest="command",
+                            metavar="{%s}" % ",".join(COMMAND_NAMES))
+
+    sub.add_parser("show", help="current configuration and fix")
+
+    p = sub.add_parser("monitor", help="live view; Ctrl-C to stop")
+    p.add_argument("--raw", action="store_true",
+                   help="also show decoded raw frames")
+    p.add_argument("--interval", type=float, default=None,
+                   help="redraw interval in seconds (default 1.0)")
+    p.add_argument("--timeout", type=float, default=None,
+                   help="per-exchange timeout in seconds (default %.1f)"
+                        % PROBE_TIMEOUT)
+
+    p = sub.add_parser("probe", help="read-only capability sweep")
+    p.add_argument("--listen-seconds", dest="listen_seconds", type=float,
+                   default=10.0, help="phase 1 duration (default 10)")
+    p.add_argument("--json", metavar="PATH", default=None,
+                   help="also write results as JSON")
+
+    p = sub.add_parser("bandwidth", help="bandwidth arithmetic for the "
+                       "current, or a hypothetical, configuration")
+    p.add_argument("--rate", type=float, default=None,
+                   help="hypothetical fix rate in Hz")
+    p.add_argument("--sentences", default=None,
+                   help="hypothetical sentence rates, e.g. GSV=1,GGA=1")
+
+    p = sub.add_parser("set", help="change a receiver setting, verified")
+    set_sub = p.add_subparsers(dest="set_target", required=True,
+                               metavar="{baud,rate,sentences,constellation}")
+    b = set_sub.add_parser("baud", parents=[force_yes])
+    b.add_argument("value", type=int, choices=sorted(BAUD_CODE))
+    r = set_sub.add_parser("rate", parents=[force_yes])
+    r.add_argument("value", type=_parse_set_rate,
+                   help="milliseconds (%s), or e.g. '5hz'"
+                        % "/".join(str(i) for i in NAV_INTERVALS))
+    s = set_sub.add_parser("sentences", parents=[force_yes])
+    s.add_argument("pairs", nargs="+", metavar="NAME=RATE")
+    c = set_sub.add_parser("constellation", parents=[force_yes])
+    c.add_argument("names", nargs="+", metavar="NAME")
+
+    p = sub.add_parser("restart", parents=[force_yes],
+                       help="restart the receiver")
+    p.add_argument("kind", choices=sorted(RESTART_FLAG))
+
+    p = sub.add_parser("init", help="boot-path setup for gpsd's "
+                       "ExecStartPre; always exits 0")
+    p.add_argument("--timeout", type=float, default=10.0,
+                   help="deadline in seconds (default 10)")
+
+    args = ap.parse_args(rest)
+    args.device = device
+    return args
+
+
+# Which Change each 'set' target builds, keyed by argparse's own set_target
+# dest -- a table, not an if/elif chain matching the target's name, per the
+# design rule against name-based special-casing (the same rule _mode_flags,
+# _absorb_sky and Field.describe's own comments cite). Reuses
+# _parse_rate_overrides/_parse_set_constellation from the REPL section
+# above rather than restating either parse.
+SET_BUILDERS = {
+    "baud": lambda a: SetBaud(a.value),
+    "rate": lambda a: SetRate(a.value),
+    "sentences": lambda a: SetSentences(_parse_rate_overrides(
+        ",".join(a.pairs))),
+    "constellation": lambda a: SetConstellation(_parse_set_constellation(
+        a.names)),
+}
+
+
+def _via_refusal(args, verb):
+    """A refusal message if --via casic was asked of `verb`, else None.
+
+    Every Change class in this file (SetBaud, SetRate, SetSentences,
+    SetConstellation, Restart -- see CHANGES) builds only $PCAS sentences;
+    none builds the CASIC CFG-MSG/CFG-RST 'set' frames the design doc's own
+    "Why both command paths are exposed" section describes as the
+    alternative. Silently treating --via casic as --via pcas would answer a
+    question the caller did not ask; refusing outright says so instead.
+    """
+    if args.via != "casic":
+        return None
+    return ("gnssctl: --via casic is not implemented for '%s' -- every "
+           "Change class in this file only builds the $PCAS path. Drop "
+           "--via, or pass --via pcas." % verb)
+
+
+def cmd_set(port, args):
+    """CLI entry point for 'gnssctl set TARGET ...'.
+
+    Builds the Change parse_args' set_target subparser resolved (via
+    SET_BUILDERS) and applies it through a fresh, writable Session --
+    matching cmd_show/cmd_monitor/cmd_probe/cmd_bandwidth's own
+    one-shot-per-invocation shape (a fresh process, a fresh Session), not
+    the REPL's one-shared-Session-per-run shape; see the module comment
+    above _repl_set for why the REPL needs the latter and this does not.
+
+    timeout/observe_seconds are read the same way cmd_monitor reads its own
+    `timeout` -- not real flags on 'set's argparse subparsers (nothing there
+    asks for one), but an escape hatch getattr() leaves open so --selftest
+    can drive apply()'s real code at something faster than its production
+    1.5s-per-Get, 1.5s-per-observe pace.
+    """
+    reason = _via_refusal(args, "set %s" % args.set_target)
+    if reason:
+        print(reason, file=sys.stderr)
+        return EXIT_NO_PORT
+    try:
+        change = SET_BUILDERS[args.set_target](args)
+    except ValueError as exc:
+        # The Change subclass's own spec-citing refusal (§2.3.x), the same
+        # message the REPL surfaces from _repl_set -- not a vaguer one. No
+        # Session has been built yet, so nothing has reached the wire.
+        print("gnssctl: %s" % exc, file=sys.stderr)
+        return EXIT_NO_PORT
+    session = Session(port, allow_apply=True,
+                      timeout=getattr(args, "timeout", None) or PROBE_TIMEOUT,
+                      observe=getattr(args, "observe_seconds", None)
+                              or OBSERVE_SECONDS)
+    verdict = session.apply(change, force=args.force, yes=args.yes)
+    print(verdict)
+    return EXIT_REFUSED if verdict.status == "refused" else EXIT_OK
+
+
+def cmd_restart(port, args):
+    """CLI entry point for 'gnssctl restart KIND'. See cmd_set's docstring
+    for why this builds its own Session (and reads the same timeout/
+    observe_seconds escape hatch) rather than sharing one.
+    """
+    reason = _via_refusal(args, "restart")
+    if reason:
+        print(reason, file=sys.stderr)
+        return EXIT_NO_PORT
+    session = Session(port, allow_apply=True,
+                      timeout=getattr(args, "timeout", None) or PROBE_TIMEOUT,
+                      observe=getattr(args, "observe_seconds", None)
+                              or OBSERVE_SECONDS)
+    verdict = session.apply(Restart(args.kind), force=args.force,
+                            yes=args.yes)
+    print(verdict)
+    return EXIT_REFUSED if verdict.status == "refused" else EXIT_OK
+
+
+class _CliCommand:
+    """One dispatchable CLI verb: its handler, and whether main() has to
+    open the port (root check, ServiceGuard, baud auto-detection) before
+    calling it.
+
+    Declared per verb, in this one table (CLI_DISPATCH below), rather than
+    as an 'if args.command == "init"' special case threaded through main()
+    -- the same rule against dispatching on a name instead of a declared
+    property that DISPATCH (the REPL's own table), POLLS and every Sentence's
+    `repeat=` already follow. init is the sole needs_port=False entry: it
+    runs before gpsd exists, manages its own Port, and must not require
+    root beyond what ExecStartPre already grants (see its section banner).
+    """
+    __slots__ = ("fn", "needs_port")
+
+    def __init__(self, fn, needs_port=True):
+        self.fn = fn
+        self.needs_port = needs_port
+
+
+CLI_DISPATCH = {
+    "show": _CliCommand(cmd_show),
+    "monitor": _CliCommand(cmd_monitor),
+    "probe": _CliCommand(cmd_probe),
+    "bandwidth": _CliCommand(cmd_bandwidth),
+    "set": _CliCommand(cmd_set),
+    "restart": _CliCommand(cmd_restart),
+    "init": _CliCommand(cmd_init, needs_port=False),
+}
+
+
+def _open_with_baud_detection(device, forced_baud, seconds, port_factory=Port):
+    """(Port, Observation) at whichever candidate baud recognised something,
+    or (None, the last Observation tried) if none did.
+
+    Mirrors gnss-probe's own arrangement (see the design doc: "Port access
+    reuses gnss-probe's existing arrangements: baud auto-detection over
+    115200 then 9600") -- BAUD_CANDIDATES is that same order, reused rather
+    than restated. Tries only `forced_baud` (--baud) when one is given.
+
+    Raises whatever port_factory(device, baud) raises (OSError, for the
+    real Port, if the device cannot be opened at all) rather than catching
+    it here and trying the next candidate: an open failure is a property of
+    the device, not the baud, and will not go away at a different speed --
+    the same judgment gnss-probe's own main() already made.
+
+    port_factory defaults to the real Port so main() gets real hardware
+    access; --selftest passes a fake one instead, so this is exercised
+    without touching hardware (see _baud_fake_factory below).
+    """
+    bauds = [forced_baud] if forced_baud else list(BAUD_CANDIDATES)
+    obs = None
+    for baud in bauds:
+        port = port_factory(device, baud)
+        print("Listening at %d baud for %.1fs (sending nothing)..."
+              % (baud, seconds))
+        obs = listen(port, seconds)
+        if obs.recognised:
+            return port, obs
+        print("  nothing recognisable at %d baud" % baud)
+        port.close()
+    return None, obs
+
+
+def _on_interrupt(guard):
+    """Restore the ServiceGuard, then exit EXIT_INTERRUPTED.
+
+    Named and factored out from where main() installs it
+    (signal.signal(SIGINT, lambda *_a: _on_interrupt(guard))) so --selftest
+    can call it directly against a fake guard and inspect what happened,
+    rather than installing a real OS signal handler (which --selftest must
+    not do -- there would be no safe way to fire it without either skipping
+    the assertion or raising SystemExit through the test harness itself).
+    Leaving gpsd stopped after a Ctrl-C would silently cost the node its
+    clock, so this runs before the exit, not after.
+    """
+    guard.restore()
+    sys.exit(EXIT_INTERRUPTED)
+
+
+def main(argv):
+    """The front door. See the section banner above for the exit codes.
+
+    --selftest is handled before anything else: no root, no device, no
+    ServiceGuard. init bypasses the root check and the ServiceGuard
+    entirely -- see _CliCommand's docstring -- via CLI_DISPATCH's own
+    needs_port flag, not a name comparison here. Everything else requires
+    root (to stop gpsd and open the port) unless --no-service-control is
+    given. A bare invocation (no subcommand) enters the REPL, against one
+    Session built here and handed to repl() -- see repl()'s own docstring
+    for why it, unlike every cmd_*, does not build one itself.
+
+    A SIGINT/SIGTERM handler is installed once the device is known to exist
+    (so an interrupt before that has nothing to restore) and stays
+    installed for the rest of the run, restoring the guard on either signal
+    -- see _on_interrupt.
+
+    Port.close() is not idempotent (a second call raises "Bad file
+    descriptor" -- inherited from gnss-probe's own Port, see its own
+    docstring): every path below that opens a port closes it exactly once,
+    in the single `finally` at the bottom, never both there and inline.
+    """
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        # argparse's own usage-error (2) and --help (0) exits, converted to
+        # a plain returned int rather than left to propagate: main(argv) ->
+        # int is a real contract here, not just the common case, so a
+        # caller (or --selftest, driving main() in-process) never has to
+        # catch SystemExit to find out what a bad argv did.
+        return exc.code if isinstance(exc.code, int) else EXIT_NO_PORT
+
+    if args.selftest:
+        return selftest()
+
+    args.device = args.device or device_from_gpsd_defaults() or DEFAULT_DEVICE
+
+    spec = CLI_DISPATCH.get(args.command) if args.command else None
+
+    if spec is not None and not spec.needs_port:
+        return spec.fn(args)
+
+    if not args.no_service_control and os.geteuid() != 0:
+        print("gnssctl: need root to stop gpsd and open %s" % args.device,
+              file=sys.stderr)
+        print("  run with sudo, or use --no-service-control if gpsd is "
+              "already stopped", file=sys.stderr)
+        return EXIT_NO_PORT
+
+    if not os.path.exists(args.device):
+        print("gnssctl: %s does not exist" % args.device, file=sys.stderr)
+        return EXIT_NO_PORT
+
+    guard = ServiceGuard(enabled=not args.no_service_control)
+    signal.signal(signal.SIGINT, lambda signum, frame: _on_interrupt(guard))
+    signal.signal(signal.SIGTERM, lambda signum, frame: _on_interrupt(guard))
+
+    with guard:
+        port = None
+        try:
+            port, obs = _open_with_baud_detection(args.device, args.baud,
+                                                  OBSERVE_SECONDS)
+            if port is None:
+                bauds = [args.baud] if args.baud else list(BAUD_CANDIDATES)
+                print("gnssctl: no recognisable data at %s" %
+                      " or ".join(str(b) for b in bauds), file=sys.stderr)
+                holders = port_holder(args.device)
+                if holders:
+                    print("  held by: %s" % ", ".join(holders),
+                          file=sys.stderr)
+                return EXIT_NO_FRAMING
+
+            if spec is None:
+                session = Session(port, allow_apply=True)
+                return repl(session, args)
+            return spec.fn(port, args)
+        except OSError as exc:
+            print("gnssctl: cannot open %s: %s" % (args.device, exc),
+                  file=sys.stderr)
+            holders = port_holder(args.device)
+            if holders:
+                print("  still held by: %s" % ", ".join(holders),
+                      file=sys.stderr)
+            return EXIT_NO_PORT
+        finally:
+            if port is not None:
+                port.close()
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -3311,6 +3737,11 @@ class _FakePort:
         self.writes = []
         self._data = data
         self._fail_write = fail_write
+        # Not read by any check that predates this one -- added for
+        # _open_with_baud_detection's own checks, which need to see that a
+        # candidate that recognised nothing was closed before the next
+        # candidate was tried, and that the WINNING one was not.
+        self.closed = False
 
     def read(self, timeout):
         if self._data:
@@ -3329,6 +3760,9 @@ class _FakePort:
 
     def set_baud(self, baud):
         self.baud = baud
+
+    def close(self):
+        self.closed = True
 
 
 class _QuietThenInterrupt:
@@ -3593,6 +4027,80 @@ def _init_on_write_failure():
 
 def _init_args(device="/dev/fake", timeout=10.0):
     return _Args(device=device, timeout=timeout)
+
+
+def _usage(*args):
+    """The --help text parse_args(...) prints for a given (sub)command path,
+    captured rather than let reach the real stdout/stderr -- e.g. _usage()
+    for the top-level --help, _usage("set", "baud") for 'set baud --help'.
+    Exists so the checks below can assert on real argparse output (every
+    subcommand name, every baud choice) instead of restating what the tree
+    is supposed to contain as a second, driftable list.
+    """
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            parse_args(list(args) + ["--help"] if args else ["--help"])
+        except SystemExit:
+            pass
+    return buf.getvalue()
+
+
+def _main_as_nonroot(argv):
+    """main(argv), with os.geteuid() made to look non-root for the
+    duration of the call -- deterministic regardless of who actually runs
+    --selftest (root or not, e.g. under sudo or some CI containers), for
+    the checks below that assert what happens WITHOUT root. Reverted in a
+    finally so a failure mid-call cannot leave the real os.geteuid patched.
+    """
+    real = os.geteuid
+    os.geteuid = lambda: 1000
+    try:
+        return main(argv)
+    finally:
+        os.geteuid = real
+
+
+def _baud_fake_factory(recognisable_at, calls=None):
+    """A port_factory for _open_with_baud_detection: a real Port's
+    constructor takes (path, baud) and opens hardware; this ignores the
+    path and returns a _FakePort instead, carrying wire bytes (a whole GSV
+    epoch, so Observation.recognised is genuinely true, not a fluke of a
+    truncated sentence) only at the baud(s) named in `recognisable_at`.
+    `calls`, when given, records every baud tried, in order -- what the
+    checks below use to confirm auto-detection tries BAUD_CANDIDATES in
+    order and a forced --baud skips the loop rather than merely returning
+    the right answer by coincidence.
+    """
+    def factory(device, baud):
+        if calls is not None:
+            calls.append(baud)
+        return _FakePort(baud, _EPOCH if baud in recognisable_at else b"")
+    return factory
+
+
+class _FakeGuard:
+    """Stands in for ServiceGuard in _on_interrupt's own check: records
+    whether .restore() was called, without touching systemctl or a real
+    unit.
+    """
+
+    def __init__(self):
+        self.restored = False
+
+    def restore(self):
+        self.restored = True
+
+
+def _interrupt_exit_code(guard):
+    """The SystemExit code _on_interrupt(guard) raises."""
+    try:
+        _on_interrupt(guard)
+    except SystemExit as exc:
+        return exc.code
+    return None
 
 
 def selftest():
@@ -4428,6 +4936,190 @@ def selftest():
           lambda: _init_on_write_failure() == ([], INIT_BAUD))
 
     print("")
+    print("cli:")
+    check("--selftest needs neither root nor a device",
+          lambda: "--selftest" in _usage())
+    check("every subcommand in the design appears in usage",
+          lambda: all(c in _usage() for c in
+                      ("show", "monitor", "probe", "bandwidth", "set",
+                       "restart", "init")))
+    check("baud choices are exactly the six documented rates",
+          lambda: all(str(b) in _usage("set", "baud", "--help") for b in BAUD_CODE))
+    check("an unknown subcommand exits non-zero rather than doing something",
+          lambda: main(["nosuchcommand"]) != 0)
+    check("exit codes are the ones the design specifies",
+          lambda: (EXIT_OK, EXIT_NO_PORT, EXIT_NO_FRAMING, EXIT_REFUSED,
+                   EXIT_INTERRUPTED) == (0, 1, 2, 3, 130))
+
+    check("device, given bare with no subcommand, parses as the device -- "
+          "what lets main() enter the REPL against a non-default one",
+          lambda: _split_device(["/dev/ttyUSB0"]) == ("/dev/ttyUSB0", []))
+    check("device ahead of a subcommand parses as both",
+          lambda: _split_device(["/dev/ttyAMA0", "show"])
+                  == ("/dev/ttyAMA0", ["show"]))
+    check("a bare verb is not mistaken for a device",
+          lambda: _split_device(["show"]) == (None, ["show"]))
+    check("a bare flag is not mistaken for a device",
+          lambda: _split_device(["--selftest"]) == (None, ["--selftest"]))
+    check("a bare invocation parses with command=None and device=None -- "
+          "what routes main() to the REPL against the default device",
+          lambda: parse_args([]).command is None
+                  and parse_args([]).device is None)
+
+    check("parse_args supplies every attribute cmd_probe reads",
+          lambda: {"listen_seconds", "json"} <= set(vars(parse_args(["probe"]))))
+    check("parse_args supplies every attribute cmd_monitor reads",
+          lambda: {"raw", "interval", "timeout"}
+                  <= set(vars(parse_args(["monitor"]))))
+    check("parse_args supplies every attribute cmd_bandwidth reads -- baud "
+          "comes from the global flag, not a second copy on this subparser",
+          lambda: {"rate", "baud", "sentences"}
+                  <= set(vars(parse_args(["bandwidth"]))))
+    check("parse_args supplies every attribute cmd_init reads",
+          lambda: {"device", "timeout"} <= set(vars(parse_args(["init"]))))
+    check("a global --baud reaches 'bandwidth' as args.baud without a "
+          "subparser-local default clobbering it",
+          lambda: parse_args(["--baud", "57600", "bandwidth"]).baud == 57600)
+
+    check("parse_args resolves each 'set' target to the attribute "
+          "SET_BUILDERS reads",
+          lambda: parse_args(["set", "baud", "9600"]).value == 9600
+                  and parse_args(["set", "rate", "5hz"]).value == 200
+                  and parse_args(["set", "sentences", "GSV=1", "GGA=0"]).pairs
+                      == ["GSV=1", "GGA=0"]
+                  and parse_args(["set", "constellation", "GPS", "BDS"]).names
+                      == ["GPS", "BDS"])
+    check("parse_args resolves 'restart KIND --yes'",
+          lambda: parse_args(["restart", "cold", "--yes"]).kind == "cold"
+                  and parse_args(["restart", "cold", "--yes"]).yes is True)
+    check("SET_BUILDERS covers exactly the four 'set' targets the argparse "
+          "tree offers",
+          lambda: set(SET_BUILDERS) == {"baud", "rate", "sentences",
+                                        "constellation"})
+
+    check("CLI_DISPATCH covers exactly the seven CLI verbs",
+          lambda: set(CLI_DISPATCH) == set(COMMAND_NAMES))
+    check("init is the only verb that skips main()'s port-opening path -- "
+          "a declared property in the table, not an 'if command == ...' "
+          "special case in main() itself",
+          lambda: {name for name, spec in CLI_DISPATCH.items()
+                  if not spec.needs_port} == {"init"})
+
+    check("main() converts an argparse usage error into a returned int "
+          "rather than raising SystemExit through the caller -- argparse's "
+          "own usage-error convention (2) here, which coincides with "
+          "EXIT_NO_FRAMING's value but is unrelated to it: no device was "
+          "ever touched",
+          lambda: main(["set", "baud", "not-a-number"]) == 2)
+    check("an extra positional argparse itself rejects also returns as a "
+          "plain int",
+          lambda: isinstance(main(["show", "bogus-extra-positional"]), int))
+
+    check("a non-init command without root and without --no-service-control "
+          "refuses to run",
+          lambda: _main_as_nonroot(
+              ["/nonexistent/device/for/selftest", "show"]) == EXIT_NO_PORT)
+    check("--no-service-control skips the root check, but a nonexistent "
+          "device still refuses to run",
+          lambda: _main_as_nonroot(
+              ["/nonexistent/device/for/selftest", "--no-service-control",
+               "show"]) == EXIT_NO_PORT)
+    check("init bypasses the root check and the ServiceGuard entirely -- "
+          "main() exits 0 even without root, with no --no-service-control, "
+          "and even for a device that does not exist (cmd_init's own "
+          "defined meaning: no HAT on this node, not an error)",
+          lambda: _main_as_nonroot(
+              ["/nonexistent/device/for/selftest", "init"]) == EXIT_OK)
+
+    check("baud auto-detection tries BAUD_CANDIDATES in order and returns "
+          "the first speed that recognises anything",
+          lambda: (lambda calls: (
+              _open_with_baud_detection(
+                  "/dev/fake", None, _TEST_WINDOW,
+                  port_factory=_baud_fake_factory({9600}, calls))[0].baud == 9600
+              and calls == [115200, 9600]))([]))
+    check("a forced --baud skips the candidate loop entirely, even when an "
+          "earlier candidate would also have recognised something",
+          lambda: (lambda calls: (
+              _open_with_baud_detection(
+                  "/dev/fake", 9600, _TEST_WINDOW,
+                  port_factory=_baud_fake_factory({115200, 9600}, calls))
+              [0].baud == 9600
+              and calls == [9600]))([]))
+    check("nothing recognisable at any candidate baud returns no port",
+          lambda: _open_with_baud_detection(
+              "/dev/fake", None, _TEST_WINDOW,
+              port_factory=_baud_fake_factory(set()))[0] is None)
+    check("a candidate that recognised nothing is closed before the next "
+          "is tried; the winning one is left open for the caller",
+          lambda: (lambda made=[]: (
+              _open_with_baud_detection(
+                  "/dev/fake", None, _TEST_WINDOW,
+                  port_factory=lambda d, b, made=made: (
+                      lambda p: (made.append(p), p)[1])(
+                          _FakePort(b, _EPOCH if b == 9600 else b"")))
+              and made[0].closed and made[0].baud == 115200
+              and not made[1].closed and made[1].baud == 9600))())
+
+    check("cmd_set and cmd_restart build their own writable Session as "
+          "their own first statement, matching cmd_show et al.'s "
+          "one-shot-per-invocation shape",
+          lambda: all(calls and all(c.get("allow_apply") is True for c in calls)
+                      for calls in (_session_calls(n) for n in
+                                   ("cmd_set", "cmd_restart"))))
+    # timeout/observe_seconds shrink cmd_set/cmd_restart's own Session to
+    # _TEST_WINDOW (see cmd_set's own docstring for the escape hatch this
+    # uses) -- without it these four checks would run apply() at its real
+    # 1.5s-per-Get, 1.5s-per-observe pace, the same cost _apply_on_quiet_port
+    # and friends already avoid for every OTHER apply() check in this file.
+    check("cmd_set('baud') applies SetBaud and returns EXIT_OK for a nak -- "
+          "a receiver answer, not a tool failure",
+          lambda: (lambda port=_FakePort(9600, b""): (
+              cmd_set(port, _Args(set_target="baud", value=19200, force=False,
+                                  yes=False, via="pcas", timeout=_TEST_WINDOW,
+                                  observe_seconds=_TEST_WINDOW)) == EXIT_OK
+              and port.baud == 19200))())
+    check("cmd_set surfaces the Change constructor's own spec-citing "
+          "refusal and returns EXIT_NO_PORT without writing anything",
+          lambda: (lambda port=_FakePort(9600, b""): (
+              cmd_set(port, _Args(set_target="rate", value=333, force=False,
+                                  yes=False, via="pcas", timeout=_TEST_WINDOW,
+                                  observe_seconds=_TEST_WINDOW)) == EXIT_NO_PORT
+              and port.writes == []))())
+    check("cmd_restart withholds a cold restart until --yes, returning "
+          "EXIT_REFUSED and writing nothing",
+          lambda: (lambda port=_FakePort(9600, b""): (
+              cmd_restart(port, _Args(kind="cold", force=False, yes=False,
+                                      via="pcas", timeout=_TEST_WINDOW,
+                                      observe_seconds=_TEST_WINDOW))
+              == EXIT_REFUSED
+              and port.writes == []))())
+    check("cmd_restart sends the restart once --yes is given",
+          lambda: (lambda port=_FakePort(9600, b""): (
+              cmd_restart(port, _Args(kind="cold", force=False, yes=True,
+                                      via="pcas", timeout=_TEST_WINDOW,
+                                      observe_seconds=_TEST_WINDOW)) == EXIT_OK
+              and len(port.writes) == 1))())
+    check("--via casic is refused for 'set' and 'restart' -- no Change "
+          "class here implements a CASIC write path -- rather than "
+          "silently behaving as if --via pcas had been given",
+          lambda: (lambda port=_FakePort(9600, b""): (
+              cmd_set(port, _Args(set_target="baud", value=9600, force=False,
+                                  yes=False, via="casic", timeout=_TEST_WINDOW,
+                                  observe_seconds=_TEST_WINDOW)) == EXIT_NO_PORT
+              and cmd_restart(port, _Args(kind="hot", force=False, yes=False,
+                                          via="casic", timeout=_TEST_WINDOW,
+                                          observe_seconds=_TEST_WINDOW))
+              == EXIT_NO_PORT
+              and port.writes == []))())
+
+    check("the interrupt handler restores the guard, then exits "
+          "EXIT_INTERRUPTED specifically -- not merely some SystemExit -- "
+          "without ever installing a real OS signal handler",
+          lambda: (lambda g: (_interrupt_exit_code(g) == EXIT_INTERRUPTED
+                              and g.restored))(_FakeGuard()))
+
+    print("")
     if _FAILS:
         print("%d FAILED: %s" % (len(_FAILS), ", ".join(_FAILS)))
         return 1
@@ -4436,4 +5128,4 @@ def selftest():
 
 
 if __name__ == "__main__":
-    sys.exit(selftest() if "--selftest" in sys.argv[1:] else 0)
+    sys.exit(main(sys.argv[1:]))
