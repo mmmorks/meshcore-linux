@@ -10,6 +10,7 @@ Protocol source: Quectel L76K GNSS Protocol Specification V1.1. Section marks
 (§) throughout this file refer to it.
 """
 import errno
+import json
 import math
 import os
 import select
@@ -1898,6 +1899,238 @@ class Session:
             return None
 
 
+# --------------------------------------------------------------------------
+# probe -- the read-only diagnostic
+#
+# Carried over from gnss-probe (which this file replaces). The finding that
+# justifies its existence: what this receiver EMITS and what it ACCEPTS are
+# different protocols. It emits u-blox b5 62 and ignores Allystar f1 d9
+# entirely, but answers CASIC ba ce -- which it never emits on its own. A
+# sweep that only tries the framing seen passively on the wire finds nothing
+# but refusals; this is why Session scans every framing on every poll (see
+# Session's own docstring) and why cmd_probe tries CASIC unconditionally
+# rather than only the framing phase 1 happened to observe.
+# --------------------------------------------------------------------------
+
+def sweep(session, framing):
+    """Poll every entry in POLLS in one framing.
+
+    Drives Session.poll -- the frozen table, the only transmit path a probe is
+    allowed -- rather than any lower-level send. Paced by PROBE_SPACING for the
+    same reason apply() is: driver_allystar.c warns that some parts get cranky
+    under rapid reconfiguration, and reading a chip that has fallen behind as
+    "unsupported" would poison every remaining result in the sweep.
+    """
+    session.framing = framing
+    results = []
+    for i in range(len(POLLS)):
+        results.append(session.poll(i))
+        time.sleep(PROBE_SPACING)
+    return results
+
+
+def productive(results):
+    """Did this framing actually yield data, as opposed to refusals?
+
+    A sweep where every binary poll NAKs is a working conversation in which the
+    chip declined every question -- which is exactly what a u-blox emulation
+    layer does. It means "ask somewhere else", not "this is the answer", so it
+    is the trigger for trying the next framing rather than a result to stop on.
+    """
+    return any(r.outcome in ("reply", "ack")
+               for r in results if r.poll.kind == "bin")
+
+
+def hexdump(data, limit=64):
+    if not data:
+        return ""
+    body = " ".join("%02x" % b for b in data[:limit])
+    return body + (" ..." if len(data) > limit else "")
+
+
+OUTCOME_LABEL = {
+    "reply": "REPLY",
+    "ack": "ACK",
+    "nak": "NAK",
+    "silence": "silent",
+}
+
+
+def render_probe(obs, sweeps, device):
+    out = []
+    w = out.append
+    w("=" * 72)
+    w("gnssctl probe: %s" % device)
+    w("=" * 72)
+    w("")
+    w("PHASE 1 -- what is on the wire (nothing sent)")
+    w("  port speed        %d baud" % obs.baud)
+    w("  bytes read        %d" % obs.raw_bytes)
+    w("")
+    w("  binary framing:")
+    for f in ALL_FRAMINGS:
+        w("    %-9s sync %s  hits %-5d valid frames %-5d" % (
+            f.name,
+            " ".join("%02x" % b for b in f.sync),
+            obs.sync_hits.get(f.name, 0),
+            obs.valid_frames.get(f.name, 0)))
+        ids = obs.frame_ids.get(f.name) or {}
+        if ids:
+            top = sorted(ids.items(), key=lambda kv: -kv[1])[:8]
+            w("              messages: " +
+              ", ".join("%s x%d" % (k, v) for k, v in top))
+    w("")
+    if obs.nmea_counts:
+        w("  NMEA sentences emitted by the RECEIVER (not via gpsd):")
+        for tag, n in sorted(obs.nmea_counts.items(), key=lambda kv: -kv[1]):
+            w("    %-8s x%d" % (tag, n))
+    else:
+        w("  NMEA sentences: none seen")
+    w("")
+
+    if not sweeps:
+        w("PHASE 2 -- skipped: no transmittable framing answered a version poll")
+        w("")
+        w("  Raw capture head:")
+        w("    " + hexdump(obs.raw_head, 96))
+    for framing, results in sweeps:
+        w("PHASE 2 -- capability sweep in %s framing (%s)" % (
+            framing.name, " ".join("%02x" % b for b in framing.sync)))
+        if not productive(results):
+            w("  Every binary poll was refused. The chip is talking, but it "
+              "declines every")
+            w("  question in this protocol -- which is what a u-blox emulation "
+              "layer does.")
+        w("")
+        w("  %-12s %-8s %s" % ("POLL", "RESULT", "DETAIL"))
+        w("  " + "-" * 68)
+        for r in results:
+            if r.outcome == "reply" and r.detail:
+                parts = ["%s=%s" % (k, v) for k, v in r.detail.items()]
+            elif r.outcome == "reply":
+                parts = ["payload " + hexdump(r.raw, 24)]
+            elif r.outcome == "nak":
+                parts = ["not supported on this chip"]
+            elif r.outcome == "ack":
+                parts = ["supported, returned no data"]
+            else:
+                # Say what "silence" is actually made of. A busy wire with no
+                # matching frame is a different claim from a dead wire, and
+                # only the ProbeResult's own window/seen tally can tell them
+                # apart -- see ProbeResult's docstring for why both are kept.
+                other = ", ".join("%s x%d" % (k, v)
+                                  for k, v in sorted(r.seen.items(),
+                                                     key=lambda kv: -kv[1])[:5])
+                parts = ["no matching frame; %d bytes arrived" % r.window_total,
+                         "frames seen: %s" % (other or "NONE in any framing")]
+            if r.answered_in and r.answered_in not in (framing.name, "nmea"):
+                parts.insert(0, "ANSWERED IN %s FRAMING" % r.answered_in.upper())
+            # Wrap rather than truncate. A cut-off line once hid galileo_e1 in
+            # gnss-probe -- the single field this whole tool exists to read.
+            lines = []
+            cur = ""
+            for part in parts:
+                if cur and len(cur) + len(part) + 2 > 48:
+                    lines.append(cur)
+                    cur = part
+                else:
+                    cur = (cur + ", " + part) if cur else part
+            if cur:
+                lines.append(cur)
+            w("  %-12s %-8s %s" % (r.poll.label,
+                                   OUTCOME_LABEL[r.outcome], lines[0]))
+            for extra in lines[1:]:
+                w("  %-12s %-8s %s" % ("", "", extra))
+            if r.outcome == "reply" and r.raw:
+                w("  %-12s %-8s hex: %s" % ("", "", hexdump(r.raw, 32)))
+            if r.outcome == "silence" and r.window:
+                w("  %-12s %-8s saw: %s" % ("", "", hexdump(r.window, 28)))
+        w("")
+    w("=" * 72)
+    return "\n".join(out)
+
+
+def probe_json(obs, sweeps, device):
+    return {
+        "device": device,
+        "baud": obs.baud,
+        "bytes_read": obs.raw_bytes,
+        "sync_hits": obs.sync_hits,
+        "valid_frames": obs.valid_frames,
+        "frame_ids": obs.frame_ids,
+        "nmea_counts": obs.nmea_counts,
+        "nmea_sample": obs.nmea_sample,
+        # The raw window head, kept for the same reason ProbeResult keeps a
+        # window per poll: without it, "recognised nothing" and "read nothing"
+        # are indistinguishable, and only one of them supports concluding this
+        # protocol is unsupported.
+        "raw_head_hex": obs.raw_head.hex(),
+        "sweeps": [
+            {
+                "framing": framing.name,
+                "productive": productive(results),
+                "probes": [
+                    {
+                        "poll": r.poll.label,
+                        "why": r.poll.why,
+                        "outcome": r.outcome,
+                        "detail": r.detail,
+                        "raw_hex": r.raw.hex() if r.raw else None,
+                        "answered_in": r.answered_in,
+                        "window_bytes": r.window_total,
+                        "window_hex": r.window.hex() if r.window else None,
+                        "frames_seen": r.seen,
+                    }
+                    for r in results
+                ],
+            }
+            for framing, results in sweeps
+        ],
+    }
+
+
+def cmd_probe(port, args):
+    """Read-only diagnostic: what this receiver answers, and in which framing.
+
+    Builds Session with allow_apply=False -- not a courtesy, a structural
+    guarantee. That is the whole reason probe can be trusted on a live node:
+    see Session's docstring and the --selftest check that walks this file's
+    own syntax tree to confirm nothing outside {write, poll, apply, _exchange,
+    _probe_binary} can reach the wire.
+    """
+    session = Session(port, allow_apply=False)
+    print("Listening at %d baud for %.0fs (sending nothing)..."
+          % (port.baud, args.listen_seconds))
+    obs = session.observe(args.listen_seconds)
+
+    # CASIC first, unconditionally -- not because phase 1 suggests it, but
+    # because it is the documented finding this tool exists to act on: this
+    # receiver EMITS u-blox framing and ACCEPTS CASIC framing, and those are
+    # different questions. Falling back through the rest of ALL_FRAMINGS
+    # covers the case that finding does not hold on whatever chip is actually
+    # attached today.
+    order = (CASIC,) + tuple(f for f in ALL_FRAMINGS if f is not CASIC)
+    sweeps = []
+    for framing in order:
+        print("Sweeping %s framing..." % framing.name)
+        results = sweep(session, framing)
+        sweeps.append((framing, results))
+        if productive(results):
+            break
+        if framing is not order[-1]:
+            print("  every binary poll refused; trying the next framing")
+
+    print("")
+    print(render_probe(obs, sweeps, port.path))
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(probe_json(obs, sweeps, port.path), fh, indent=2)
+        print("JSON written to %s" % args.json)
+
+    return 0 if any(productive(results) for _, results in sweeps) else 2
+
+
 def check(name, fn):
     """Record one assertion.
 
@@ -2069,6 +2302,10 @@ def _poll_on_quiet_port(n, data):
     """
     port = _FakePort(9600, data)
     return port, Session(port, timeout=_TEST_WINDOW).poll(n)
+
+
+def _probe_session():
+    return Session(None, allow_apply=False)
 
 
 def _scan(framing, *chunks):
@@ -2567,6 +2804,19 @@ def selftest():
                    and "readback failed" in v.detail)(
               *_apply_on_quiet_port(_breaking_readback(
                   Restart("hot"), OSError(5, "Input/output error")))))
+
+    print("")
+    print("probe reporting:")
+    check("a read-only session is what probe builds",
+          lambda: _raises(lambda: _probe_session().apply(SetRate(200))))
+    check("the report names every framing it scanned",
+          lambda: all(f.name in render_probe(Observation(9600), [], "/dev/null")
+                      for f in ALL_FRAMINGS))
+    check("a silent phase 2 is stated, not omitted",
+          lambda: "no transmittable framing" in render_probe(
+              Observation(9600), [], "/dev/null"))
+    check("the JSON carries the raw window so silence is falsifiable",
+          lambda: "raw_head_hex" in probe_json(Observation(9600), [], "/dev/null"))
 
     print("")
     if _FAILS:
