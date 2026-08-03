@@ -2069,37 +2069,66 @@ def _init_sequence(port, deadline):
     Order is load-bearing, same as gnss-set-baud before it: both candidate
     sends happen unconditionally, then the fix rate is sent only once the
     CFG-PRT readback confirms 115200.
+
+    Every exit path -- an expired deadline (whether already past at entry
+    or reached partway through the candidate loop), an exception from
+    write()/set_baud(), or reaching the end normally -- leaves the port
+    clocked at 115200 (the `finally` below). gpsd is about to open this
+    port at that speed; leaving it anywhere else turns a diagnosable "no
+    data received" into a speed mismatch that looks like dead hardware --
+    exactly the failure this function exists to prevent, so it cannot be
+    contingent on which exit was taken.
+
+    gnss-set-baud paused a full second between the 9600 and 115200
+    attempts; this sends both back-to-back. That is a deliberate trade
+    against the hard deadline this function has to honour, not an
+    oversight, and it is unconfirmed against real hardware: the
+    vendor-driver warning PROBE_SPACING's own comment cites is about rapid
+    *binary polling*, a different case, and nothing here has evidence this
+    part minds two NMEA sends with no gap -- but nobody has measured it on
+    the actual receiver either. Do not read the absence of a sleep as
+    settled; it is untested, not disproven.
     """
     speed = nmea_wrap(PCAS01.build(cmd=BAUD_CODE[INIT_BAUD]))
-    for candidate in INIT_CANDIDATES:
+    try:
+        for candidate in INIT_CANDIDATES:
+            if time.monotonic() > deadline:
+                return
+            port.set_baud(candidate)
+            port.write(speed)
+
         if time.monotonic() > deadline:
             return
-        port.set_baud(candidate)
-        port.write(speed)
+        port.set_baud(INIT_BAUD)
+        # The one read in this sequence. It goes through Session.get --
+        # unlike the sends above, a read is exactly what Session is for, and
+        # _exchange is already one of the permitted write sites (the
+        # empty-payload Get it sends is not a caller-chosen frame; see
+        # Session's own docstring).
+        readback = Session(port, allow_apply=False,
+                           timeout=min(INIT_CONFIRM_TIMEOUT,
+                                      max(0.0, deadline - time.monotonic())))
+        got = readback.get(CFG_PRT)
+        if got is None or got.get("baudRate") != INIT_BAUD:
+            # Unproven -- say nothing more than that. The `finally` below
+            # leaves the port at 115200 regardless of whether the receiver
+            # followed, so the failure surfaces as gpsd's own "no data
+            # received" rather than a speed mismatch that looks like dead
+            # hardware (see the section banner). Sending the fix rate here
+            # would be presenting an assumption as a measurement.
+            return
 
-    if time.monotonic() > deadline:
-        return
-    port.set_baud(INIT_BAUD)
-    # The one read in this sequence. It goes through Session.get -- unlike
-    # the sends above, a read is exactly what Session is for, and _exchange
-    # is already one of the permitted write sites (the empty-payload Get it
-    # sends is not a caller-chosen frame; see Session's own docstring).
-    readback = Session(port, allow_apply=False,
-                       timeout=min(INIT_CONFIRM_TIMEOUT,
-                                  max(0.0, deadline - time.monotonic())))
-    got = readback.get(CFG_PRT)
-    if got is None or got.get("baudRate") != INIT_BAUD:
-        # Unproven -- say nothing more than that. The port is already at
-        # 115200 (set above) regardless of whether the receiver followed, so
-        # the failure surfaces as gpsd's own "no data received" rather than
-        # a speed mismatch that looks like dead hardware (see the section
-        # banner). Sending the fix rate here would be presenting an
-        # assumption as a measurement.
-        return
-
-    if time.monotonic() > deadline:
-        return
-    port.write(nmea_wrap(PCAS02.build(interval=INIT_INTERVAL_MS)))
+        if time.monotonic() > deadline:
+            return
+        port.write(nmea_wrap(PCAS02.build(interval=INIT_INTERVAL_MS)))
+    finally:
+        # Every exit lands here -- deadline expiry inside the loop (which,
+        # without this, would leave the port at whichever candidate baud the
+        # loop last set, or never touched at all), an exception from
+        # write()/set_baud(), or the normal returns above. set_baud is a
+        # local termios call, not a wire operation, so this cannot hang and
+        # cannot itself blow the deadline.
+        port.set_baud(INIT_BAUD)
 
 
 def cmd_init(args):
@@ -3269,12 +3298,19 @@ class _FakePort:
     what matters there is what reaches write(), and for a refusal that nothing
     does. read() sleeps rather than returning immediately, because a real port
     blocks and a busy spin would burn a core for the length of every window.
+
+    fail_write, when set, is raised by every write() call instead of
+    recording one -- for the init checks that need to prove a write failure
+    still leaves the port at the right speed (Port.write's own real failure
+    mode is an OSError from the underlying os.write/tcdrain, which this
+    stands in for without a real, failing fd).
     """
 
-    def __init__(self, baud=9600, data=b""):
+    def __init__(self, baud=9600, data=b"", fail_write=None):
         self.baud = baud
         self.writes = []
         self._data = data
+        self._fail_write = fail_write
 
     def read(self, timeout):
         if self._data:
@@ -3284,6 +3320,8 @@ class _FakePort:
         return b""
 
     def write(self, data):
+        if self._fail_write is not None:
+            raise self._fail_write
         self.writes.append(data)
 
     def flush_input(self):
@@ -3476,22 +3514,81 @@ _INIT_CFG_PRT_POLL = CASIC.encode(*CFG_PRT.key)
 _INIT_WRITES_CACHE = {}
 
 
-def _init_writes(reply=b"", deadline=None):
-    """port.writes after one _init_sequence run against a fresh _FakePort
-    that answers every read with `reply` (default: silence).
+def _init_run(reply=b"", deadline=None):
+    """(port.writes, port.baud) after one _init_sequence run against a
+    fresh _FakePort that answers every read with `reply` (default: silence).
+
+    Both, not just the writes: the port's final speed is exactly what a
+    fix round found nothing here was asserting -- _init_writes(deadline=an
+    already-expired one) == [] passed while _init_sequence left the port at
+    9600, because nothing looked at .baud. _init_writes/_init_baud below
+    both read this same tuple so that mistake can't recur by only checking
+    one half of it.
 
     Memoized per (reply, deadline): several checks below ask different
-    questions about the same run (the exact write sequence for a given
-    reply) rather than each driving their own, and the CFG-PRT readback's
-    own read window is real wall-clock time even against a fake port.
+    questions about the same run rather than each driving their own, and
+    the CFG-PRT readback's own read window is real wall-clock time even
+    against a fake port.
     """
     key = (reply, deadline)
     if key not in _INIT_WRITES_CACHE:
         port = _FakePort(9600, reply)
         dl = time.monotonic() + 5.0 if deadline is None else deadline
         _init_sequence(port, dl)
-        _INIT_WRITES_CACHE[key] = port.writes
+        _INIT_WRITES_CACHE[key] = (port.writes, port.baud)
     return _INIT_WRITES_CACHE[key]
+
+
+def _init_writes(reply=b"", deadline=None):
+    return _init_run(reply, deadline)[0]
+
+
+def _init_baud(reply=b"", deadline=None):
+    return _init_run(reply, deadline)[1]
+
+
+def _init_mid_loop():
+    """(writes, baud) when the deadline expires between the two candidate
+    sends, i.e. after 9600's but before 115200's.
+
+    A real deadline a fraction of a second out cannot reliably land in that
+    gap against a fake port with no artificial per-write delay -- that would
+    be a race, not a test, and adding a delay to _FakePort.write() itself
+    would slow down every other check that uses it. time.monotonic is
+    stubbed for the scope of this one _init_sequence call instead, so the
+    boundary is exact: not-yet-expired for the loop's first deadline check,
+    expired for every one after.
+    """
+    port = _FakePort(9600, b"")
+    real_monotonic = time.monotonic
+    calls = [0]
+
+    def fake_monotonic():
+        calls[0] += 1
+        return 0.0 if calls[0] == 1 else 1000.0
+
+    time.monotonic = fake_monotonic
+    try:
+        _init_sequence(port, 0.5)
+    finally:
+        time.monotonic = real_monotonic
+    return port.writes, port.baud
+
+
+def _init_on_write_failure():
+    """(writes, baud) when port.write raises on every call.
+
+    Proof the `finally` in _init_sequence runs on an exception exit the
+    same as a normal one. _init_sequence does not catch this itself --
+    cmd_init does, the same as any other hardware failure -- so this
+    catches what cmd_init would, to get at what the finally left behind.
+    """
+    port = _FakePort(9600, b"", fail_write=OSError(5, "Input/output error"))
+    try:
+        _init_sequence(port, time.monotonic() + 5.0)
+    except OSError:
+        pass
+    return port.writes, port.baud
 
 
 def _init_args(device="/dev/fake", timeout=10.0):
@@ -4298,22 +4395,37 @@ def selftest():
     check("init always reports success, whatever happened",
           lambda: cmd_init(_init_args(device="/nonexistent")) == 0)
     check("unproven: exactly 3 frames, in order -- speed @9600, speed "
-          "@115200, one CFG-PRT readback, and no fix rate",
+          "@115200, one CFG-PRT readback, no fix rate -- and the port "
+          "still ends at 115200, where gpsd is about to open it",
           lambda: _init_writes() == [_INIT_SPEED, _INIT_SPEED,
-                                     _INIT_CFG_PRT_POLL])
+                                     _INIT_CFG_PRT_POLL]
+                  and _init_baud() == INIT_BAUD)
     check("proven: the readback confirming 115200 adds exactly one more "
-          "frame, in order -- the fix rate, and nothing after it",
+          "frame, in order -- the fix rate, and nothing after it -- port "
+          "still at 115200",
           lambda: _init_writes(reply=_PRT_AT_INIT_BAUD)
                   == [_INIT_SPEED, _INIT_SPEED, _INIT_CFG_PRT_POLL,
-                     _INIT_RATE])
+                     _INIT_RATE]
+                  and _init_baud(reply=_PRT_AT_INIT_BAUD) == INIT_BAUD)
     check("a CFG-PRT reply at the wrong baud also withholds the fix rate -- "
           "the readback has to agree, not merely answer -- same 3-frame "
-          "shape as no reply at all",
+          "shape as no reply at all, port still at 115200",
           lambda: _init_writes(reply=_PRT_AT_WRONG_BAUD)
-                  == [_INIT_SPEED, _INIT_SPEED, _INIT_CFG_PRT_POLL])
-    check("init honours its overall deadline: one already expired sends "
-          "nothing",
-          lambda: _init_writes(deadline=time.monotonic() - 1.0) == [])
+                  == [_INIT_SPEED, _INIT_SPEED, _INIT_CFG_PRT_POLL]
+                  and _init_baud(reply=_PRT_AT_WRONG_BAUD) == INIT_BAUD)
+    check("a deadline already expired at entry sends nothing, but still "
+          "leaves the port at 115200 -- gpsd is about to open it there "
+          "regardless of why init gave up",
+          lambda: (lambda dl: _init_writes(deadline=dl) == []
+                              and _init_baud(deadline=dl) == INIT_BAUD)
+                  (time.monotonic() - 1.0))
+    check("a deadline that expires between the two candidate sends stops "
+          "after the first one -- and still leaves the port at 115200, not "
+          "wherever that first send left it",
+          lambda: _init_mid_loop() == ([_INIT_SPEED], INIT_BAUD))
+    check("a write that raises leaves the port at 115200 too -- the "
+          "finally runs on an exception exit the same as a normal one",
+          lambda: _init_on_write_failure() == ([], INIT_BAUD))
 
     print("")
     if _FAILS:
