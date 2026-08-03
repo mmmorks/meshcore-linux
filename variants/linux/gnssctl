@@ -533,9 +533,21 @@ class Repeat:
 
 
 class Sentence:
-    def __init__(self, name, *parts):
+    def __init__(self, name, *parts, repeat=None):
         self.name = name
         self.parts = parts
+        # How many times this sentence is emitted per position fix, given
+        # the sky and the enabled talkers. Declared per sentence rather
+        # than matched on the sentence's name at the call site: the
+        # multiplicity is a property of the sentence, and a new sentence
+        # that forgot to declare one would otherwise be silently counted
+        # once per fix -- an under-count in the bandwidth guard.
+        self._repeat = repeat
+
+    def repeat(self, sats, talkers):
+        if self._repeat is None:
+            return 1
+        return self._repeat(sats, talkers)
 
     def _flat_fields(self, count=None):
         """Expand repeat blocks for a body with `count` data fields."""
@@ -673,7 +685,14 @@ GSV = Sentence("GSV",                                          # §2.2.3
                       # nothing does arithmetic on a satellite's own numbers.
                       F("satID", Num("999")), F("elev", Num("99")),
                       F("az", Num("999")), F("cn0", Num("99"))),
-               F("signalID", IntC(1)))
+               F("signalID", IntC(1)),
+               # One sentence per four satellites, per talker (§2.2.3:
+               # max four satellites per transmission, and §2.2.3 note 2
+               # forbids GN, so each constellation reports separately). A
+               # talker with no satellites in view contributes zero, not
+               # one -- sats.get(t, 0), not sats[t].
+               repeat=lambda sats, talkers: sum(
+                   math.ceil(sats.get(t, 0) / 4.0) for t in talkers))
 
 GSA = Sentence("GSA",                                          # §2.2.4
                F("mode", EnumC("M", "A")), F("fixMode", IntC(1)),
@@ -682,7 +701,10 @@ GSA = Sentence("GSA",                                          # §2.2.4
                # list the same as it can in a GSV sky view.
                Repeat(12, "sats", F("satID", IntC(3))),
                F("pdop", Num("99.0")), F("hdop", Num("99.0")),
-               F("vdop", Num("99.0")), F("systemID", IntC(1)))
+               F("vdop", Num("99.0")), F("systemID", IntC(1)),
+               # One per constellation in the solution, each carrying its
+               # own <SystemID> (§2.2.4).
+               repeat=lambda sats, talkers: len(talkers))
 
 VTG = Sentence("VTG",                                          # §2.2.5
                F("cogt", Num("359.9")), F("t", CharC),
@@ -783,6 +805,8 @@ def capacity(baud):
     8N1 framing is 1 start + 8 data + 1 stop = 10 bits per byte, so this is
     exact rather than an estimate.
     """
+    if baud <= 0:
+        raise ValueError("baud must be positive, got %r" % (baud,))
     return baud / 10.0
 
 
@@ -798,23 +822,17 @@ def talkers_for(constellations):
 def epoch_bytes(rates, sats, talkers):
     """Worst-case bytes emitted per position fix.
 
-    GSV emits ceil(sats/4) sentences per talker (§2.2.3); GSA emits one per
-    constellation, each carrying its own <SystemID> (§2.2.4). Everything else is
-    one sentence per fix. A rate of N means once every N fixes (§2.3.3).
+    Multiplicity (how many times a sentence repeats per fix) is declared on
+    the sentence itself -- see GSV's and GSA's `repeat=` -- not matched here
+    by name, so a sentence that forgot to declare one can't silently be
+    under-counted. A rate of N means once every N fixes (§2.3.3).
     """
     total = 0.0
     for name, rate in rates.items():
         if not rate:
             continue
         sentence = STANDARD_SENTENCES[name]
-        if name == "GSV":
-            per_fix = sum(math.ceil(sats.get(t, 0) / 4.0)
-                          for t in talkers) * sentence.max_width()
-        elif name == "GSA":
-            per_fix = len(talkers) * sentence.max_width()
-        else:
-            per_fix = sentence.max_width()
-        total += per_fix / float(rate)
+        total += sentence.repeat(sats, talkers) * sentence.max_width() / float(rate)
     return total
 
 
@@ -1169,6 +1187,14 @@ def selftest():
     check("the report shows its arithmetic",
           lambda: all(t in budget(_ALL8, 9600, 1, _SKY, _T3).render()
                       for t in ("9600", "B/s", "%", "ceiling")))
+    check("multiplicity is declared per sentence, not matched by name",
+          lambda: GSV.repeat({"GP": 8}, ("GP",)) == 2
+                  and GSA.repeat({"GP": 8}, ("GP", "GL")) == 2
+                  and RMC.repeat({"GP": 8}, ("GP", "GL")) == 1)
+    check("a talker with no satellites in view contributes nothing",
+          lambda: GSV.repeat({}, ("GP", "GL", "BD")) == 0)
+    check("capacity refuses a nonsensical baud rather than dividing by zero",
+          lambda: _raises(lambda: capacity(0)))
 
     print("")
     if _FAILS:
