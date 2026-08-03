@@ -793,6 +793,10 @@ MODE_CONSTELLATION = {
 }
 CONSTELLATION_MODE = {v: k for k, v in MODE_CONSTELLATION.items()}
 
+# The widest set §2.3.4 offers, for wherever the enabled constellations are
+# unknown rather than known to be empty.
+ALL_CONSTELLATIONS = max(MODE_CONSTELLATION.values(), key=len)
+
 RESTART_FLAG = {"hot": 0, "warm": 1, "cold": 2, "factory": 3}   # §2.3.5
 
 # Satellites in view per GSV talker at the theoretical ceiling. Sizes from
@@ -842,14 +846,44 @@ def epoch_bytes(rates, sats, talkers):
     return total
 
 
+def projected_sky(sats_now, constellations):
+    """(satellites per talker, the talkers whose count had to be assumed).
+
+    A talker contributes no satellites either because its constellation is
+    genuinely absent or because GSV is switched off and there is nothing to
+    count -- and to the budget those are the same zero. Since GSV is the only
+    sentence that reveals the sky, pricing a change against what GSV shows
+    prices GSV itself at zero on any node where it is currently off, and both
+    of budget()'s operating points go blind together, so not even the ceiling
+    warning fires.
+
+    An unobservable sky is unknown, not empty, so it is priced at the Table 16
+    ceiling: over-stating costs a refusal the operator can --force,
+    under-stating costs the node. Which talkers were assumed is returned rather
+    than discarded, because a figure that justifies a refusal has to be able to
+    say whether it was measured.
+    """
+    out = dict(sats_now)
+    assumed = set()
+    for talker in talkers_for(constellations):
+        if not out.get(talker):
+            out[talker] = TALKER_CEILING[talker]
+            assumed.add(talker)
+    return out, frozenset(assumed)
+
+
 class Budget:
-    def __init__(self, rates, baud, hz, now_bps, ceiling_bps):
+    def __init__(self, rates, baud, hz, now_bps, ceiling_bps, assumed=frozenset()):
         self.rates = rates
         self.baud = baud
         self.hz = hz
         self.now_bps = now_bps
         self.ceiling_bps = ceiling_bps
         self.capacity_bps = capacity(baud)
+        # Talkers whose satellite count was substituted rather than counted.
+        # Carried so the report can say which of its two numbers is a
+        # measurement -- see sky_note.
+        self.assumed = assumed
 
     @property
     def now_pct(self):
@@ -869,14 +903,35 @@ class Budget:
         """True means no headroom if every enabled constellation fills the sky."""
         return self.ceiling_bps > self.capacity_bps
 
+    @property
+    def measured(self):
+        """True if every contributing talker's sky was actually counted."""
+        return not self.assumed
+
+    @property
+    def sky_note(self):
+        """How the first operating point was arrived at.
+
+        A substituted count is an assumption, and printing it under "sky now"
+        reports an assumption as a measurement. This repository already has the
+        scar: the README warns that gpsd synthesizes NMEA for its clients, so
+        measuring the client stream and calling it the receiver yields
+        conclusions that are backwards. A number that exists to justify
+        refusing an operator has to say where it came from.
+        """
+        if self.measured:
+            return "sky now"
+        return "sky assumed for %s -- GSV is off" % "+".join(sorted(self.assumed))
+
     def render(self):
         on = ", ".join("%s@%d" % (k, v) for k, v in sorted(self.rates.items()) if v)
         return "\n".join((
             "  bandwidth check (8N1, 10 bits/byte):",
             "    link capacity         %6d baud -> %7.0f B/s" % (
                 self.baud, self.capacity_bps),
-            "    %-22s %5.1f Hz -> %7.0f B/s  %6.1f%%  (sky now)" % (
-                on or "nothing enabled", self.hz, self.now_bps, self.now_pct),
+            "    %-22s %5.1f Hz -> %7.0f B/s  %6.1f%%  (%s)" % (
+                on or "nothing enabled", self.hz, self.now_bps, self.now_pct,
+                self.sky_note),
             "    %-22s %5s    -> %7.0f B/s  %6.1f%%  (ceiling)" % (
                 "all constellations", "", self.ceiling_bps, self.ceiling_pct),
         ))
@@ -890,11 +945,16 @@ def budget(rates, baud, hz, sats_now, constellations):
     a realistic sky it is 95.6%, which both passes and explains why the vendor
     ships 1 Hz rather than faster. So "sky now" is the hard error and the
     ceiling is the headroom warning.
+
+    The substitution for an uncountable sky happens HERE rather than at the call
+    site, so that no caller can price a projection without it and none can lose
+    track of which talkers were assumed. That provenance travels on the Budget.
     """
     talkers = talkers_for(constellations)
-    now = epoch_bytes(rates, sats_now, talkers) * hz
+    sats, assumed = projected_sky(sats_now, constellations)
+    now = epoch_bytes(rates, sats, talkers) * hz
     ceiling = epoch_bytes(rates, TALKER_CEILING, talkers) * hz
-    return Budget(rates, baud, hz, now, ceiling)
+    return Budget(rates, baud, hz, now, ceiling, assumed)
 
 
 DEFAULT_DEVICE = "/dev/ttyAMA0"
@@ -1224,32 +1284,6 @@ OBSERVE_SECONDS = 1.5
 # a few sentences without hauling the whole stream around.
 RAW_WINDOW = 256
 
-# The widest set §2.3.4 offers, for wherever the enabled constellations are
-# unknown rather than known to be empty.
-ALL_CONSTELLATIONS = max(MODE_CONSTELLATION.values(), key=len)
-
-
-def projected_sky(sats_now, constellations):
-    """Satellites per talker for a projection, with the unobservable filled in.
-
-    A talker contributes no satellites either because its constellation is
-    genuinely absent or because GSV is switched off and there is nothing to
-    count -- and to the budget those are the same zero. Since GSV is the only
-    sentence that reveals the sky, pricing a change against what GSV shows
-    prices GSV itself at zero on any node where it is currently off, and both
-    of budget()'s operating points go blind together, so not even the ceiling
-    warning fires.
-
-    An unobservable sky is unknown, not empty, so it is priced at the Table 16
-    ceiling: over-stating costs a refusal the operator can --force,
-    under-stating costs the node.
-    """
-    out = dict(sats_now)
-    for talker in talkers_for(constellations):
-        if not out.get(talker):
-            out[talker] = TALKER_CEILING[talker]
-    return out
-
 
 class Change:
     """One documented configuration change.
@@ -1523,9 +1557,18 @@ class Session:
     rather than by convention, and why --selftest can assert it.
     """
 
-    def __init__(self, port, allow_apply=False):
+    def __init__(self, port, allow_apply=False, timeout=PROBE_TIMEOUT,
+                 observe=OBSERVE_SECONDS):
         self.port = port
         self.allow_apply = allow_apply
+        # How long to sit on the wire, per read window and per pre-flight
+        # observation. Parameters rather than module lookups so --selftest can
+        # shrink its own windows against a fake port without touching the real
+        # defaults. PROBE_SPACING is deliberately NOT one of these: the pause
+        # between writes is what keeps a receiver that gets cranky under rapid
+        # reconfiguration from being misread as broken.
+        self.timeout = timeout
+        self.observe_seconds = observe
         self.framing = CASIC
         # Scan for EVERY framing, not just the one being asked in. A chip with
         # one command parser and one output formatter may well answer a foreign
@@ -1562,9 +1605,9 @@ class Session:
         from counting the wire. Reporting an inference as a readback is the
         same trap the README records about measuring gpsd's synthesized NMEA.
 
-        Accurate to +-1 epoch: OBSERVE_SECONDS is wall clock, not a whole
-        number of fixes, so at 1 Hz a 1.5 s window catches one epoch or two
-        depending on where it lands. Rates are ratios, so a partial epoch
+        Accurate to +-1 epoch: the observation window is wall clock, not a
+        whole number of fixes, so at 1 Hz a 1.5 s window catches one epoch or
+        two depending on where it lands. Rates are ratios, so a partial epoch
         mostly cancels, but a sentence at rate 2 can read as 1 or 3.
         """
         # Accumulate per sentence NAME across talkers. $GPGSV, $BDGSV and
@@ -1651,7 +1694,7 @@ class Session:
             self.port.flush_input()
             self.nmea.take_lines()
             self.port.write(nmea_wrap(p.payload))
-            self._read_window(PROBE_TIMEOUT)
+            self._read_window(self.timeout)
             # A reply is any sentence that is not routine positioning data --
             # and routine positioning data is exactly what $PCAS03 meters, so
             # the set comes from that command's field table rather than from a
@@ -1687,19 +1730,28 @@ class Session:
         # what the guard stands in front of is change.sentences(), and none of
         # those is written until the budget has passed or been overridden.
         bud = None
-        obs = self.observe(OBSERVE_SECONDS)
+        obs = self.observe(self.observe_seconds)
         projection = change.projected(self, obs)
         if projection is not None:
             rates, baud, hz, constellations = projection
-            bud = budget(rates, baud, hz,
-                         projected_sky(obs.sats_in_view, constellations),
-                         constellations)
+            bud = budget(rates, baud, hz, obs.sats_in_view, constellations)
             if not bud.ok and not force:
+                # Say which number this is refusing on. With GSV off the sky
+                # cannot be counted and is priced at the Table 16 ceiling, which
+                # is the safe direction but is an assumption -- and refusing an
+                # operator on an assumption without saying so is how "re-enable
+                # GSV at 9600", the documented reason this tooling exists, turns
+                # into an unexplained wall.
+                why = ""
+                if not bud.measured:
+                    why = (" The sky was assumed, not measured (%s): GSV is off, "
+                           "so there is nothing to count. If you know the sky is "
+                           "sparse, --force." % "+".join(sorted(bud.assumed)))
                 return Verdict(
                     "refused",
-                    "%s: %.0f%% of the link -- the stream would never drain. "
-                    "Cut the load or raise the speed first, or --force." % (
-                        change.describe(), bud.now_pct),
+                    "%s: %.0f%% of the link (%s) -- the stream would never "
+                    "drain. Cut the load or raise the speed first, or --force.%s"
+                    % (change.describe(), bud.now_pct, bud.sky_note, why),
                     bud)
 
         for sentence in change.sentences():
@@ -1784,7 +1836,7 @@ class Session:
         for sc in self.scanners.values():
             sc.take()
         self.port.write(self.framing.encode(message.cls, message.mid, b""))
-        for frame in self._read_window(PROBE_TIMEOUT):
+        for frame in self._read_window(self.timeout):
             if frame.framing != self.framing.name:
                 continue
             if frame.key == message.key:
@@ -1808,7 +1860,7 @@ class Session:
             return None
 
         self.port.write(self.framing.encode(p.cls, p.mid, p.payload))
-        frames = self._read_window(PROBE_TIMEOUT)
+        frames = self._read_window(self.timeout)
 
         tally = {}
         for fr in frames:
@@ -1933,6 +1985,23 @@ def _sky(counts, sats):
     return obs
 
 
+# The wire window the fake-port checks run with. They assert ordering, refusal
+# and classification, none of which depends on how long the window is: the fake
+# port hands over its whole reply on the first read, so the rest of a real
+# 1.5 s window would be pure sleep. The production defaults are untouched.
+_TEST_WINDOW = 0.05
+
+# One whole epoch of a twelve-satellite GPS sky, and a wire with no GSV on it
+# at all -- the two fixtures the apply() checks need, since "what the sky is"
+# and "whether the sky can be seen" are what the bandwidth guard turns on.
+_EPOCH = (nmea_wrap("GPGSV,3,1,12,02,49,123,43,0")
+          + nmea_wrap("GPGSV,3,2,12,05,60,005,43,0")
+          + nmea_wrap("GPGSV,3,3,12,06,06,127,29,0")
+          + nmea_wrap("GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1"))
+_NO_GSV = nmea_wrap("GNRMC,071556.000,A,3149.29103,N,11706.92916,E,"
+                    "0.00,0.00,250420,,,A,V")
+
+
 class _FakePort:
     """A quiet port that records what was written to it. Not hardware.
 
@@ -1964,20 +2033,18 @@ class _FakePort:
         self.baud = baud
 
 
-def _apply_on_quiet_port(change, **kw):
-    """(port, verdict) for one apply() against a port showing one epoch of sky.
+def _apply_on_quiet_port(change, sky=None, **kw):
+    """(port, verdict) for one apply() against a port showing `sky`.
 
-    A whole epoch, not a sample of one: twelve GPS satellites take three GSV
-    sentences to report (§2.2.3, four per transmission), so a single one would
-    correctly infer "GSV every third fix" and price the stream at a third of
-    what it costs. The budget must be refusing real traffic here, not an
-    artefact of the fixture.
+    The default is a WHOLE epoch, not a sample of one: twelve GPS satellites
+    take three GSV sentences to report (§2.2.3, four per transmission), so a
+    single one would correctly infer "GSV every third fix" and price the stream
+    at a third of what it costs. The budget must be refusing real traffic here,
+    not an artefact of the fixture.
     """
-    port = _FakePort(9600, nmea_wrap("GPGSV,3,1,12,02,49,123,43,0")
-                     + nmea_wrap("GPGSV,3,2,12,05,60,005,43,0")
-                     + nmea_wrap("GPGSV,3,3,12,06,06,127,29,0")
-                     + nmea_wrap("GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1"))
-    return port, Session(port, allow_apply=True).apply(change, **kw)
+    port = _FakePort(9600, _EPOCH if sky is None else sky)
+    return port, Session(port, allow_apply=True, timeout=_TEST_WINDOW,
+                         observe=_TEST_WINDOW).apply(change, **kw)
 
 
 def _breaking_readback(change, exc):
@@ -1996,12 +2063,12 @@ def _breaking_readback(change, exc):
 def _poll_on_quiet_port(n, data):
     """(port, result) for one poll against a port that answers once, then quiets.
 
-    On a read-only session, which is where a poll belongs. Costs a whole
-    PROBE_TIMEOUT of wall clock: the read window runs its course rather than
-    stopping at the first answer, so silence and an answer cost the same.
+    On a read-only session, which is where a poll belongs. The read window runs
+    its course rather than stopping at the first answer -- silence and an answer
+    cost the same -- which is why these run on a shortened one.
     """
     port = _FakePort(9600, data)
-    return port, Session(port).poll(n)
+    return port, Session(port, timeout=_TEST_WINDOW).poll(n)
 
 
 def _scan(framing, *chunks):
@@ -2412,8 +2479,11 @@ def selftest():
                   and Session(None).current_constellations(_sky({}, {"GP": 6}))
                   == frozenset(("GPS",)))
     check("a talker with nothing to count is priced at the ceiling, not zero",
-          lambda: projected_sky({}, ALL_CONSTELLATIONS) == TALKER_CEILING
-                  and projected_sky({"GP": 6}, ALL_CONSTELLATIONS)["GP"] == 6)
+          lambda: (lambda sats, assumed: sats == TALKER_CEILING
+                   and assumed == frozenset(TALKER_CEILING))(
+              *projected_sky({}, ALL_CONSTELLATIONS))
+          and (lambda sats, assumed: sats["GP"] == 6 and "GP" not in assumed)(
+              *projected_sky({"GP": 6}, ALL_CONSTELLATIONS)))
     # The measured case: enabling GSV on a node that shows only $GNRMC. Priced
     # against the observed sky, GSV costs zero and both operating points go
     # blind together, so the change is approved on the way to muting the node.
@@ -2421,8 +2491,24 @@ def selftest():
           lambda: (lambda blind, seen: blind.ok and 40.0 < blind.now_pct < 41.0
                    and not seen.ok)(
               budget({"RMC": 1, "GSV": 1}, 9600, 5.0, {}, frozenset()),
-              budget({"RMC": 1, "GSV": 1}, 9600, 5.0,
-                     projected_sky({}, ALL_CONSTELLATIONS), ALL_CONSTELLATIONS)))
+              budget({"RMC": 1, "GSV": 1}, 9600, 5.0, {}, ALL_CONSTELLATIONS)))
+    # ...but the price of that is a number nobody measured, and a report that
+    # calls it "sky now" claims a measurement that never happened.
+    check("a budget says whether its sky was measured or assumed",
+          lambda: (lambda seen, blind:
+                   seen.measured and not seen.assumed
+                   and "(sky now)" in seen.render()
+                   and not blind.measured
+                   and blind.assumed == frozenset(("GP", "GL", "BD"))
+                   and "sky assumed for BD+GL+GP" in blind.render()
+                   and "(sky now)" not in blind.render())(
+              budget(_ALL8, 9600, 1, _SKY, _T3),
+              budget({"RMC": 1, "GSV": 1}, 9600, 1.0, {}, ALL_CONSTELLATIONS)))
+    check("a refusal on an assumed sky says so and names the escape",
+          lambda: (lambda p, v: v.status == "refused"
+                   and "assumed, not measured" in v.detail
+                   and "--force" in v.detail)(
+              *_apply_on_quiet_port(SetSentences({"GSV": 1}), sky=_NO_GSV)))
 
     print("")
     print("poll (against a recording port, no hardware):")
@@ -2457,8 +2543,8 @@ def selftest():
     # CASIC layout would report a confident wrong number to the guard.
     check("a readback declines a reply framed in another dialect",
           lambda: Session(_FakePort(9600, UBX.encode(
-              *CFG_RATE.key, CFG_RATE.build(interval=500, res=0)))
-          ).get(CFG_RATE) is None)
+              *CFG_RATE.key, CFG_RATE.build(interval=500, res=0))),
+              timeout=_TEST_WINDOW).get(CFG_RATE) is None)
 
     print("")
     print("apply (against a recording port, no hardware):")
