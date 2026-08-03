@@ -469,9 +469,9 @@ class TextCodec:
         return str(value)
 
 
-def Num(max):
+def Num(widest):
     """A numeric field bounded by the widest value the spec permits."""
-    return TextCodec("Num", len(max))
+    return TextCodec("Num", len(widest))
 
 
 def IntC(width):
@@ -543,7 +543,16 @@ class Sentence:
                 # Variable block: everything not accounted for by the fixed
                 # fields belongs to it. GSV is header(3) + 4n + signalID(1).
                 fixed = sum(1 for p in self.parts if isinstance(p, F))
-                times = max(0, (count - fixed)) // len(part.fields)
+                leftover = max(0, count - fixed)
+                # A truncated sentence (dropped byte, cut-off read) leaves a
+                # remainder that doesn't fill a whole row. Guessing here would
+                # silently misattribute a field -- e.g. a stray satID read as
+                # signalID -- so refuse rather than parse it wrong.
+                if leftover % len(part.fields):
+                    raise ValueError(
+                        "%s: %d field(s) do not fill whole %d-field repeat blocks"
+                        % (self.name, leftover, len(part.fields)))
+                times = leftover // len(part.fields)
             out.append((part, times))
         return out
 
@@ -662,11 +671,10 @@ GSV = Sentence("GSV",                                          # §2.2.3
 
 GSA = Sentence("GSA",                                          # §2.2.4
                F("mode", EnumC("M", "A")), F("fixMode", IntC(1)),
-               # <SatID> here has the same 3-digit QZSS range as GSV's (Table
-               # 16), but §2.2.4's own worked example never exceeds 2 digits,
-               # so nothing exercises the gap. Left at IntC(2) pending the same
-               # width reconciliation GSV needed -- see that sentence's note.
-               Repeat(12, "sats", F("satID", IntC(2))),
+               # Three digits, not two: Table 16 assigns QZSS the range
+               # 193-197, and a QZSS satellite can appear in a GSA solution
+               # list the same as it can in a GSV sky view.
+               Repeat(12, "sats", F("satID", IntC(3))),
                F("pdop", Num("99.0")), F("hdop", Num("99.0")),
                F("vdop", Num("99.0")), F("systemID", IntC(1)))
 
@@ -893,6 +901,11 @@ def selftest():
               GSV.parse(SPEC_NMEA[7].rsplit("*", 1)[0][5:])))
     check("GSV reads a short final sentence",
           lambda: len(GSV.parse(SPEC_NMEA[9].rsplit("*", 1)[0][5:])["sats"]) == 4)
+    check("a truncated sentence is refused, not silently misattributed",
+          lambda: GSV.parse("GSV,1,1,03,05,60,005,43,06,06,127,29,07,05,042,33,0")
+                     ["signalID"] == 0
+                  and _raises(lambda: GSV.parse(
+                      "GSV,1,1,03,05,60,005,43,06,06,127,29,07,05,042,33")))
     check("VTG, GLL, ZDA and TXT all parse their examples",
           lambda: all(s.parse(SPEC_NMEA[i].rsplit("*", 1)[0][5:]) for i, s in
                       ((15, VTG), (16, GLL), (19, ZDA), (17, TXT))))
@@ -918,7 +931,7 @@ def selftest():
           lambda: [TXT.max_width(), GGA.max_width(), RMC.max_width(),
                    GSV.max_width(), GSA.max_width(), GLL.max_width(),
                    VTG.max_width(), ZDA.max_width()]
-                  == [82, 81, 77, 76, 68, 53, 42, 39])
+                  == [82, 81, 77, 76, 80, 53, 42, 39])
 
     print("")
     if _FAILS:
