@@ -289,6 +289,140 @@ SPEC_CASIC = {
     "CFG-RATE set 500":   "bace04000604f4010000f8010604",
 }
 
+# §3.2.2.1 Table 9. Bits 2-3 and 6-7 are undocumented and left unnamed.
+PROTO_MASK = ((0, "binary in"), (1, "text in"), (4, "binary out"), (5, "text out"))
+
+# §3.2.2.3 Table 12. Each bit clears one section of battery-backed RAM.
+BBR_SECTIONS = ((0, "ephemeris"), (1, "almanac"), (2, "health"),
+                (3, "ionospheric"), (4, "position"), (5, "clock drift"),
+                (6, "oscillator"), (7, "UTC"), (8, "RTC"), (9, "configuration"))
+
+RESET_MODE = {0: "immediate hardware reset (watchdog)", 1: "software reset",
+              2: "software reset, GPS only", 4: "hardware reset after power off"}
+START_MODE = {0: "hot start", 1: "warm start", 2: "cold start",
+              3: "factory data reset"}
+
+# §3.2.2.2 Table 11. 0 = off, 1-9 = every Nth fix, 0xFFFF = emit once now.
+MSG_RATE_SPECIAL = {0: "off", 0xFFFF: "once (query)"}
+
+
+def _mode_flags(mode):
+    """Decode CFG-PRT <Mode> into a '8N1'-style string (§3.2.2.1 Table 10)."""
+    bits = {0: "5", 1: "6", 2: "7", 3: "8"}[(mode >> 6) & 3]
+    par = (mode >> 9) & 7
+    parity = "N" if par & 4 else ("O" if par == 1 else "E")
+    stop = {0: "1", 1: "1.5", 2: "2"}.get((mode >> 12) & 3, "?")
+    return bits + parity + stop
+
+
+class Field:
+    __slots__ = ("name", "codec", "bits", "enum", "unit")
+
+    def __init__(self, name, codec, bits=None, enum=None, unit=None):
+        self.name = name
+        self.codec = codec
+        self.bits = bits
+        self.enum = enum
+        self.unit = unit
+
+    def describe(self, value):
+        if self.name == "mode":
+            return _mode_flags(value)
+        if self.bits:
+            return [label for bit, label in self.bits if value & (1 << bit)]
+        if self.enum:
+            return self.enum.get(value, value)
+        return value
+
+
+class Message:
+    """One CASIC message, declared once as its spec field table.
+
+    build() and parse() are both driven by that table, so an encoder and a
+    decoder cannot drift apart -- which is the whole reason the tables are data
+    rather than hand-written pack/unpack pairs.
+    """
+
+    def __init__(self, name, cls, mid, *fields):
+        self.name = name
+        self.cls = cls
+        self.mid = mid
+        self.fields = fields
+        self.size = sum(f.codec.size for f in fields)
+
+    @property
+    def key(self):
+        return (self.cls, self.mid)
+
+    def build(self, **kw):
+        out = bytearray()
+        for f in self.fields:
+            if f.name not in kw:
+                raise ValueError("%s: missing field %s" % (self.name, f.name))
+            try:
+                out += f.codec.pack(kw[f.name])
+            except struct.error as exc:
+                raise ValueError("%s.%s: %s" % (self.name, f.name, exc))
+        extra = set(kw) - {f.name for f in self.fields}
+        if extra:
+            raise ValueError("%s: unknown field(s) %s" % (self.name, ", ".join(sorted(extra))))
+        if len(out) % 4:
+            raise ValueError("%s: payload %d bytes, not a multiple of 4 (§3.1)"
+                             % (self.name, len(out)))
+        return bytes(out)
+
+    def parse(self, payload):
+        if len(payload) < self.size:
+            raise ValueError("%s: payload %d bytes, need %d"
+                             % (self.name, len(payload), self.size))
+        out = {}
+        off = 0
+        for f in self.fields:
+            out[f.name] = f.codec.unpack(payload[off:off + f.codec.size])
+            off += f.codec.size
+        return out
+
+    def describe(self, payload):
+        raw = self.parse(payload)
+        return {f.name: f.describe(raw[f.name]) for f in self.fields}
+
+
+CFG_PRT = Message("CFG-PRT", 0x06, 0x00,                       # §3.2.2.1 Table 8
+                  Field("portID", U1),
+                  Field("protoMask", U1, bits=PROTO_MASK),
+                  Field("mode", U2),
+                  Field("baudRate", U4, unit="bps"))
+
+CFG_MSG = Message("CFG-MSG", 0x06, 0x01,                       # §3.2.2.2 Table 11
+                  Field("clsID", U1),
+                  Field("msgID", U1),
+                  Field("rate", U2, enum=MSG_RATE_SPECIAL))
+
+CFG_RST = Message("CFG-RST", 0x06, 0x02,                       # §3.2.2.3 Table 12
+                  Field("navBbrMask", U2, bits=BBR_SECTIONS),
+                  Field("resetMode", U1, enum=RESET_MODE),
+                  Field("startMode", U1, enum=START_MODE))
+
+CFG_RATE = Message("CFG-RATE", 0x06, 0x04,                     # §3.2.2.4 Table 13
+                   Field("interval", U2, unit="ms"),
+                   Field("res", U2))
+
+ACK_ACK = Message("ACK-ACK", 0x05, 0x01,                       # §3.2.1.2 Table 7
+                  Field("clsID", U1), Field("msgID", U1), Field("res", U2))
+
+ACK_NACK = Message("ACK-NACK", 0x05, 0x00,                     # §3.2.1.1 Table 6
+                   Field("clsID", U1), Field("msgID", U1), Field("res", U2))
+
+CASIC_MESSAGES = {m.key: m for m in
+                  (CFG_PRT, CFG_MSG, CFG_RST, CFG_RATE, ACK_ACK, ACK_NACK)}
+
+# §3.1.2 Table 5. Note the class is 0x4E here and 0xF0 in u-blox --
+# gpsd-gnss-tuning.conf drives the u-blox numbering through ubxtool, which is a
+# different interface. Conflating the two silently addresses the wrong message.
+NMEA_MSG_ID = {"GGA": (0x4E, 0x00), "GLL": (0x4E, 0x01), "GSA": (0x4E, 0x02),
+               "GSV": (0x4E, 0x03), "RMC": (0x4E, 0x04), "VTG": (0x4E, 0x05),
+               "ZDA": (0x4E, 0x08)}
+
 
 def check(name, fn):
     """Record one assertion.
@@ -404,6 +538,50 @@ def selftest():
                   == [b"\xba\xce\xba\xce"])
     check("a bad frame is skipped and the next one still found",
           lambda: len(_scan(CASIC, bytes(bytearray(_f[:-1]) + b"\xff") + _f)) == 1)
+
+    print("")
+    print("CASIC message tables (§3.2):")
+    check("CFG-MSG builds the spec's GGA-enable frame",
+          lambda: CASIC.encode(CFG_MSG.cls, CFG_MSG.mid,
+                               CFG_MSG.build(clsID=0x4E, msgID=0x00, rate=1))
+                  == bytes.fromhex(SPEC_CASIC["CFG-MSG set GGA"]))
+    check("CFG-RATE builds the spec's 2 Hz frame",
+          lambda: CASIC.encode(CFG_RATE.cls, CFG_RATE.mid,
+                               CFG_RATE.build(interval=500, res=0))
+                  == bytes.fromhex(SPEC_CASIC["CFG-RATE set 500"]))
+    check("CFG-RST builds the spec's clear-configuration frame",
+          lambda: CASIC.encode(CFG_RST.cls, CFG_RST.mid,
+                               CFG_RST.build(navBbrMask=0x01FF, resetMode=0, startMode=0))
+                  == bytes.fromhex(SPEC_CASIC["CFG-RST clear cfg"]))
+    check("CFG-PRT parses the spec's UART0 response (§3.2.2.1 Table 8)",
+          lambda: CFG_PRT.parse(bytes.fromhex("00ffc00880250000"))
+                  == {"portID": 0, "protoMask": 0xFF, "mode": 0x08C0, "baudRate": 9600})
+    check("CFG-RATE parses the spec's 1000 ms response",
+          lambda: CFG_RATE.parse(bytes.fromhex("e8030000"))["interval"] == 1000)
+    check("ACK-ACK names the message it acknowledges",
+          lambda: ACK_ACK.parse(bytes.fromhex("06000000"))["clsID"] == 0x06)
+    check("every CASIC payload is a multiple of 4 bytes (§3.1)",
+          lambda: all(m.size % 4 == 0 for m in CASIC_MESSAGES.values()))
+    check("every message round-trips: parse(build(x)) == x",
+          lambda: all(m.parse(m.build(**v)) == v for m, v in (
+              (CFG_PRT, {"portID": 1, "protoMask": 0x07, "mode": 0x08C0,
+                         "baudRate": 115200}),
+              (CFG_MSG, {"clsID": 0x4E, "msgID": 0x03, "rate": 0xFFFF}),
+              (CFG_RST, {"navBbrMask": 0x0200, "resetMode": 1, "startMode": 2}),
+              (CFG_RATE, {"interval": 200, "res": 0}),
+              (ACK_NACK, {"clsID": 0x06, "msgID": 0x0C, "res": 0}))))
+    check("build refuses an out-of-range value rather than truncating",
+          lambda: _raises(lambda: CFG_MSG.build(clsID=0x4E, msgID=0, rate=70000)))
+    check("build refuses a missing field",
+          lambda: _raises(lambda: CFG_RATE.build(interval=200)))
+    check("mode 0x08C0 describes as 8N1 (§3.2.2.1 Table 10)",
+          lambda: CFG_PRT.describe(bytes.fromhex("00ffc00880250000"))["mode"] == "8N1")
+    check("protoMask 0xff describes all four protocol bits (Table 9)",
+          lambda: set(CFG_PRT.describe(bytes.fromhex("00ffc00880250000"))["protoMask"])
+                  == {"binary in", "text in", "binary out", "text out"})
+    check("NMEA message IDs use CASIC class 0x4E, not u-blox 0xf0 (Table 5)",
+          lambda: NMEA_MSG_ID["GGA"] == (0x4E, 0x00)
+                  and NMEA_MSG_ID["ZDA"] == (0x4E, 0x08))
 
     print("")
     if _FAILS:
