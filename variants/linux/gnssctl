@@ -2144,22 +2144,53 @@ def _init_sequence(port, deadline):
         port.set_baud(INIT_BAUD)
 
 
-def cmd_init(args):
+def cmd_init(args, port_factory=Port):
     """Boot-path entry point for `gnssctl init DEVICE`. Always returns 0 --
     see the section banner for why a failure here must never stop gpsd
     starting.
 
     Runs from gpsd's ExecStartPre. Not finding the device is not an error
     either: a node with no GNSS HAT still starts gpsd for other devices.
+
+    Catches BaseException, not Exception -- the one place in this file
+    where that is the requirement, not a bug (everywhere else, swallowing
+    BaseException would hide a real interrupt). Exception does not catch
+    KeyboardInterrupt or SystemExit; they are BaseException's other
+    children, not Exception's. A non-zero exit here stops ExecStartPre,
+    which stops gpsd from starting at all -- and a node with no gpsd loses
+    its clock outright, which is worse than whatever interrupted this run.
+    A mis-tuned receiver is recoverable; a missing one is not.
+
+    SIGTERM -- what systemd sends when ExecStartPre exceeds
+    TimeoutStartSec -- has no Python-level default that raises anything
+    (unlike SIGINT, which the interpreter already turns into
+    KeyboardInterrupt on its own), so nothing would reach the except clause
+    below without a handler; one is installed for the scope of this call,
+    converting SIGTERM into the same KeyboardInterrupt SIGINT already
+    produces, so both funnel through the one except below instead of
+    needing two. Restored in a finally so a SIGTERM arriving after this
+    function returns is not still routed through a handler with nothing
+    left to protect.
+
+    port_factory defaults to the real Port; --selftest injects a fake one
+    to prove an interrupt mid-_init_sequence still returns 0 and still
+    leaves the port at INIT_BAUD, without touching hardware.
     """
     if not os.path.exists(args.device):
         return 0
     deadline = time.monotonic() + args.timeout
+
+    def _on_term(signum, frame):
+        raise KeyboardInterrupt
+
+    previous_term = signal.signal(signal.SIGTERM, _on_term)
     try:
-        with Port(args.device, 9600) as port:
+        with port_factory(args.device, 9600) as port:
             _init_sequence(port, deadline)
-    except Exception as exc:
+    except BaseException as exc:
         print("gnssctl init: %s" % exc, file=sys.stderr)
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
     return 0
 
 
@@ -3183,15 +3214,17 @@ def _split_device(argv):
     return None, argv
 
 
-def parse_args(argv):
-    """argparse.Namespace for one gnssctl invocation.
+def _build_parser():
+    """The argparse.ArgumentParser itself, built but not yet run against
+    any argv.
 
-    Every attribute a cmd_* function reads via args.NAME (see each cmd_*'s
-    own docstring, and the interface note at the top of this section) is
-    guaranteed present here, with a sensible default, whether or not the
-    corresponding flag was given on the command line -- see the --selftest
-    checks below that walk this function's own output and assert exactly
-    that for cmd_probe/cmd_monitor/cmd_bandwidth/cmd_init.
+    Factored out of parse_args() so --selftest can inspect the live tree
+    argparse itself builds -- e.g. which verbs the top-level subparsers
+    action actually offers, or which targets 'set's own sub-subparsers
+    offer -- and assert SET_BUILDERS/CLI_DISPATCH against THAT, rather than
+    against a second, hand-authored list that could drift from what the
+    parser really accepts. See _subparser_choices below and the checks that
+    use it.
 
     --force/--yes/--raw/--json/--interval reuse the REPL's own flag names
     for the same meanings (see _parse_flags and the DISPATCH handlers above)
@@ -3209,8 +3242,6 @@ def parse_args(argv):
     hypothetical link speed to price -- so one flag serves both without
     that collision.
     """
-    device, rest = _split_device(list(argv))
-
     ap = argparse.ArgumentParser(
         prog="gnssctl",
         description="Read and configure the GNSS receiver on this node. "
@@ -3294,7 +3325,34 @@ def parse_args(argv):
     p.add_argument("--timeout", type=float, default=10.0,
                    help="deadline in seconds (default 10)")
 
-    args = ap.parse_args(rest)
+    return ap
+
+
+def _subparser_choices(parser):
+    """{name: sub-ArgumentParser} for the first level of subparsers under
+    `parser` -- argparse's own record of what a subcommand tree actually
+    offers, read from the live parser object rather than restated as a
+    second, driftable list. () if `parser` declares no subparsers action
+    (a leaf, e.g. 'set baud').
+    """
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return dict(action.choices)
+    return {}
+
+
+def parse_args(argv):
+    """argparse.Namespace for one gnssctl invocation.
+
+    Every attribute a cmd_* function reads via args.NAME (see each cmd_*'s
+    own docstring, and the interface note at the top of this section) is
+    guaranteed present here, with a sensible default, whether or not the
+    corresponding flag was given on the command line -- see the --selftest
+    checks below that walk this function's own output and assert exactly
+    that for cmd_probe/cmd_monitor/cmd_bandwidth/cmd_init.
+    """
+    device, rest = _split_device(list(argv))
+    args = _build_parser().parse_args(rest)
     args.device = device
     return args
 
@@ -3468,7 +3526,7 @@ def _on_interrupt(guard):
     sys.exit(EXIT_INTERRUPTED)
 
 
-def main(argv):
+def main(argv, port_factory=Port):
     """The front door. See the section banner above for the exit codes.
 
     --selftest is handled before anything else: no root, no device, no
@@ -3480,15 +3538,34 @@ def main(argv):
     Session built here and handed to repl() -- see repl()'s own docstring
     for why it, unlike every cmd_*, does not build one itself.
 
-    A SIGINT/SIGTERM handler is installed once the device is known to exist
-    (so an interrupt before that has nothing to restore) and stays
-    installed for the rest of the run, restoring the guard on either signal
-    -- see _on_interrupt.
+    Only SIGTERM gets a custom handler, installed once the device is known
+    to exist (so an interrupt before that has nothing to restore) -- see
+    _on_interrupt. SIGINT is deliberately left at Python's own default,
+    which raises KeyboardInterrupt: repl() catches it at the prompt and
+    per-command (return to 'gnssctl>', not exit) and _monitor_loop catches
+    it to stop cleanly and return 0 ("Ctrl-C to stop", its own --help text)
+    -- both narrower, more specific handlers than this function has any
+    business overriding. Installing a custom SIGINT handler here would stop
+    Python from ever raising KeyboardInterrupt at all for the rest of the
+    process (a signal handler REPLACES the default disposition, it does not
+    sit in front of it), which would silently turn "Ctrl-C returns to the
+    prompt" and "Ctrl-C stops monitor" into "Ctrl-C kills the process" --
+    confirmed by executing the module before this fix. The `except
+    KeyboardInterrupt` below is the outer net: it only catches what escapes
+    repl()'s and _monitor_loop's own handling (there is none for
+    show/probe/bandwidth/set/restart, and baud auto-detection itself has
+    none either), and restores the guard the same way _on_interrupt does
+    for SIGTERM.
 
     Port.close() is not idempotent (a second call raises "Bad file
     descriptor" -- inherited from gnss-probe's own Port, see its own
     docstring): every path below that opens a port closes it exactly once,
     in the single `finally` at the bottom, never both there and inline.
+
+    port_factory defaults to the real Port; --selftest injects a fake one
+    for the check that drives an interrupt through this function's own
+    composition (not a separately factored copy of it) without hardware or
+    root.
     """
     try:
         args = parse_args(argv)
@@ -3522,14 +3599,14 @@ def main(argv):
         return EXIT_NO_PORT
 
     guard = ServiceGuard(enabled=not args.no_service_control)
-    signal.signal(signal.SIGINT, lambda signum, frame: _on_interrupt(guard))
     signal.signal(signal.SIGTERM, lambda signum, frame: _on_interrupt(guard))
 
     with guard:
         port = None
         try:
             port, obs = _open_with_baud_detection(args.device, args.baud,
-                                                  OBSERVE_SECONDS)
+                                                  OBSERVE_SECONDS,
+                                                  port_factory=port_factory)
             if port is None:
                 bauds = [args.baud] if args.baud else list(BAUD_CANDIDATES)
                 print("gnssctl: no recognisable data at %s" %
@@ -3544,6 +3621,16 @@ def main(argv):
                 session = Session(port, allow_apply=True)
                 return repl(session, args)
             return spec.fn(port, args)
+        except KeyboardInterrupt:
+            # Only reached if repl()'s or _monitor_loop's own, narrower
+            # handling did not catch it themselves -- e.g. during baud
+            # auto-detection (before either has started), or during a
+            # one-shot command with no handler of its own (show/probe/
+            # bandwidth/set/restart). Returning from inside `with guard:`
+            # still runs guard.__exit__ -> restore(), the same guarantee
+            # _on_interrupt gives SIGTERM explicitly.
+            print("")
+            return EXIT_INTERRUPTED
         except OSError as exc:
             print("gnssctl: cannot open %s: %s" % (args.device, exc),
                   file=sys.stderr)
@@ -3774,6 +3861,13 @@ class _FakePort:
 
     def close(self):
         self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
 
 class _QuietThenInterrupt:
@@ -4074,6 +4168,27 @@ def _main_as_nonroot(argv):
         os.geteuid = real
 
 
+def _cmd_set_capture(**kw):
+    """(exit_code, stdout, port) from one cmd_set call against a fresh,
+    quiet _FakePort -- lets a check assert on the Verdict's own printed
+    status (NAK/OK/REFUSED/UNCONFIRMED), not just the exit code: several
+    different Verdict.status values map to the same EXIT_OK, so an
+    exit-code-only check cannot tell a nak from an unconfirmed from an
+    outright ok. The port is returned too, for checks that also want a
+    side effect like the re-clocked baud. _TEST_WINDOW is applied
+    automatically -- see cmd_set's own docstring for the timeout/
+    observe_seconds escape hatch this uses.
+    """
+    import io          # only used here, and this is the only caller
+    import contextlib  # only used here, and this is the only caller
+    port = _FakePort(9600, b"")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cmd_set(port, _Args(timeout=_TEST_WINDOW,
+                                   observe_seconds=_TEST_WINDOW, **kw))
+    return code, out.getvalue(), port
+
+
 def _baud_fake_factory(recognisable_at, calls=None):
     """A port_factory for _open_with_baud_detection: a real Port's
     constructor takes (path, baud) and opens hardware; this ignores the
@@ -4158,6 +4273,207 @@ def _guard_interrupted_stop():
     finally:
         systemctl = real_systemctl
     return [c[1] for c in calls if c[0] == "start"]
+
+
+def _signals_installed(func_name):
+    """The set of signal.SIGXXX names `func_name`'s own body passes to
+    signal.signal(...), read from the module's own syntax tree -- same
+    AST-walk approach as _write_sites/_uses_apply/_session_calls. Pins
+    that main() installs a handler for SIGTERM only, leaving SIGINT at
+    Python's own default (which raises KeyboardInterrupt) so repl()'s and
+    _monitor_loop's own, narrower handlers get first refusal at it -- see
+    main()'s own docstring for why installing one for SIGINT too would
+    silently break both.
+    """
+    import ast  # only used here, and this is the only caller
+    with open(__file__) as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            out = set()
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "signal"
+                        and isinstance(inner.func.value, ast.Name)
+                        and inner.func.value.id == "signal"
+                        and inner.args
+                        and isinstance(inner.args[0], ast.Attribute)):
+                    out.add(inner.args[0].attr)
+            return out
+    return set()
+
+
+def _interrupting_port_factory(device, baud):
+    """A port_factory that raises KeyboardInterrupt instead of returning
+    anything -- a stand-in for a real Ctrl-C/SIGTERM landing exactly as
+    _open_with_baud_detection is about to open the port, before repl() or
+    _monitor_loop even start. Neither of their own, narrower handling can
+    be what catches this one -- only main()'s own outer `except
+    KeyboardInterrupt` can, which is the property this exists to drive.
+    """
+    raise KeyboardInterrupt
+
+
+def _main_interrupted(argv):
+    """main(argv, port_factory=_interrupting_port_factory), with
+    os.geteuid() made to look like root -- so main()'s own root check
+    passes and ServiceGuard actually runs, rather than being skipped by
+    --no-service-control, which would make "the guard's own __exit__ still
+    running" trivially true for the wrong reason -- and systemctl patched
+    to report both gpsd units inactive, so ServiceGuard's real
+    __enter__/restore execute for real but touch no actual systemd. For
+    the check that drives a KeyboardInterrupt through main()'s own
+    composition end to end, not a separately factored copy of its logic,
+    without hardware or real root.
+
+    Catches a KeyboardInterrupt that escapes main() entirely and returns
+    the string "escaped uncaught" instead of letting it propagate -- same
+    reason _interrupt_exit_code catches _on_interrupt's SystemExit rather
+    than letting the check's own comparison see it: check()'s `except
+    Exception` does not catch a BaseException sibling like this one, so an
+    actually-broken main() would otherwise crash the whole --selftest run
+    instead of reporting one clean FAIL. Confirmed by deliberately
+    reverting main()'s own fix in a scratch copy and re-running: without
+    this, the same regression that print("") + "return EXIT_INTERRUPTED"
+    normally converts to a clean 130 instead aborts --selftest mid-run
+    with an uncaught KeyboardInterrupt traceback.
+    """
+    global systemctl
+    real_systemctl = systemctl
+    real_geteuid = os.geteuid
+
+    class _Result:
+        returncode = 1  # "not active" -- nothing for ServiceGuard to stop
+
+    def fake_systemctl(*args):
+        if args[0] == "is-active":
+            return _Result()
+        return None
+
+    systemctl = fake_systemctl
+    os.geteuid = lambda: 0
+    try:
+        return main(argv, port_factory=_interrupting_port_factory)
+    except KeyboardInterrupt:
+        return "escaped uncaught"
+    finally:
+        systemctl = real_systemctl
+        os.geteuid = real_geteuid
+
+
+def _init_interrupted():
+    """(result, port.baud, port.closed) from cmd_init when a write inside
+    _init_sequence raises KeyboardInterrupt -- a stand-in for a SIGINT (or,
+    via cmd_init's own SIGTERM-to-KeyboardInterrupt handler, a SIGTERM)
+    landing mid-sequence.
+
+    Pins cmd_init's own `except BaseException` -- `except Exception` does
+    not catch KeyboardInterrupt, a BaseException sibling, not one of
+    Exception's subclasses -- so before that fix this would have propagated
+    straight out of cmd_init, and out of ExecStartPre non-zero: the one
+    outcome cmd_init's whole existence is meant to prevent. The port ending
+    at INIT_BAUD is _init_sequence's own `finally`, unrelated to this fix
+    and unchanged by it -- checked here too because interrupting mid-write
+    is exactly the scenario that finally exists for.
+
+    Catches a KeyboardInterrupt that escapes cmd_init entirely and returns
+    "escaped uncaught" for the whole tuple, rather than letting it
+    propagate -- same reason _main_interrupted does: check()'s own
+    `except Exception` cannot catch a BaseException sibling, so an
+    actually-broken cmd_init would otherwise crash --selftest instead of
+    reporting one clean FAIL. Confirmed by deliberately reverting cmd_init's
+    fix in a scratch copy: without this, the same regression aborts
+    --selftest mid-run with an uncaught KeyboardInterrupt traceback instead
+    of a clean FAIL line.
+    """
+    made = []
+
+    def factory(device, baud):
+        port = _FakePort(baud, b"", fail_write=KeyboardInterrupt())
+        made.append(port)
+        return port
+
+    import io          # only used here, and this is the only caller
+    import contextlib  # only used here, and this is the only caller
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            # os.devnull, not an arbitrary made-up path: cmd_init's own
+            # first line is `if not os.path.exists(args.device): return 0`,
+            # so the device given here has to genuinely exist -- os.devnull
+            # always does, on every platform, without touching real
+            # hardware.
+            result = cmd_init(_Args(device=os.devnull, timeout=5.0),
+                              port_factory=factory)
+    except KeyboardInterrupt:
+        return "escaped uncaught", "escaped uncaught", "escaped uncaught"
+    return result, made[0].baud, made[0].closed
+
+
+def _repl_survives_interrupt():
+    """(repl()'s return value, number of input() calls it made) when the
+    FIRST prompt read raises KeyboardInterrupt and the SECOND raises
+    EOFError -- proof that repl()'s own `except KeyboardInterrupt:
+    print(""); continue` (see repl()'s own body) is what a Ctrl-C at the
+    prompt does: the loop keeps running (a second input() call happens at
+    all, rather than the exception propagating out) and then exits cleanly
+    once it is actually told to (EOFError, i.e. Ctrl-D).
+
+    This is the property main()'s own SIGINT-handling composition depends
+    on: SIGINT is deliberately left at Python's own default specifically so
+    repl() (and _monitor_loop) see the KeyboardInterrupt themselves, before
+    anything in main() would -- see main()'s own docstring and
+    _signals_installed's check.
+
+    Patches builtins.input (repl()'s only blocking read), atexit.register
+    (so repl()'s own history-save callback is never actually registered
+    with the real atexit machinery -- left alone, it would leak into this
+    process's real shutdown and write to the real HISTFILE) and
+    readline.read_history_file/write_history_file (so no real file under
+    ~/.gnssctl_history is touched either way), all reverted in a finally.
+    Nothing else about repl() is faked -- readline itself is the real
+    module, and DISPATCH is never reached because the loop never gets a
+    real command line to hand it.
+    """
+    import builtins
+    import readline as rl
+    import io          # only used here, and this is the only caller
+    import contextlib  # only used here, and this is the only caller
+
+    calls = {"n": 0}
+
+    def fake_input(prompt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt
+        if calls["n"] == 2:
+            raise EOFError
+        raise AssertionError("repl() read a third line; it should have "
+                             "exited on the EOFError above")
+
+    real_input = builtins.input
+    real_register = atexit.register
+    real_read_hist = rl.read_history_file
+    real_write_hist = rl.write_history_file
+    builtins.input = fake_input
+    atexit.register = lambda *a, **kw: None
+    rl.read_history_file = lambda *a, **kw: None
+    rl.write_history_file = lambda *a, **kw: None
+    try:
+        port = _FakePort(9600, b"")
+        port.path = "/dev/fake"
+        session = Session(port, allow_apply=True, timeout=_TEST_WINDOW,
+                          observe=_TEST_WINDOW)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = repl(session, _Args())
+    finally:
+        builtins.input = real_input
+        atexit.register = real_register
+        rl.read_history_file = real_read_hist
+        rl.write_history_file = real_write_hist
+    return result, calls["n"]
 
 
 def selftest():
@@ -5049,13 +5365,20 @@ def selftest():
     check("parse_args resolves 'restart KIND --yes'",
           lambda: parse_args(["restart", "cold", "--yes"]).kind == "cold"
                   and parse_args(["restart", "cold", "--yes"]).yes is True)
-    check("SET_BUILDERS covers exactly the four 'set' targets the argparse "
-          "tree offers",
-          lambda: set(SET_BUILDERS) == {"baud", "rate", "sentences",
-                                        "constellation"})
+    check("SET_BUILDERS covers exactly the targets 'set's own subparser "
+          "offers -- measured from the live argparse tree, not restated "
+          "as a second list that could drift from what it really accepts",
+          lambda: set(SET_BUILDERS) == set(_subparser_choices(
+              _subparser_choices(_build_parser())["set"])))
 
-    check("CLI_DISPATCH covers exactly the seven CLI verbs",
-          lambda: set(CLI_DISPATCH) == set(COMMAND_NAMES))
+    check("CLI_DISPATCH covers exactly the verbs the top-level parser "
+          "itself offers -- likewise measured, not restated",
+          lambda: set(CLI_DISPATCH)
+                  == set(_subparser_choices(_build_parser())))
+    check("COMMAND_NAMES (what _split_device tells a verb apart from a "
+          "device with) matches the same live parser too",
+          lambda: set(COMMAND_NAMES)
+                  == set(_subparser_choices(_build_parser())))
     check("init is the only verb that skips main()'s port-opening path -- "
           "a declared property in the table, not an 'if command == ...' "
           "special case in main() itself",
@@ -5129,13 +5452,14 @@ def selftest():
     # uses) -- without it these four checks would run apply() at its real
     # 1.5s-per-Get, 1.5s-per-observe pace, the same cost _apply_on_quiet_port
     # and friends already avoid for every OTHER apply() check in this file.
-    check("cmd_set('baud') applies SetBaud and returns EXIT_OK for a nak -- "
-          "a receiver answer, not a tool failure",
-          lambda: (lambda port=_FakePort(9600, b""): (
-              cmd_set(port, _Args(set_target="baud", value=19200, force=False,
-                                  yes=False, via="pcas", timeout=_TEST_WINDOW,
-                                  observe_seconds=_TEST_WINDOW)) == EXIT_OK
-              and port.baud == 19200))())
+    check("cmd_set('baud') applies SetBaud and returns EXIT_OK specifically "
+          "for a NAK verdict -- a receiver answer, not a tool failure, and "
+          "not merely 'ok' or 'unconfirmed' passing through the same code",
+          lambda: (lambda code, out, port: code == EXIT_OK
+                                           and out.startswith("NAK")
+                                           and port.baud == 19200)(
+              *_cmd_set_capture(set_target="baud", value=19200, force=False,
+                                yes=False, via="pcas")))
     check("cmd_set surfaces the Change constructor's own spec-citing "
           "refusal and returns EXIT_NO_PORT without writing anything",
           lambda: (lambda port=_FakePort(9600, b""): (
@@ -5181,6 +5505,34 @@ def selftest():
           "silently a no-op",
           lambda: set(_guard_interrupted_stop())
                   == {"gpsd.socket", "gpsd.service"})
+
+    check("main() installs a handler only for SIGTERM -- SIGINT stays at "
+          "Python's own default so repl()'s and _monitor_loop's own, "
+          "narrower KeyboardInterrupt handling runs first, not main()'s",
+          lambda: _signals_installed("main") == {"SIGTERM"})
+    check("cmd_monitor's own KeyboardInterrupt handling returns 0 -- "
+          "Ctrl-C stops 'monitor' cleanly, exactly as its own --help text "
+          "promises ('Ctrl-C to stop'), rather than propagating past it",
+          lambda: cmd_monitor(_QuietThenInterrupt(2),
+                              _Args(raw=False, interval=_TEST_WINDOW,
+                                    timeout=_TEST_WINDOW)) == EXIT_OK)
+    check("repl() survives a KeyboardInterrupt at the prompt -- it reaches "
+          "a SECOND input() call rather than exiting, then returns 0 "
+          "cleanly once actually told to (EOFError) -- 'Ctrl-C returns to "
+          "gnssctl>' still holds with main()'s own signal setup applied",
+          lambda: _repl_survives_interrupt() == (0, 2))
+    check("a KeyboardInterrupt that escapes repl()'s and _monitor_loop's "
+          "own handling -- e.g. one landing during baud auto-detection, "
+          "before either even starts -- still returns EXIT_INTERRUPTED "
+          "through main() itself (not a copy of its logic), with the "
+          "guard's own __exit__ still running",
+          lambda: _main_interrupted([os.devnull, "show"])
+                  == EXIT_INTERRUPTED)
+    check("cmd_init still returns 0, and still leaves the port at "
+          "INIT_BAUD, when a write inside _init_sequence raises "
+          "KeyboardInterrupt -- the except BaseException (not Exception) "
+          "this pins",
+          lambda: _init_interrupted() == (0, INIT_BAUD, True))
 
     print("")
     if _FAILS:
