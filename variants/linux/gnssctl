@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""gnssctl - read and configure the GNSS receiver on this node.
+
+  gnssctl                     interactive REPL
+  gnssctl show                current configuration and fix
+  gnssctl set rate 5hz        change a setting, verified
+  gnssctl --selftest          unit tests; touches no hardware
+
+Protocol source: Quectel L76K GNSS Protocol Specification V1.1. Section marks
+(§) throughout this file refer to it.
+"""
+import struct
+import sys
+
+_FAILS = []
+
+
+class Codec:
+    """One CASIC data type (§3.1.1, Table 4).
+
+    Little-endian throughout: the spec's worked frames encode Len, BaudRate and
+    the checksum little-endian (e.g. CFG-RATE 1000 ms as 'E8 03 00 00', §3.2.2.4).
+    """
+
+    __slots__ = ("name", "size", "_fmt")
+
+    def __init__(self, name, size, fmt):
+        self.name = name
+        self.size = size
+        self._fmt = "<" + fmt
+
+    def pack(self, value):
+        return struct.pack(self._fmt, value)
+
+    def unpack(self, raw):
+        return struct.unpack(self._fmt, raw[:self.size])[0]
+
+    def __repr__(self):
+        return "<%s>" % self.name
+
+
+U1 = Codec("U1", 1, "B")
+I1 = Codec("I1", 1, "b")
+U2 = Codec("U2", 2, "H")
+I2 = Codec("I2", 2, "h")
+U4 = Codec("U4", 4, "I")
+I4 = Codec("I4", 4, "i")
+R4 = Codec("R4", 4, "f")
+R8 = Codec("R8", 8, "d")
+
+
+def check(name, fn):
+    """Record one assertion.
+
+    Takes a thunk rather than a value on purpose. A check written before the
+    function it exercises exists must report FAIL and let the rest of the suite
+    run -- evaluating eagerly would raise NameError and abort the whole file,
+    which makes red-green cycles impossible in a single-file script.
+    """
+    try:
+        ok = bool(fn())
+    except Exception as exc:
+        print("  FAIL %s [%s: %s]" % (name, type(exc).__name__, exc))
+        _FAILS.append(name)
+        return
+    print(("  ok   " if ok else "  FAIL ") + name)
+    if not ok:
+        _FAILS.append(name)
+
+
+def selftest():
+    del _FAILS[:]
+    print("gnssctl --selftest")
+    print("")
+    print("data types (§3.1.1 Table 4):")
+    check("U1 is one byte", lambda: U1.size == 1)
+    check("I1 is one byte", lambda: I1.size == 1)
+    check("U2 is two bytes", lambda: U2.size == 2)
+    check("I2 is two bytes", lambda: I2.size == 2)
+    check("U4 is four bytes", lambda: U4.size == 4)
+    check("I4 is four bytes", lambda: I4.size == 4)
+    check("R4 is four bytes", lambda: R4.size == 4)
+    check("R8 is eight bytes", lambda: R8.size == 8)
+    check("U2 packs little-endian",
+          lambda: U2.pack(1000) == b"\xe8\x03")
+    check("U4 packs little-endian",
+          lambda: U4.pack(9600) == b"\x80\x25\x00\x00")
+    check("I1 is two's complement (§3.1.1 'Complement')",
+          lambda: I1.pack(-1) == b"\xff" and I1.unpack(b"\xff") == -1)
+    check("every integer type round-trips",
+          lambda: all(c.unpack(c.pack(v)) == v
+                      for c, v in ((U1, 255), (I1, -128), (U2, 65535),
+                                   (I2, -32768), (U4, 4294967295), (I4, -1))))
+
+    print("")
+    if _FAILS:
+        print("%d FAILED: %s" % (len(_FAILS), ", ".join(_FAILS)))
+        return 1
+    print("all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(selftest() if "--selftest" in sys.argv[1:] else 0)
