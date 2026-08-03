@@ -1329,11 +1329,22 @@ class ServiceGuard:
             print("The GNSS clock source drops until this finishes; chrony "
                   "falls back to the pool\nand takes a couple of minutes to "
                   "return to stratum 1 afterwards.\n")
+            # Armed BEFORE the first stop, not after the settle sleep.
+            # restore() returns early when not armed, so arming afterwards
+            # leaves a window -- the whole second between "gpsd is now
+            # stopped" and "we would put it back" -- in which a Ctrl-C exits
+            # with gpsd down and the restore silently skipped. That is the
+            # node's stratum-1 clock, and the banner printed just above
+            # promises it comes back. Arming first can only cause a
+            # redundant `systemctl start` on units that were already
+            # running, which is a no-op.
+            self._armed = True
             for unit in self.UNITS:
                 if self.was_active.get(unit):
                     systemctl("stop", unit)
             time.sleep(1.0)
-        self._armed = True
+        else:
+            self._armed = True
         return self
 
     def restore(self):
@@ -4103,6 +4114,52 @@ def _interrupt_exit_code(guard):
     return None
 
 
+def _guard_interrupted_stop():
+    """The units ServiceGuard.restore() starts back up after a ServiceGuard
+    whose FIRST stop call raises (a stand-in for a SIGINT/SIGTERM landing
+    mid-__enter__, which _on_interrupt's real call to guard.restore() would
+    see the same way: __enter__ never reaches its own `self._armed = True`
+    line if that line still ran only after the stop loop).
+
+    This is the check that pins the arming-order fix: __enter__ now arms
+    BEFORE the stop loop runs, so restore() -- called here directly, since
+    the raised OSError means __exit__ is never reached either -- still does
+    its job even though __enter__ itself never returned normally. Before
+    the fix, restore() would have no-op'd (_armed still False), silently
+    leaving both units down.
+
+    systemctl is a plain module-level name, patched here (not passed as a
+    parameter -- ServiceGuard's own methods call it unparameterised) and
+    restored in a finally so no other check can observe the patch.
+    """
+    global systemctl
+    real_systemctl = systemctl
+    calls = []
+
+    class _Result:
+        returncode = 0
+
+    def fake(*args):
+        calls.append(args)
+        if args[0] == "is-active":
+            return _Result()  # both units report active
+        if args[0] == "stop":
+            raise OSError(5, "Input/output error")
+        return None
+
+    systemctl = fake
+    guard = ServiceGuard(enabled=True)
+    try:
+        try:
+            guard.__enter__()
+        except OSError:
+            pass
+        guard.restore()
+    finally:
+        systemctl = real_systemctl
+    return [c[1] for c in calls if c[0] == "start"]
+
+
 def selftest():
     del _FAILS[:]
     print("gnssctl --selftest")
@@ -5118,6 +5175,12 @@ def selftest():
           "without ever installing a real OS signal handler",
           lambda: (lambda g: (_interrupt_exit_code(g) == EXIT_INTERRUPTED
                               and g.restored))(_FakeGuard()))
+    check("ServiceGuard is armed before the first stop, not after the "
+          "settle sleep -- a stop that raises partway through still leaves "
+          "restore() able to start every unit it recorded as active, not "
+          "silently a no-op",
+          lambda: set(_guard_interrupted_stop())
+                  == {"gpsd.socket", "gpsd.service"})
 
     print("")
     if _FAILS:
