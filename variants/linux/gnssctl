@@ -998,6 +998,11 @@ class NmeaCollector:
         # Per-talker satellite table, accumulated across a GSV group's parts
         # rather than overwritten like `records` above -- see _absorb_sky.
         self.sky = {}
+        # Per talker: has this talker's CURRENT group seen its own <SenNum>
+        # 1 line yet? Tracked separately from `sky` itself so a group whose
+        # first line was dropped can be told apart from one in progress --
+        # see _absorb_sky.
+        self._sky_started = {}
         self.bad_checksums = 0
         self.keep = keep
 
@@ -1062,20 +1067,42 @@ class NmeaCollector:
         §2.2.3), each carrying at most four satellites; `records` above keeps
         only the LAST one per talker, so reading it for a sky table would show
         at most four satellites no matter how many are actually in view. This
-        accumulates across the group instead, starting a fresh table when
-        <SenNum> is 1 -- the group's first line -- so a table missing that
-        first line (a window boundary, a dropped byte) comes up a satellite
-        short rather than silently mixing two epochs together forever.
+        accumulates across the group instead.
+
+        Starts a fresh table on <SenNum> 1 -- the group's first line -- same
+        as when a talker is seen for the very first time: the guarantee this
+        exists for is "a table missing its first line comes up a satellite
+        short, never two epochs mixed together", and that has to hold in the
+        MIDDLE of a session too, not only at start-up. A truncated sentence is
+        routine (NmeaCollector.feed's own try/except exists because of it), so
+        a group's <SenNum> 1 line going missing mid-session is not a corner
+        case: without _sky_started tracking this, the next line seen for that
+        talker (<SenNum> 2 or 3) would merge onto whatever the PREVIOUS,
+        now-stale, completed group left behind -- which is exactly the mixing
+        the docstring used to claim could not happen. So a non-1 line arriving
+        for a talker that has not seen its own group's <SenNum> 1 clears the
+        stale table first, then contributes only its own rows: a satellite
+        short (or, worst case, only what one line reports), never stale ones
+        lingering indistinguishable from current ones.
         """
         sats = rec.get("sats")
         if not sats or not isinstance(sats[0], dict) or "satID" not in sats[0]:
             return
-        if rec.get("senNum") == 1:
+        sen_num = rec.get("senNum")
+        if sen_num == 1 or not self._sky_started.get(talker):
             self.sky[talker] = {}
+            self._sky_started[talker] = True
         bucket = self.sky.setdefault(talker, {})
         for row in sats:
             if row.get("satID"):
                 bucket[row["satID"]] = row
+        total = rec.get("totalNumSen")
+        if sen_num is not None and total is not None and sen_num >= total:
+            # Group complete (or this line claims to be the last one it will
+            # see) -- ready for the next group to require its own <SenNum> 1
+            # again, rather than silently accepting whatever arrives next as
+            # a continuation of this one.
+            self._sky_started[talker] = False
 
     def take_lines(self):
         out, self.lines = self.lines, []
@@ -2292,7 +2319,7 @@ def _field_describe(message, raw):
     return {f.name: f.describe(raw[f.name]) for f in message.fields}
 
 
-def render_show(session, obs):
+def render_show(session, obs, readback=None):
     """Current configuration and fix -- see the module comment above for the
     provenance rule every line here follows.
 
@@ -2302,6 +2329,18 @@ def render_show(session, obs):
     --selftest for the same methods. Only the two Gets below need a real
     session; without one they render as "not read back", never silently
     omitted.
+
+    readback, when given, is (prt, rate) -- the already-parsed CFG-PRT/
+    CFG-RATE dicts (either may be None) -- and is used INSTEAD of querying
+    `session`, even if `session` is not None. This is what lets a caller that
+    redraws repeatedly (cmd_monitor) do the two Gets ONCE, before its loop,
+    and pass the result in on every redraw rather than calling this with a
+    live session on a timer: the latter looks read-only but is not -- each
+    call would re-transmit, re-flush the port's input buffer, and feed the
+    reply into the SESSION's own NmeaCollector rather than the Observation
+    on screen, silently undercounting exactly what the display claims to
+    be measuring passively. cmd_show, a one-shot command, has no such loop
+    and is correct to omit `readback` and let this query `session` directly.
     """
     out = []
     w = out.append
@@ -2314,7 +2353,12 @@ def render_show(session, obs):
     # here without a second implementation to drift out of step.
     inferrer = session if session is not None else Session(None)
 
-    prt = session.get(CFG_PRT) if session is not None else None
+    if readback is not None:
+        prt, rate = readback
+    else:
+        prt = session.get(CFG_PRT) if session is not None else None
+        rate = session.get(CFG_RATE) if session is not None else None
+
     if prt is not None:
         d = _field_describe(CFG_PRT, prt)
         w("  port            %d baud, %s, %s  [readback: CFG-PRT]" % (
@@ -2322,7 +2366,6 @@ def render_show(session, obs):
     else:
         w("  port            unknown -- no CFG-PRT reply  [not read back]")
 
-    rate = session.get(CFG_RATE) if session is not None else None
     if rate is not None and rate.get("interval"):
         w("  fix interval    %d ms (%.3g Hz)  [readback: CFG-RATE]" % (
             rate["interval"], 1000.0 / rate["interval"]))
@@ -2431,29 +2474,63 @@ def cmd_show(port, args):
 
 
 def cmd_monitor(port, args):
-    """Live view: reads, feeds one long-lived Observation, redraws on a timer
-    until Ctrl-C.
+    """Live view: reads CFG-PRT/CFG-RATE ONCE, then feeds one long-lived
+    Observation purely by watching, redrawing on a timer until Ctrl-C.
 
     Session built allow_apply=False -- read-only by construction, matching
-    show and bandwidth. Port.read already selects on the serial fd for
-    `interval` seconds, so this loop is one port.read() call per redraw with
-    no separate wait step. Port.fd is public so a future interactive mode
-    could select() on it alongside stdin for pause/toggle keys -- an open
-    question with the human, deliberately not built here -- without
-    restructuring this loop; it would replace the single port.read() call
-    with a select() over {port.fd, stdin} and dispatch on which fired.
+    show and bandwidth. The one-time readback above is the ONLY thing this
+    function ever transmits; every redraw inside the loop calls
+    render_show(None, obs, readback=...) rather than handing the loop a live
+    session, so a redraw can never re-send a Get.
+
+    That distinction is not cosmetic. An earlier version called
+    render_show(session, obs) from inside the loop. render_show does its own
+    session.get(CFG_PRT)/get(CFG_RATE) whenever session is not None, and
+    each get() flushes the port's input buffer, writes a frame, and reads
+    for up to Session's timeout (1.5s default) -- feeding whatever NMEA
+    arrives into the SESSION's own NmeaCollector, a different object from
+    `obs`. So every redraw sent two frames, discarded buffered wire data
+    twice, and diverted several seconds of real traffic away from the
+    Observation the display claims to be built from -- while the banner
+    printed "nothing sent". That is this task's own failure mode, produced
+    by this task's own code: the measurement apparatus corrupting the
+    measurement while asserting it is passive. See render_show's docstring
+    for the `readback` parameter this loop uses to avoid it.
+
+    Port.read already selects on the serial fd for `interval` seconds, so
+    the loop body is one port.read() call per redraw with no separate wait
+    step. Port.fd is public so a future interactive mode could select() on
+    it alongside stdin for pause/toggle keys -- an open question with the
+    human, deliberately not built here -- without restructuring this loop;
+    it would replace the single port.read() call with a select() over
+    {port.fd, stdin} and dispatch on which fired.
     """
-    session = Session(port, allow_apply=False)
+    # timeout overridable the same way listen_seconds is elsewhere in this
+    # file -- not a production knob, but without it --selftest could only
+    # drive this loop's real code at the production 1.5s-per-Get pace.
+    session = Session(port, allow_apply=False,
+                      timeout=getattr(args, "timeout", None) or PROBE_TIMEOUT)
+    print("Reading CFG-PRT and CFG-RATE once...")
+    readback = (session.get(CFG_PRT), session.get(CFG_RATE))
+
     obs = Observation(port.baud)
     raw = bool(getattr(args, "raw", False))
     interval = getattr(args, "interval", None) or 1.0
     scanners = {f.name: Scanner(f) for f in ALL_FRAMINGS} if raw else {}
 
-    print("Watching %s at %d baud (nothing sent). Ctrl-C to stop."
+    print("Watching %s at %d baud -- nothing else is sent. Ctrl-C to stop."
           % (port.path, port.baud))
     try:
         while True:
             data = port.read(interval)
+            # Decoded fresh each iteration, not accumulated: these are
+            # printed AFTER the clear and the panels below, appended under
+            # the sky table, so they are visible for this redraw's `interval`
+            # seconds rather than erased by the very next line of output --
+            # an earlier version cleared the screen immediately after
+            # printing them, so the feature ran but nothing was ever visible
+            # to a human watching the terminal.
+            raw_lines = []
             if data:
                 obs.absorb(data)
                 if raw:
@@ -2461,13 +2538,20 @@ def cmd_monitor(port, args):
                         sc.feed(data)
                         for fr in sc.take():
                             detail = Session._decode(fr)
-                            print("  %-9s %02x-%02x  %s" % (
+                            raw_lines.append("  %-9s %02x-%02x  %s" % (
                                 fr.framing, fr.cls, fr.mid,
                                 detail if detail else hexdump(fr.payload, 24)))
             _clear_screen()
-            print(render_show(session, obs))
+            print(render_show(None, obs, readback=readback))
             print("")
             print(render_sky(obs))
+            if raw:
+                print("")
+                print("  raw frames this cycle:")
+                for line in raw_lines:
+                    print(line)
+                if not raw_lines:
+                    print("    none")
     except KeyboardInterrupt:
         print("")
         return 0
@@ -2738,6 +2822,55 @@ class _FakePort:
 
     def set_baud(self, baud):
         self.baud = baud
+
+
+class _QuietThenInterrupt:
+    """A port that answers `iterations` reads with nothing, then raises
+    KeyboardInterrupt -- the only way to end cmd_monitor's own `while True`
+    loop, so this drives a couple of REAL redraw cycles through cmd_monitor
+    itself rather than only its call graph.
+
+    Exists for exactly one gap: _reaches()/_session_calls() inspect
+    cmd_monitor's own AST body, which no longer contains a live-session
+    render_show call -- but they cannot see what render_show ITSELF does
+    with whatever cmd_monitor hands it. Only actually running the loop and
+    checking what reached write() closes that.
+    """
+
+    def __init__(self, iterations=3):
+        self.baud = 9600
+        self.path = "/dev/fake"
+        self.writes = []
+        self._left = iterations
+
+    def read(self, timeout):
+        if self._left <= 0:
+            raise KeyboardInterrupt
+        self._left -= 1
+        # Paces itself against the SAME wall-clock budget _read_window checks
+        # (like _FakePort's own read()) rather than returning instantly: an
+        # instant return lets _read_window's while loop busy-spin through its
+        # whole window in a handful of Python instructions, exhausting
+        # `iterations` in one call before any real time (or a second read())
+        # happens, and this port's whole purpose -- driving a fixed, known
+        # number of real read() calls -- depends on that not happening.
+        time.sleep(timeout)
+        return b""
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def flush_input(self):
+        pass
+
+
+class _Args:
+    """A bare attribute bag, standing in for argparse's Namespace so cmd_*
+    functions can be driven in --selftest without argparse in the loop.
+    """
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 def _apply_on_quiet_port(change, sky=None, **kw):
@@ -3344,12 +3477,41 @@ def selftest():
                     b"$GNGGA,071556.000,3149.29103,N,11706.92916,E,1,21,0.7,"
                     b"75.7,M,-5.0,M,,*69\r\n"
                     b"$GNGSA,A,3,10,13,15,20,,,,,,,,,2.5,2.0,1.5,1*35\r\n")
-    check("show reports the fix quality from GGA",
-          lambda: "3D" in render_show(None, _OBS) or "fix" in render_show(None, _OBS))
+    # The brief's own "3D" in text or "fix" in text is a near-tautology --
+    # render_show prints the labels "fix interval" and "fix type"
+    # unconditionally, so it would pass even with the whole GSA/GGA block
+    # deleted. Replaced with the actual decoded, translated values: if any
+    # of quality/fix-mode translation, DOP or satellite count broke, this
+    # fails.
+    check("show reports the translated fix mode, quality, DOP triple and "
+          "satellite count decoded from GSA/GGA",
+          lambda: (lambda text: "3 (3D)" in text
+                   and "1 (GPS SPS mode, fix valid)" in text
+                   and "2.5 / 2.0 / 1.5" in text
+                   and "21" in text)(render_show(None, _OBS)))
     check("show reports satellites used and HDOP",
           lambda: "21" in render_show(None, _OBS) and "0.7" in render_show(None, _OBS))
-    check("show states when a value was observed rather than read back",
-          lambda: "observed" in render_show(None, _OBS))
+    # Likewise "observed" in text alone is near-tautological -- the sentence
+    # rates line always carries "[observed: ...]" regardless of whether GGA/
+    # GSA ever parsed. Pinned against BOTH halves of the provenance split
+    # together: the two Gets marked not-read-back (session=None) and the
+    # inferred rates marked observed, with their actual values.
+    check("without a session, the readbacks are marked not-read-back and "
+          "the sentence rates are marked observed, together and concretely",
+          lambda: (lambda text: "no CFG-PRT reply" in text
+                   and "no CFG-RATE reply" in text
+                   and "GGA@1, GSA@1, GSV@2" in text
+                   and "[observed: tallied from the wire" in text)(
+              render_show(None, _OBS)))
+    # A field genuinely absent from the wire (not merely a documented "0")
+    # must render as unknown, not as though some code -- least of all 0,
+    # itself a real documented value -- were present.
+    _OBS_NO_QUALITY = _observe(nmea_wrap(
+        "GNGGA,071556.000,3149.29103,N,11706.92916,E,,21,0.7,75.7,M,-5.0,M,,"))
+    check("a GGA quality field absent from the wire renders as unknown, "
+          "not a fabricated code",
+          lambda: any("quality" in l and "unknown" in l for l in
+                     render_show(None, _OBS_NO_QUALITY).splitlines()))
     check("the sky table lists a satellite with its elevation and C/N0",
           lambda: all(t in render_sky(_OBS) for t in ("02", "49", "43")))
     check("an empty observation renders without raising",
@@ -3390,6 +3552,19 @@ def selftest():
     check("a satellite reported across multiple GSV lines is not lost to the "
           "last line's overwrite",
           lambda: set(_observe(_EPOCH).sky.get("GP", {})) == {"02", "05", "06"})
+
+    # A group's own <SenNum> 1 line can go missing mid-session the same way
+    # any other sentence can (NmeaCollector.feed's own try/except exists
+    # because truncation is routine) -- and unlike session start-up, there
+    # IS a previous, completed group sitting in `sky` here for a naive
+    # implementation to merge onto. Group A completes normally; group B's
+    # first line is simply never sent, only its second (and last).
+    check("a group whose first line is missing does not merge its lone "
+          "sentence onto the previous, now-stale group",
+          lambda: set(_observe(
+              nmea_wrap("GPGSV,1,1,04,02,49,123,43,0")     # group A, complete
+              + nmea_wrap("GPGSV,2,2,08,06,10,050,20,0")   # group B, part 1 missing
+          ).sky.get("GP", {})) == {"06"})
 
     _MIXED_SKY = _observe(
         nmea_wrap("GPGSV,1,1,08,10,49,123,43,02,30,050,22,0")
@@ -3433,6 +3608,26 @@ def selftest():
           "reachable from its own body",
           lambda: not _reaches("cmd_bandwidth",
                                {"get", "current_hz", "poll", "apply"}))
+
+    # _reaches/_session_calls above inspect cmd_monitor's OWN AST -- they
+    # cannot see that render_show, a function cmd_monitor calls, used to
+    # transmit on every redraw when handed a live session. Only actually
+    # running the loop and inspecting what reached write() closes that gap.
+    # Compared against a run with the same one-time readback but ZERO loop
+    # iterations, rather than against a bare 0: the readback itself legitimately
+    # writes twice (CFG-PRT, CFG-RATE Get) BEFORE the loop starts, and a check
+    # for literally zero writes would fail on that correct behaviour, not on
+    # the bug.
+    def _monitor_writes(iterations):
+        port = _QuietThenInterrupt(iterations)
+        cmd_monitor(port, _Args(raw=False, interval=_TEST_WINDOW,
+                                timeout=_TEST_WINDOW))
+        return port.writes
+
+    check("monitor's redraw loop sends nothing beyond its one-time "
+          "CFG-PRT/CFG-RATE readback, however many redraws run",
+          lambda: len(_monitor_writes(2)) == 2  # readback only, 0 redraws
+                  and len(_monitor_writes(4)) == 2)  # readback + 2 redraws
 
     print("")
     if _FAILS:
