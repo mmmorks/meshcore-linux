@@ -2016,10 +2016,12 @@ class Session:
 # --------------------------------------------------------------------------
 # init -- the boot-path setup that runs before gpsd opens the port
 #
-# Replaces gnss-set-baud (variants/linux/gnss-set-baud; kept as a read-only
-# reference until Task 15 removes it). Runs from gpsd's ExecStartPre, on
-# every gpsd start, on a node whose GNSS receiver is its stratum-1 clock
-# source. Three consequences:
+# Replaces gnss-set-baud, a shell script that did the same job at boot; it was
+# removed from this repo in the same change that repointed gpsd's
+# ExecStartPre at this file, so it no longer exists to read -- what it did is
+# summarised below instead. Runs from gpsd's ExecStartPre, on every gpsd
+# start, on a node whose GNSS receiver is its stratum-1 clock source. Three
+# consequences:
 #
 #   * cmd_init must always return 0. A mis-tuned receiver is recoverable; a
 #     node with no gpsd at all loses its clock. A failure here has to
@@ -2877,9 +2879,13 @@ def _bandwidth_view(session, seconds, rate=None, baud=None, sentences=None):
 # session already in hand. That sharing is what "the REPL dispatches
 # read-only commands through the one session it was given, not a second
 # one" actually looks like in code: the alternative, kept out on purpose,
-# was two independent copies of each loop that a future fix (like Task 11's
-# monitor-transmits-on-every-redraw bug) would have to be found and applied
-# twice.
+# was two independent copies of each loop that a bug fix would have to be
+# found and applied twice. That is not hypothetical: cmd_monitor's own
+# redraw loop once transmitted on every redraw while its own banner claimed
+# "sending nothing" -- it flushed the port and diverted NMEA into a
+# different collector each time, starving the very display it was meant to
+# refresh. One shared _monitor_loop means that class of bug gets fixed once,
+# for both entry points, not once per copy.
 #
 # cmd_show/cmd_monitor/cmd_bandwidth keep their OWN
 # Session(port, allow_apply=False, ...) construction as their literal first
@@ -5342,9 +5348,10 @@ def selftest():
     # Same anti-regression shape as cmd_monitor's own check above (see its
     # comment for why the comparison is against a same-readback/zero-redraw
     # run rather than a bare 0), driven through _repl_monitor instead of
-    # cmd_monitor -- proof that the fix Task 11 made once now holds on BOTH
-    # entry points that share _monitor_loop, not only the one the earlier
-    # regression check happened to drive.
+    # cmd_monitor -- proof that the redraw-transmits-every-time fix (see the
+    # REPL section banner above) holds on BOTH entry points that share
+    # _monitor_loop, not only the one the earlier regression check happened
+    # to drive.
     def _repl_monitor_writes(iterations):
         port = _QuietThenInterrupt(iterations)
         session = Session(port, allow_apply=True, timeout=_TEST_WINDOW)
