@@ -22,7 +22,8 @@ The daemon is `meshcored`; its CLI client is `meshcorectl`.
   [changing settings](#changing-settings-after-first-boot)
 - [GPS](#gps) — [serial](#serial-gps), [gpsd + chrony](#disciplining-the-host-clock-from-gnss),
   [PPS](#pps-on-the-waveshare-lorawangnss-hat), [serving time](#serving-the-time-to-the-lan),
-  [receiver tuning](#tuning-the-receiver)
+  [receiver tuning](#tuning-the-receiver),
+  [identifying the receiver](#identifying-the-receiver-gnss-probe)
 - [Resetting a node](#resetting-a-node)
 - [Known gaps](#known-gaps)
 
@@ -915,6 +916,122 @@ from PPS.
 > `RMC`, `ZDA`, `GBS`) appear there regardless. Use `gpspipe -R` for the device
 > and `gpspipe -r` for the client; tuning against the latter produces conclusions
 > that are exactly backwards.
+
+### Identifying the receiver: `gnss-probe`
+
+**Measured on `pimesh`, 2026-08-02.** `$PCAS06` answers
+`$GPTXT,01,01,02,SW=URANUS5,V5.3.0.0`. Note the field is `SW=` — **software**,
+not manufacturer. The L76K spec's own TXT example is `MA=CASIC` (§2.2.7), so
+`URANUS5` is a firmware string and is *not* evidence of an Allystar part, which
+is how it was originally read. No `MA=` line came back, so the vendor string
+remains unconfirmed.
+
+Everything that *is* checkable says this behaves as the CASIC part the Quectel
+L76K spec documents:
+
+- Its binary command interface is CASIC — `BA CE` framing, length before
+  class/ID, 32-bit word checksum, empty-payload Get semantics, and
+  `CFG-PRT` / `CFG-MSG` / `CFG-RATE` all answering (spec §3).
+- Its NMEA matches the spec throughout: `GN` talker for GSA and
+  per-constellation `GP`/`GL`/`BD` for GSV (Table 2, which forbids `GN` on
+  GSV); GSA `<SystemID>` values 1/4/2 and satellite-ID ranges 1–32 / 1–63 /
+  65–88 (Table 16); the GSV `<SignalID>` trailing field.
+- It ignores Allystar `f1 d9` completely.
+
+So treat `gpsd-gnss-tuning.conf` and `gnss-set-baud`'s "Allystar URANUS5" as
+unverified. The `$PCAS` command set does not identify a vendor — it is used by
+Allystar and CASIC parts alike.
+
+The important result is that **what it emits and what it accepts are different
+protocols**:
+
+| Framing | Sync | Behaviour |
+|---|---|---|
+| u-blox | `b5 62` | What it **emits** (NAV frames at 1 Hz). Parses commands and refuses every one |
+| Allystar | `f1 d9` | **Ignored entirely** — no answer of any kind, while normal output continues |
+| CASIC | `ba ce` | Never emitted, but **this is what it answers to** |
+
+So the receiver presents a u-blox emulation on output while its real command
+interface is CASIC — documented in the *Quectel L76K GNSS Protocol
+Specification* §3.1, whose framing differs from u-blox in field order (length
+precedes class/ID) and checksum (32-bit word sum, not an 8-bit Fletcher pair).
+
+Two consequences worth recording:
+
+- **gpsd 3.26's Allystar driver would not help.** Its lexer waits for `f1 d9`,
+  which this chip neither sends nor answers to, so it would never bind. Do not
+  plan around a gpsd upgrade.
+- **`CFG-PRT` is reachable after all**, just not in the framing we were asking
+  in. Over CASIC it answers `portID=1 (UART1), 8N1, 115200`. `CFG-MSG`,
+  `CFG-RATE` (1000 ms) and an undocumented 44-byte `CFG-PPS` also answer.
+  Everything else — `CFG-NAVSAT`, `MON-VER`, `CFG-SBAS`, `CFG-SURVEY` — returns
+  a real CASIC NAK, so those really are absent.
+- **The `ubxtool` calls in `gpsd-gnss-tuning.conf` do work.** Appendix C gives
+  the factory default as *all eight* NMEA sentences (RMC, GGA, GSV, GSA, VTG,
+  GLL, TXT, ZDA). With gpsd stopped, the receiver emits only GSA and GSV —
+  precisely the two that `ExecStartPost` enables, and nothing else. gpsd turns
+  NMEA off when it activates the device and those two calls put them back, so
+  the u-blox numbering (`f0,03` = GSV, `f0,02` = GSA) is right on this chip.
+- **GLONASS is on, and that is not the default.** Appendix C's default GNSS
+  configuration is GPS + BeiDou; we see `GL` GSV sentences, so `$PCAS04` has
+  been set to 7 at some point. Worth knowing because nothing in this repo sets
+  it — if it turns out to be volatile, a power cycle would silently drop a
+  constellation.
+
+`$PCAS06` itself is undocumented: the spec lists only `$PCAS01`, `02`, `03`,
+`04` and `10`. `$PCAS03` is the documented way to set NMEA sentence rates, and
+`$PCAS04` confirms there is no Galileo option (modes are GPS / BeiDou / GLONASS
+combinations only), which settles that question independently of the binary
+protocol.
+
+Note the NMEA message class differs between the two: **`0x4E` in CASIC**,
+`0xF0` in u-blox. `gpsd-gnss-tuning.conf` uses the u-blox numbering over `b5 62`
+via `ubxtool`, which is a different interface from the one above.
+
+`gnss-probe` settles it without writing anything to the receiver:
+
+```sh
+sudo gnss-probe                     # device from /etc/default/gpsd
+sudo gnss-probe --json probe.json   # same, plus machine-readable output
+gnss-probe --selftest               # unit tests, touches no hardware
+```
+
+It stops gpsd (**and `gpsd.socket`** — gpsd is socket-activated and meshcored
+reconnects with backoff, so the service alone would be respawned mid-probe),
+listens passively, then sweeps a table of poll messages and reports ACK / NAK /
+reply / silence for each. gpsd is restarted to whatever state it was found in,
+including on Ctrl-C. Budget a couple of minutes of stratum-1 downtime afterwards
+while chrony's refclock filter refills.
+
+Reading the output:
+
+- **`NAK` is a result, not a failure.** "This chip refuses `CFG-SURVEY`" is one
+  of the answers being paid for — it says survey-in / position-hold timing mode
+  is unavailable.
+- **`silent` is much weaker than `NAK`**, and the distinction carries the whole
+  Allystar conclusion above. A NAK is a parsed-and-refused conversation. Silence
+  is no reply at all — which is why each silent line also prints how many bytes
+  *did* arrive during its window, and every frame decoded in it across all three
+  framings. On a wire that is never quiet, "no matching frame" and "nothing
+  arrived" are different claims and only one of them supports concluding a
+  protocol is unsupported.
+- **It sweeps every framing, not just the one seen in phase 1**, moving on when
+  a framing refuses everything. Sweeping only the observed framing is exactly
+  how the CASIC interface stayed hidden.
+- **Phase 1 is worth reading even if phase 2 draws blanks.** It lists the NMEA
+  sentences the *receiver* emits, read from the device rather than through gpsd,
+  so it is not subject to the synthesis trap warned about above. On `pimesh`
+  that set is `GNGSA`, `GPGSV`, `GLGSV`, `BDGSV` and nothing else — no GGA, RMC,
+  ZDA or GRS, all of which gpsd synthesizes for its clients.
+- **Polls carry empty payloads**, which is the documented CASIC "Get" form but
+  is *not* a valid u-blox poll for every message. `CFG-MSG` in particular needs
+  a class/ID argument in u-blox, so its `b5 62` NAK is inconclusive rather than
+  evidence that the `ubxtool` calls in `gpsd-gnss-tuning.conf` are refused.
+
+It is read-only by construction: there is no arbitrary-send path in the tool,
+only a frozen table of polls. Confirming that, say, enabling Galileo actually
+helps is a separate job — it needs writes, and hours of satellite counts and
+chrony residuals to measure.
 
 ### Two HAT quirks that are easy to get wrong
 

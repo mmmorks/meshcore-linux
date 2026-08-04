@@ -1,14 +1,35 @@
 #!/bin/sh
-# gnss-set-baud - put the HAT's GNSS receiver at 115200 before gpsd opens it.
+# gnss-set-baud - initialise the HAT's GNSS receiver before gpsd opens it.
 #
-# The receiver on the Waveshare LoRaWAN/GNSS HAT is an Allystar URANUS5, not a
-# u-blox. It answers enough of the u-blox binary protocol for gpsd's u-blox
-# driver to bind (NAV output plus CFG-MSG), and NAKs essentially everything
-# else -- including CFG-PRT, which is the u-blox way to set the baud rate. Its
-# native Allystar command set is reachable over plain NMEA and does work, so
-# the port speed is set with $PCAS01 rather than CFG-PRT.
+# Sets two things, in this order, and the order is load-bearing:
 #
-# Why a script rather than an inline ExecStartPre: the command contains a '$'
+#   $PCAS01,5    port speed -> 115200
+#   $PCAS02,200  fix rate   -> 200 ms (5 Hz)
+#
+#
+# --- what this receiver is ---------------------------------------------------
+#
+# Not a u-blox, despite putting u-blox framing on the wire. Probed directly
+# (variants/linux/gnss-probe), it emits b5 62 NAV frames, answers ba ce (CASIC)
+# binary and $PCAS NMEA, and completely ignores f1 d9 (Allystar) -- 13,620
+# bytes arrived across 12 f1d9 polls with zero replies in any framing.
+#
+# Its version string reports SW=URANUS5, but that is the *software* field, not
+# a part number, so the vendor is unconfirmed. Every checkable behaviour
+# matches the CASIC part documented by the Quectel L76K GNSS Protocol
+# Specification V1.1, and that spec is what the settings below are taken from.
+#
+# Three consequences that decide how this script works:
+#
+#   * gpsd's u-blox driver binds, because the NAV output really is b5 62.
+#   * gpsd 3.26's Allystar driver would never bind even if we had it -- its
+#     lexer waits on f1 d9, which this receiver never sends.
+#   * Over b5 62 the receiver NAKs both CFG-PRT and CFG-RATE, so neither the
+#     speed nor the fix rate can be set that way. (CFG-PRT and CFG-RATE do
+#     both answer over ba ce, but reaching them needs the port to ourselves,
+#     whereas a $PCAS sentence needs no framing and no binary encoder.)
+#
+# Why a script rather than an inline ExecStartPre: the commands contain a '$'
 # and a CR/LF, and systemd applies its own $-expansion and C-escape processing
 # to Exec lines before /bin/sh ever sees them. Getting the string through both
 # layers intact is a quoting trap that fails silently -- the receiver would
@@ -18,7 +39,8 @@
 # window where gpsd is reading at the wrong speed.
 
 DEV="${1:-/dev/ttyAMA0}"
-CMD='$PCAS01,5*19'          # $PCAS01,5 = 115200 baud
+BAUD_CMD='$PCAS01,5*19'         # $PCAS01,5   = 115200 baud
+RATE_CMD='$PCAS02,200*1D'       # $PCAS02,200 = 200 ms fix interval (5 Hz)
 
 # Not an error: a node with no GNSS HAT still starts gpsd for other devices.
 [ -c "$DEV" ] || exit 0
@@ -30,7 +52,7 @@ CMD='$PCAS01,5*19'          # $PCAS01,5 = 115200 baud
 # idempotent, which matters because it runs on every gpsd start, not just boot.
 for speed in 9600 115200; do
     stty -F "$DEV" "$speed" raw -echo clocal >/dev/null 2>&1 || continue
-    printf '%s\r\n' "$CMD" > "$DEV" 2>/dev/null
+    printf '%s\r\n' "$BAUD_CMD" > "$DEV" 2>/dev/null
     sleep 1
 done
 
@@ -38,4 +60,23 @@ done
 # wrong the failure surfaces as gpsd's own "no data received" rather than as a
 # speed mismatch that looks like dead hardware.
 stty -F "$DEV" 115200 raw -echo clocal >/dev/null 2>&1
+
+# --- the fix rate, and why it is sent only at 115200 --------------------------
+#
+# Deliberately NOT sent at both speeds the way $PCAS01 is, and deliberately
+# after the speed rather than before.
+#
+# At 5 Hz, with the sentence set the drop-in enables, the receiver emits about
+# 5.2 kB/s. That is 45% of a 115200 link -- comfortable -- but 5.4x more than
+# a 9600 link can carry, where no epoch would ever finish clocking out and the
+# stream would collapse into permanent backlog.
+#
+# So if the speed above somehow failed and the receiver is still at 9600, this
+# sentence must NOT land. Sending it at 9600 too would manufacture exactly the
+# wedged receiver it needs to avoid.
+#
+# That makes the failure safe by construction: at 9600 the sentence is
+# unparseable noise, the receiver stays at its 1 Hz default, and 9600 carries
+# 1 Hz comfortably. The symptom is a slow position rate, not a dead link.
+printf '%s\r\n' "$RATE_CMD" > "$DEV" 2>/dev/null
 exit 0

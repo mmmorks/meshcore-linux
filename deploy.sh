@@ -6,8 +6,8 @@
 #   ./deploy.sh othernode            # deploy to another ssh host
 #   SKIP_BUILD=1 ./deploy.sh         # reuse the existing build artifact
 #
-# Copies the binary and meshcorectl over, installs them, restarts the service,
-# and then insists the service actually came back up.
+# Copies the binary, meshcorectl and gnss-probe over, installs them, restarts
+# the service, and then insists the service actually came back up.
 #
 # What it deliberately does NOT do:
 #
@@ -110,6 +110,7 @@ say "copying to $HOST:$STAGE"
 scp "${SSH_OPTS[@]}" -q \
   "$BIN" \
   "$REPO_DIR/variants/linux/meshcorectl" \
+  "$REPO_DIR/variants/linux/gnss-probe" \
   "$REPO_DIR/variants/linux/meshcored.service" \
   "$HOST:$STAGE/"
 
@@ -201,6 +202,11 @@ fi
 
 sudo install -m 755 "$STAGE/meshcored"   /usr/bin/meshcored
 sudo install -m 755 "$STAGE/meshcorectl" /usr/bin/meshcorectl
+
+# gnss-probe is a diagnostic, not part of the running system -- nothing starts
+# it and meshcored never calls it. It ships here so it is on the node when a
+# GNSS question comes up, rather than needing an scp mid-investigation.
+sudo install -m 755 "$STAGE/gnss-probe"  /usr/bin/gnss-probe
 
 # `start`, not `enable --now`: whether an existing node comes up at boot is its
 # own decision, and a deploy has no business revising it. The exception is a
