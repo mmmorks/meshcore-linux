@@ -3352,6 +3352,16 @@ def _build_parser():
 
     p = sub.add_parser("init", help="boot-path setup for gpsd's "
                        "ExecStartPre; always exits 0")
+    # init gets its own device positional, in addition to the global one
+    # _split_device already extracts. The line this tool replaces is
+    # 'ExecStartPre=/usr/local/sbin/gnss-set-baud /dev/ttyAMA0' -- the
+    # natural migration substitutes the program name and keeps the device
+    # where it was, giving 'gnssctl init /dev/ttyAMA0', not
+    # 'gnssctl /dev/ttyAMA0 init'. Both have to work. See parse_args for
+    # how the two are reconciled when both are given.
+    p.add_argument("device", nargs="?", default=None,
+                   help="serial device (overrides the global positional, "
+                        "if both are given)")
     p.add_argument("--timeout", type=float, default=10.0,
                    help="deadline in seconds (default 10)")
 
@@ -3380,9 +3390,30 @@ def parse_args(argv):
     corresponding flag was given on the command line -- see the --selftest
     checks below that walk this function's own output and assert exactly
     that for cmd_probe/cmd_monitor/cmd_bandwidth/cmd_init.
+
+    Two things can independently supply a device: the global positional
+    _split_device pulls out of argv[0], and 'init's own device positional
+    (see _build_parser -- the natural way to migrate
+    'ExecStartPre=.../gnss-set-baud /dev/ttyAMA0' is to keep the device
+    where it was and just substitute the program and verb, giving
+    'gnssctl init /dev/ttyAMA0'). getattr, not a name check against
+    args.command: 'init' is the only subparser that declares a 'device'
+    argument at all, so its presence in the parsed namespace already means
+    exactly what checking the verb by name would, without restating which
+    verb that is here too. If both are given and disagree, the more
+    specific one (init's own) wins and this says so on stderr -- silently
+    picking one would be exactly the kind of guess the design rules
+    elsewhere in this file refuse to make.
     """
     device, rest = _split_device(list(argv))
     args = _build_parser().parse_args(rest)
+    sub_device = getattr(args, "device", None)
+    if sub_device:
+        if device and device != sub_device:
+            print("gnssctl: %r (given after the verb) overrides %r "
+                  "(given before it)" % (sub_device, device),
+                  file=sys.stderr)
+        device = sub_device
     args.device = device
     return args
 
@@ -3624,7 +3655,27 @@ def main(argv, port_factory=Port):
         # int is a real contract here, not just the common case, so a
         # caller (or --selftest, driving main() in-process) never has to
         # catch SystemExit to find out what a bad argv did.
-        return exc.code if isinstance(exc.code, int) else EXIT_NO_PORT
+        code = exc.code if isinstance(exc.code, int) else EXIT_NO_PORT
+        # init's "always exits 0" contract has to hold even when argparse
+        # itself never reaches cmd_init -- a malformed 'init' invocation
+        # (a stray flag, an argument order this file's own device-
+        # reconciliation above does not happen to cover) would otherwise
+        # exit 2 from HERE, before cmd_init ever runs, defeating the
+        # contract before it starts. argparse has already printed its own
+        # usage/error message to stderr by the time this SystemExit
+        # reaches here (see argparse.ArgumentParser.error()), so the
+        # failure stays diagnosable -- only the exit code changes. Same
+        # reasoning as cmd_init's own `except BaseException`: this runs
+        # from gpsd's ExecStartPre, a mis-tuned receiver is recoverable
+        # but a node with no gpsd at all is not, and a diagnosable message
+        # plus a zero exit is strictly better here than a correct-looking
+        # exit code that stops the unit outright. Checked with a plain
+        # membership test, not a parsed verb (parsing is exactly what
+        # failed) -- deliberately not extended to any other subcommand:
+        # everywhere else a parse error must keep exiting 2.
+        if code != 0 and "init" in argv:
+            return EXIT_OK
+        return code
 
     if args.selftest:
         return selftest()
@@ -4476,6 +4527,51 @@ def _main_interrupted(argv):
     finally:
         systemctl = real_systemctl
         os.geteuid = real_geteuid
+
+
+def _capture_stderr(fn, *args, **kw):
+    """(fn(*args, **kw), stderr text) -- for the checks that need both a
+    return value AND what was printed to stderr from the SAME call,
+    rather than calling fn twice (which could re-observe different state
+    the second time, and prints everything twice into the bargain).
+    """
+    import io          # only used here, and this is the only caller
+    import contextlib  # only used here, and this is the only caller
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        result = fn(*args, **kw)
+    return result, err.getvalue()
+
+
+def _init_device_capture(argv):
+    """(exit_code, device cmd_init actually received) from main(argv), with
+    CLI_DISPATCH['init'].fn temporarily redirected to a fake that just
+    records args.device and returns 0, instead of the real cmd_init.
+
+    Proves the device parse_args resolved for 'init' -- whichever of the
+    global positional or init's own reaches main() -- is what dispatch
+    actually hands cmd_init, not just what parse_args reports in
+    isolation. Patching the module-level name `cmd_init` would NOT be
+    picked up here: CLI_DISPATCH's dict value is the function OBJECT,
+    bound once when the table was built, not looked up by name again at
+    dispatch time (unlike systemctl, which ServiceGuard's methods call by
+    bare name and re-resolve on every call) -- so the redirect has to go
+    through CLI_DISPATCH['init'].fn itself, and back, in a finally.
+    Touches no hardware: the fake never opens a port.
+    """
+    real_fn = CLI_DISPATCH["init"].fn
+    seen = []
+
+    def fake(args):
+        seen.append(args.device)
+        return 0
+
+    CLI_DISPATCH["init"].fn = fake
+    try:
+        code = main(argv)
+    finally:
+        CLI_DISPATCH["init"].fn = real_fn
+    return code, (seen[0] if seen else None)
 
 
 def _init_interrupted():
@@ -5665,6 +5761,43 @@ def selftest():
           "KeyboardInterrupt -- the except BaseException (not Exception) "
           "this pins",
           lambda: _init_interrupted() == (0, INIT_BAUD, True))
+
+    # A hardware finding (pimesh): 'gnssctl init /dev/ttyAMA0' -- the
+    # natural migration of 'ExecStartPre=.../gnss-set-baud /dev/ttyAMA0' --
+    # used to exit 2, because init had no device positional of its own and
+    # argparse rejected the trailing argument BEFORE cmd_init ever ran,
+    # defeating "init always exits 0" from outside cmd_init entirely. Every
+    # check below drives main(), not cmd_init directly, because that is
+    # exactly the layer the bug lived in and a check against cmd_init alone
+    # could never have caught it (none did, the first time around).
+    check("'gnssctl init' (bare) still exits 0",
+          lambda: main(["init"]) == 0)
+    check("'gnssctl DEVICE init' (the global positional before the verb) "
+          "still exits 0",
+          lambda: main(["/dev/ttyAMA0", "init"]) == 0)
+    check("'gnssctl init DEVICE' -- the natural migration of "
+          "'gnss-set-baud DEVICE', and the form that used to exit 2 -- "
+          "now exits 0, and the device it parsed actually reaches "
+          "cmd_init's own args.device, not just parse_args' output in "
+          "isolation",
+          lambda: _init_device_capture(["init", "/dev/ttyAMA0"])
+                  == (0, "/dev/ttyAMA0"))
+    check("when both the global positional and init's own device are "
+          "given and disagree, init's own wins and main() says so on "
+          "stderr, rather than silently picking one",
+          lambda: (lambda result, err: (
+              result == (0, "/dev/ttyUSB0")
+              and "/dev/ttyUSB0" in err and "/dev/ttyAMA0" in err))(
+              *_capture_stderr(_init_device_capture,
+                               ["/dev/ttyAMA0", "init", "/dev/ttyUSB0"])))
+    check("an 'init' invocation argparse itself rejects (a stray flag) "
+          "still exits 0, with argparse's own message left on stderr so "
+          "the failure stays diagnosable",
+          lambda: (lambda code, err: code == 0 and "--nonsense" in err)(
+              *_capture_stderr(main, ["init", "--nonsense"])))
+    check("this does not extend to any other subcommand -- a non-init "
+          "parse error still exits 2",
+          lambda: main(["show", "--nonsense"]) == 2)
 
     print("")
     if _FAILS:
