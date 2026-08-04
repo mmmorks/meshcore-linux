@@ -884,22 +884,27 @@ then emits neither.
 
 The fix is the receiver's native Allystar/CASIC `$PCAS` command set, which is
 reachable over plain NMEA and does work. One tool handles all of it —
-`gnssctl` — plus a gpsd drop-in that wires its boot-time init in:
+`gnssctl` — plus a gpsd drop-in that wires its boot-time init in. The drop-in
+sets `ExecStartPre=/usr/bin/gnssctl init`, so `gnssctl` has to be in place
+*before* gpsd is restarted — get that order backwards and the restart fails
+`ExecStartPre`, gpsd never starts, and the node loses its clock.
+
+`gnssctl` itself needs no separate install step here:
+[`deploy.sh`](#deploying-to-a-remote-node) already ships it to `/usr/bin/gnssctl`
+on every deploy. On a node that has never run `deploy.sh`, install it by hand
+first, the same way `meshcorectl` is installed above:
+
+```sh
+sudo install -m 755 gnssctl /usr/bin/gnssctl
+```
+
+Then install the drop-in and restart gpsd:
 
 ```sh
 sudo mkdir -p /etc/systemd/system/gpsd.service.d
 sudo install -m 644 gpsd-gnss-tuning.conf \
     /etc/systemd/system/gpsd.service.d/gnss-tuning.conf
 sudo systemctl daemon-reload && sudo systemctl restart gpsd
-```
-
-`gnssctl` itself needs no separate install step here:
-[`deploy.sh`](#deploying-to-a-remote-node) already ships it to `/usr/bin/gnssctl`
-on every deploy. On a node that has never run `deploy.sh`, install it by hand
-the same way `meshcorectl` is installed above:
-
-```sh
-sudo install -m 755 gnssctl /usr/bin/gnssctl
 ```
 
 The drop-in's `ExecStartPre` runs `gnssctl init` before gpsd opens the port —
@@ -921,7 +926,7 @@ gnssctl bandwidth                the guard's arithmetic; sends nothing
 gnssctl set baud|rate|sentences|constellation
 gnssctl restart hot|warm|cold|factory
 gnssctl init                     boot path; always exits 0
-gnssctl --selftest               234 checks, no hardware, no root
+gnssctl --selftest               235 checks, no hardware, no root
 ```
 
 Exit codes: `0` means it did what was asked — including a receiver NAK, which
@@ -988,7 +993,8 @@ L76K spec documents:
   per-constellation `GP`/`GL`/`BD` for GSV (Table 2, which forbids `GN` on
   GSV); GSA `<SystemID>` values 1/4/2 and satellite-ID ranges 1–32 / 1–63 /
   65–88 (Table 16); the GSV `<SignalID>` trailing field.
-- It ignores Allystar `f1 d9` completely.
+- It ignores Allystar `f1 d9` completely — measured on `pimesh`: 13,620 bytes
+  arrived across 12 `f1 d9` polls, with zero replies in any framing.
 
 So treat `gpsd-gnss-tuning.conf`'s "Allystar URANUS5" as unverified. The
 `$PCAS` command set does not identify a vendor — it is used by Allystar and

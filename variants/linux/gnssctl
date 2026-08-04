@@ -462,12 +462,12 @@ class TextCodec:
     documented maximum is stated once and used for all three.
     """
 
-    # "fixed", "lo" and "hi" are left out of __init__ on purpose: they are
-    # optional, set only by the factories that need them (Const; OptInt
-    # below), and their absence is what lets build() and validation tell an
-    # ordinary field apart from one of those via hasattr/getattr rather than
-    # a name check.
-    __slots__ = ("name", "max_width", "_as_int", "fixed", "lo", "hi")
+    # "fixed", "lo", "hi" and "greedy" are left out of __init__ on purpose:
+    # they are optional, set only by the factories that need them (Const;
+    # OptInt; TextC below), and their absence is what lets build(), parse()
+    # and validation tell an ordinary field apart from one of those via
+    # hasattr/getattr rather than a name check.
+    __slots__ = ("name", "max_width", "_as_int", "fixed", "lo", "hi", "greedy")
 
     def __init__(self, name, max_width, as_int=False):
         self.name = name
@@ -517,6 +517,12 @@ Unsupported = TextCodec("Unsupported", 0)
 # §2.2.7 <TextMsg> is free text with no documented maximum. Bounded by the
 # NMEA 0183 82-byte sentence limit minus this sentence's fixed overhead.
 TextC = TextCodec("String", 61)
+# The sentence is split on ',' before any field is decoded, and <TextMsg> is
+# free text that can itself contain a comma -- $PCAS06's own reply,
+# "SW=URANUS5,V5.3.0.0", does. `greedy` tells Sentence.parse to rejoin every
+# raw field from here to the end of the sentence rather than take just the
+# next one, so a comma inside the text survives instead of truncating it.
+TextC.greedy = True
 
 
 class F:
@@ -590,9 +596,16 @@ class Sentence:
         idx = 0
         for item in self._flat_fields(len(fields)):
             if isinstance(item, F):
-                out[item.name] = item.codec.decode(
-                    fields[idx] if idx < len(fields) else "")
-                idx += 1
+                if getattr(item.codec, "greedy", False):
+                    # Rejoin the rest of the raw comma-split fields instead
+                    # of taking just the next one -- see TextC's own comment
+                    # for why a free-text field needs this.
+                    out[item.name] = item.codec.decode(",".join(fields[idx:]))
+                    idx = len(fields)
+                else:
+                    out[item.name] = item.codec.decode(
+                        fields[idx] if idx < len(fields) else "")
+                    idx += 1
                 continue
             block, times = item
             rows = []
@@ -654,6 +667,10 @@ class Sentence:
         return min(total, 82)
 
 
+# <SOG> is documented as "Numeric, Knot ... Variable length" with no maximum
+# given (§2.2.1) -- unlike <COG> two fields over, which the spec caps at
+# 359.9. 999.99 is a judgment call: comfortably above any ground speed this
+# receiver will plausibly report.
 RMC = Sentence("RMC",                                          # §2.2.1
                F("utc", Utc), F("status", EnumC("A", "V", "D")),
                F("lat", LatitudeC), F("ns", CharC),
@@ -722,7 +739,7 @@ GSA = Sentence("GSA",                                          # §2.2.4
                # Three digits, not two: Table 16 assigns QZSS the range
                # 193-197, and a QZSS satellite can appear in a GSA solution
                # list the same as it can in a GSV sky view.
-               Repeat(12, "sats", F("satID", IntC(3))),
+               Repeat(12, "sats", F("satID", Num("999"))),
                F("pdop", Num("99.0")), F("hdop", Num("99.0")),
                F("vdop", Num("99.0")), F("systemID", IntC(1)),
                # One per constellation in the solution, each carrying its
@@ -733,6 +750,10 @@ GSA = Sentence("GSA",                                          # §2.2.4
 # anything else as undocumented rather than guessing, same as GGA_QUALITY.
 GSA_FIX_MODE = {1: "fix not available", 2: "2D", 3: "3D"}
 
+# <SOGN>/<SOGK> are documented only as bare "Numeric" with no range (§2.2.5),
+# the same situation as GGA's <Alt>/<Sep> above -- 999.99 is a judgment call,
+# and both units get the same bound so neither arbitrarily undercuts the
+# other by a digit.
 VTG = Sentence("VTG",                                          # §2.2.5
                F("cogt", Num("359.9")), F("t", CharC),
                F("cogm", Unsupported), F("m", CharC),
@@ -842,7 +863,7 @@ def capacity(baud):
 
 
 def talkers_for(constellations):
-    """Which GSV/GSA talker IDs a constellation set produces (§2.2 Table 2).
+    """Which GSV/GSA talker IDs a constellation set produces (§2.1 Table 2).
 
     QZSS shares the GP talker with GPS and is always enabled (§1 note 1), so it
     adds no talker of its own.
@@ -2037,11 +2058,14 @@ class Session:
 # gnss-set-baud sent $PCAS01,5 at both 9600 and 115200 (the speed is
 # volatile -- it returns to 9600 on power loss but survives a gpsd restart --
 # and there is no way to ask which one the receiver is on) and then sent
-# $PCAS02,200 unconditionally. That was safe only because $PCAS02,200 is
-# unparseable noise at 9600; the script's own comments say so. That is a
-# property of one sentence, not of the approach. _init_sequence instead
-# reads CFG-PRT back at 115200 and sends the fix rate only once that
-# readback confirms it, so the guard holds for any rate.
+# $PCAS02,200 blind: deliberately only once, after the speed change, with no
+# readback to confirm the receiver actually followed. That was guarded by
+# placement rather than by a readback -- $PCAS02,200 happens to be
+# unparseable noise at 9600, so a speed change that silently failed still
+# left the receiver at its safe 1 Hz default instead of wedged at 5 Hz over a
+# 9600 link. _init_sequence instead reads CFG-PRT back at 115200 and sends
+# the fix rate only once that readback confirms it, so the guard holds for
+# any rate, not just this one sentence's framing.
 #
 # _init_sequence writes directly (port.write(), not Session.apply()) -- see
 # the comment at the _write_sites check for why that is a deliberate sixth
@@ -4723,7 +4747,11 @@ def selftest():
                    and r["totalNumSat"] == 12)(
               GSV.parse(SPEC_NMEA[7].rsplit("*", 1)[0][5:])))
     check("GSV reads a short final sentence",
-          lambda: len(GSV.parse(SPEC_NMEA[9].rsplit("*", 1)[0][5:])["sats"]) == 4)
+          # A genuinely short block (2 of an expected 4), not one of
+          # SPEC_NMEA's examples -- every GPGSV/BDGSV example there divides
+          # evenly by 4, so none of them actually exercises this.
+          lambda: len(GSV.parse(
+              "GSV,2,2,06,08,10,020,30,09,15,030,31,1")["sats"]) == 2)
     check("a truncated sentence is refused, not silently misattributed",
           lambda: GSV.parse("GSV,1,1,03,05,60,005,43,06,06,127,29,07,05,042,33,0")
                      ["signalID"] == 0
@@ -4735,6 +4763,9 @@ def selftest():
     check("TXT keeps a message containing '=' intact (§2.2.7)",
           lambda: TXT.parse(SPEC_NMEA[17].rsplit("*", 1)[0][5:])["textMsg"]
                   == "MA=CASIC")
+    check("TXT rejoins a <TextMsg> containing a comma, PCAS06's own reply",
+          lambda: TXT.parse("TXT,01,01,02,SW=URANUS5,V5.3.0.0")["textMsg"]
+                  == "SW=URANUS5,V5.3.0.0")
     # Driven off SPEC_NMEA rather than a hand-listed tuple, so no sentence can
     # be silently omitted. An earlier hand-listed version covered six of the
     # eight and the two it skipped were both broken.
