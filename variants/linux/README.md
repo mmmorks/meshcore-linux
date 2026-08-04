@@ -23,7 +23,7 @@ The daemon is `meshcored`; its CLI client is `meshcorectl`.
 - [GPS](#gps) — [serial](#serial-gps), [gpsd + chrony](#disciplining-the-host-clock-from-gnss),
   [PPS](#pps-on-the-waveshare-lorawangnss-hat), [serving time](#serving-the-time-to-the-lan),
   [receiver tuning](#tuning-the-receiver),
-  [identifying the receiver](#identifying-the-receiver-gnss-probe)
+  [identifying the receiver](#identifying-the-receiver-gnssctl-probe)
 - [Resetting a node](#resetting-a-node)
 - [Known gaps](#known-gaps)
 
@@ -871,27 +871,78 @@ sudo journalctl -b -u gpsd | head -3  # want: started at boot, before any client
 ### Tuning the receiver
 
 Out of the box on the LoRaWAN/GNSS HAT, `cgps` shows an empty satellite table and
-`meshcorectl gps` reports zero satellites even with a good fix. The receiver is an
-**Allystar URANUS5** presenting a partial u-blox emulation — enough `NAV` output
-and `CFG-MSG` for gpsd's u-blox driver to bind, and a NAK for nearly everything
-else, including `CFG-PRT`. gpsd sets its own message list on every device
-activation, which turns NMEA off entirely, and without `GSV`/`GSA` it never builds
-a `SKY` object. The UBX routes are dead ends here: the receiver ACKs `NAV-SVINFO`
-and `NAV-SAT` and then emits neither.
+`meshcorectl gps` reports zero satellites even with a good fix. The receiver
+presents a partial u-blox emulation — enough `NAV` output and `CFG-MSG` for
+gpsd's u-blox driver to bind, and a NAK for nearly everything else, including
+`CFG-PRT` in that framing. (What the receiver actually *is* took a separate
+investigation to settle — see
+[Identifying the receiver](#identifying-the-receiver-gnssctl-probe) below.) gpsd
+sets its own message list on every device activation, which turns NMEA off
+entirely, and without `GSV`/`GSA` it never builds a `SKY` object. The UBX
+routes are dead ends here: the receiver ACKs `NAV-SVINFO` and `NAV-SAT` and
+then emits neither.
 
-The fix is the receiver's native Allystar `$PCAS` command set, which is reachable
-over plain NMEA and does work. Two files handle it — `gnss-set-baud` puts the port
-at 115200 before gpsd opens it, and `gpsd-gnss-tuning.conf` wires that in and
-re-enables `GSV`/`GSA` on every start (`CFG-MSG` is RAM-only, so it cannot be
-saved to the receiver):
+The fix is the receiver's native Allystar/CASIC `$PCAS` command set, which is
+reachable over plain NMEA and does work. One tool handles all of it —
+`gnssctl` — plus a gpsd drop-in that wires its boot-time init in:
 
 ```sh
-sudo install -m 755 gnss-set-baud /usr/local/sbin/gnss-set-baud
 sudo mkdir -p /etc/systemd/system/gpsd.service.d
 sudo install -m 644 gpsd-gnss-tuning.conf \
     /etc/systemd/system/gpsd.service.d/gnss-tuning.conf
 sudo systemctl daemon-reload && sudo systemctl restart gpsd
 ```
+
+`gnssctl` itself needs no separate install step here:
+[`deploy.sh`](#deploying-to-a-remote-node) already ships it to `/usr/bin/gnssctl`
+on every deploy. On a node that has never run `deploy.sh`, install it by hand
+the same way `meshcorectl` is installed above:
+
+```sh
+sudo install -m 755 gnssctl /usr/bin/gnssctl
+```
+
+The drop-in's `ExecStartPre` runs `gnssctl init` before gpsd opens the port —
+which puts the port at 115200 and the fix rate at 200 ms (5 Hz) — and its
+`ExecStartPost` re-enables `GSV`/`GSA` on every start (`CFG-MSG` is RAM-only,
+so it cannot be saved to the receiver). Why `ExecStartPre` calls a program
+rather than an inline command, and exactly what `init` proves before it sends
+the fix rate, are both explained in `gpsd-gnss-tuning.conf`'s own comments —
+this is also where the bandwidth measurements below come from.
+
+**The command surface**, all of it exercised by the self-test:
+
+```
+gnssctl                          REPL (readline, history, tab completion)
+gnssctl show                     current configuration and fix
+gnssctl monitor                  live view; Ctrl-C to stop
+gnssctl probe                    read-only capability sweep
+gnssctl bandwidth                the guard's arithmetic; sends nothing
+gnssctl set baud|rate|sentences|constellation
+gnssctl restart hot|warm|cold|factory
+gnssctl init                     boot path; always exits 0
+gnssctl --selftest               234 checks, no hardware, no root
+```
+
+Exit codes: `0` means it did what was asked — including a receiver NAK, which
+is an answer, not a failure; `1` means it refused to run at all or could not
+get the port; `2` means it ran but recognised no framing; `3` means a guard
+rail refused the change (`--force` overrides it); `130` means it was
+interrupted. `init` is the one exception — it always exits `0`, because a
+non-zero exit there would stop `ExecStartPre`, which stops gpsd from starting
+at all, and a node with no gpsd loses its clock outright.
+
+**Before changing anything live**, `gnssctl` computes whether the requested
+configuration physically fits the link — capacity from 8N1 framing at the
+current baud, demand from each sentence's spec-derived maximum width — and
+refuses a change that cannot fit (`set`/`restart` exit `3`; `--force`
+overrides). It distinguishes a *measured* sky, read from the receiver's own
+`GSV` output, from an *assumed* one — the Table 16 worst case, substituted
+when the sky has not actually been observed — and says in its output which of
+the two it used. `gnssctl bandwidth` prints the same arithmetic for the
+current configuration, or a hypothetical one via `--rate`/`--baud`/`--sentences`,
+without sending anything at all — the way to check a change before committing
+to it.
 
 Two consequences to know about:
 
@@ -913,11 +964,12 @@ from PPS.
 
 > **Measure the receiver, not the client stream.** gpsd synthesizes NMEA for its
 > clients from the binary data, so sentences the receiver never sends (`GGA`,
-> `RMC`, `ZDA`, `GBS`) appear there regardless. Use `gpspipe -R` for the device
-> and `gpspipe -r` for the client; tuning against the latter produces conclusions
+> `RMC`, `ZDA`, `GBS`) appear there regardless. Use `gpspipe -R` (or
+> `gnssctl probe`, which reads the same raw device) for the device and
+> `gpspipe -r` for the client; tuning against the latter produces conclusions
 > that are exactly backwards.
 
-### Identifying the receiver: `gnss-probe`
+### Identifying the receiver: `gnssctl probe`
 
 **Measured on `pimesh`, 2026-08-02.** `$PCAS06` answers
 `$GPTXT,01,01,02,SW=URANUS5,V5.3.0.0`. Note the field is `SW=` — **software**,
@@ -938,9 +990,9 @@ L76K spec documents:
   65–88 (Table 16); the GSV `<SignalID>` trailing field.
 - It ignores Allystar `f1 d9` completely.
 
-So treat `gpsd-gnss-tuning.conf` and `gnss-set-baud`'s "Allystar URANUS5" as
-unverified. The `$PCAS` command set does not identify a vendor — it is used by
-Allystar and CASIC parts alike.
+So treat `gpsd-gnss-tuning.conf`'s "Allystar URANUS5" as unverified. The
+`$PCAS` command set does not identify a vendor — it is used by Allystar and
+CASIC parts alike.
 
 The important result is that **what it emits and what it accepts are different
 protocols**:
@@ -976,7 +1028,8 @@ Two consequences worth recording:
   configuration is GPS + BeiDou; we see `GL` GSV sentences, so `$PCAS04` has
   been set to 7 at some point. Worth knowing because nothing in this repo sets
   it — if it turns out to be volatile, a power cycle would silently drop a
-  constellation.
+  constellation. `gnssctl set constellation gps bds glo` is how to set it back
+  deliberately, and `gnssctl show` is how to check what is currently active.
 
 `$PCAS06` itself is undocumented: the spec lists only `$PCAS01`, `02`, `03`,
 `04` and `10`. `$PCAS03` is the documented way to set NMEA sentence rates, and
@@ -988,12 +1041,12 @@ Note the NMEA message class differs between the two: **`0x4E` in CASIC**,
 `0xF0` in u-blox. `gpsd-gnss-tuning.conf` uses the u-blox numbering over `b5 62`
 via `ubxtool`, which is a different interface from the one above.
 
-`gnss-probe` settles it without writing anything to the receiver:
+`gnssctl probe` settles it without writing anything to the receiver:
 
 ```sh
-sudo gnss-probe                     # device from /etc/default/gpsd
-sudo gnss-probe --json probe.json   # same, plus machine-readable output
-gnss-probe --selftest               # unit tests, touches no hardware
+sudo gnssctl probe                     # device from /etc/default/gpsd
+sudo gnssctl probe --json probe.json   # same, plus machine-readable output
+gnssctl --selftest                     # unit tests, touches no hardware
 ```
 
 It stops gpsd (**and `gpsd.socket`** — gpsd is socket-activated and meshcored
@@ -1028,10 +1081,18 @@ Reading the output:
   a class/ID argument in u-blox, so its `b5 62` NAK is inconclusive rather than
   evidence that the `ubxtool` calls in `gpsd-gnss-tuning.conf` are refused.
 
-It is read-only by construction: there is no arbitrary-send path in the tool,
-only a frozen table of polls. Confirming that, say, enabling Galileo actually
-helps is a separate job — it needs writes, and hours of satellite counts and
-chrony residuals to measure.
+Two properties are worth knowing before trusting any of this:
+
+- **`probe` cannot write to the receiver.** That is structural, not a promise:
+  `gnssctl --selftest` walks the module's own syntax tree and asserts that
+  exactly six named functions in the whole file contain a `.write()` call, and
+  the probe path reaches the wire only through the frozen table of polls —
+  empty-payload CASIC "Get" requests, never an arbitrary send. Confirming that,
+  say, enabling Galileo actually helps is a separate job — it needs writes, and
+  hours of satellite counts and chrony residuals to measure.
+- **Every setting change goes through the same bandwidth guard** described
+  above under [Tuning the receiver](#tuning-the-receiver) — `probe` never
+  triggers it, because it never writes, but `set`/`restart` always do.
 
 ### Two HAT quirks that are easy to get wrong
 
