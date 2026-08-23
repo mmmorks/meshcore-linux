@@ -114,6 +114,22 @@ def nmea_split(line):
     rpartition, not partition: no standard sentence carries a '*' in its data,
     but $GPTXT's <TextMsg> is free text (§2.2.7) and splitting on the first one
     would corrupt any message containing it.
+
+    A body that is not pure ASCII is rejected before it reaches
+    nmea_checksum. Reader.feed decodes what it reads with
+    decode("ascii", "replace") on purpose -- binary frames and sentences
+    share this wire -- so a body can carry U+FFFD standing in for bytes that
+    were never text, and a CASIC frame that happens to contain 0x24 ('$') and
+    0x2a ('*') arrives here looking sentence-shaped. Such a body cannot have a
+    valid checksum, so the answer is the same either way; what differs is that
+    nmea_checksum would raise UnicodeEncodeError on it rather than return one.
+    That took down `gnssctl init` from gpsd's ExecStartPre twice, and it is
+    nothing to do with the locale: the encode() it dies in names "ascii"
+    outright, so a UTF-8 console fails identically.
+
+    Rejecting here rather than loosening nmea_checksum keeps nmea_wrap strict.
+    A non-ASCII body we BUILD is a programming error and should still raise;
+    only a body we READ off the wire is untrusted, and only this path reads.
     """
     text = line.strip()
     if not text.startswith("$") or "*" not in text:
@@ -121,6 +137,8 @@ def nmea_split(line):
     body, _, given = text[1:].rpartition("*")
     if not body:
         return None, False
+    if not body.isascii():
+        return body, False
     return body, given.strip().upper() == nmea_checksum(body)
 
 
@@ -4529,6 +4547,36 @@ def _main_interrupted(argv):
         os.geteuid = real_geteuid
 
 
+def _feed_survives_binary_frame():
+    """True if NmeaCollector.feed() takes a sentence-shaped binary frame without raising.
+
+    End-to-end where the two checks above are unit-level: feeds raw bytes that
+    are not text, contain 0x24 ('$') and 0x2a ('*'), and end in a newline --
+    the exact shape a CASIC frame lands in when it shares the wire with NMEA.
+    Asserts the reader counted it as rejected and kept none of it, which is
+    what "survived" has to mean here; merely not raising would also be true of
+    a reader that had silently stopped parsing.
+    """
+    reader = NmeaCollector()
+    before = reader.bad_checksums
+    reader.feed(b"\xba\xce$\x80\xff\x01*\xfe\r\n")
+    return reader.bad_checksums > before and reader.lines == []
+
+
+def _wrap_still_rejects_non_ascii():
+    """True if nmea_wrap() raises on a non-ASCII body.
+
+    The fix deliberately went into nmea_split, not nmea_checksum, so that the
+    outgoing path keeps its strictness. This pins that: loosening the checksum
+    helper instead would make this check fail, which is the point of writing it.
+    """
+    try:
+        nmea_wrap("PCAS\ufffd1,5")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 def _capture_stderr(fn, *args, **kw):
     """(fn(*args, **kw), stderr text) -- for the checks that need both a
     return value AND what was printed to stderr from the SAME call,
@@ -4725,6 +4773,22 @@ def selftest():
           lambda: nmea_split("$PCAS01,5*1A") == ("PCAS01,5", False))
     check("split rejects a line that is not a sentence",
           lambda: nmea_split("garbage") == (None, False))
+    check("split rejects a body carrying U+FFFD instead of raising -- the "
+          "binary-frame-shaped-like-a-sentence case that killed 'gnssctl "
+          "init' from ExecStartPre",
+          lambda: nmea_split("$PCAS\ufffd1,5*19") == ("PCAS\ufffd1,5", False))
+    check("that rejection is the locale's business at no point: the encode "
+          "that used to raise names ascii outright, so this holds under any "
+          "stdio encoding",
+          lambda: nmea_checksum("PCAS01,5") == "19"
+                  and nmea_split("$\ufffd*00")[1] is False)
+    check("NmeaCollector.feed survives a binary frame that resyncs to a '$' "
+          "and "
+          "decodes to non-text, counting it rather than dying",
+          _feed_survives_binary_frame)
+    check("nmea_wrap stays strict -- a non-ASCII body we BUILD is a "
+          "programming error and must still raise, not ship a wrong checksum",
+          _wrap_still_rejects_non_ascii)
     check("checksum covers neither $ nor * (§2.1)",
           lambda: nmea_checksum("GPTXT,01,01,02,MA=CASIC") == "27")
 
