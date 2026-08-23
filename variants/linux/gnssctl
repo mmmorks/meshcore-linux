@@ -1830,7 +1830,10 @@ class Session:
         the two ways of being wrong are not symmetric: over-stating the rate
         costs a refusal the operator can override with --force, while
         under-stating it waves through exactly the change the guard exists to
-        catch. A node already running at 5 Hz is the normal case here.
+        catch. (Before 2026-08-23 a node already running at 5 Hz was the
+        normal case, which made the assumption free; INIT_INTERVAL_MS is
+        1 Hz now, so the assumed rate is usually an over-statement -- still
+        the safe direction, just no longer the common one.)
         """
         got = self.get(CFG_RATE)
         if got and got.get("interval"):
@@ -2091,7 +2094,44 @@ class Session:
 # --------------------------------------------------------------------------
 
 INIT_BAUD = 115200
-INIT_INTERVAL_MS = 200
+
+# 1 Hz -- the receiver's own default, and deliberately NOT the 200 ms (5 Hz)
+# this used to send.
+#
+# Changed 2026-08-23 while chasing a hard hang: on the pimesh node the L76K
+# stops dead every few days, from perfect health, with its I/O pads still
+# driven and its core no longer executing. Nothing recovers it but removing
+# power. Both occurrences with pin detail left 1PPS latched HIGH, and PPS is
+# high only ~100 ms in every 1000 -- so the halt is not uniformly distributed
+# in time, it lands inside the module's post-epoch processing. Its last
+# complete frame arrived within the same millisecond as the PPS edge it then
+# failed to release.
+#
+# That points at the per-epoch firmware path, and the fix rate is the one
+# multiplier on that path we control. At 200 ms the chip computes a solution
+# five times a second across four constellations with 22-26 satellites and
+# formats seven CASIC NAV messages per epoch, three of them variable length
+# and sized by the satellite count -- five times the work, on the code the
+# evidence implicates, in a chip whose own default is 1 Hz.
+#
+# It costs nothing to give up. PPS is derived from UTC, not from the
+# navigation solution, so it stays at exactly 1.00 Hz either way; and the SHM
+# sample the clock actually consumes is `noselect`, existing only to NUMBER
+# the PPS seconds against a +/-0.5 s budget. Five samples a second where one
+# will do buys no precision -- measured on this board, the full 5 Hz set was
+# slightly WORSE (sd 8.8 ms) than a lighter one (6.6 ms).
+#
+# The chrony offset does NOT move with this. gpsd stamps the epoch at its
+# last enabled NAV message, so the stamp delay is a property of the enabled
+# MESSAGE SET -- unchanged here -- not of how often the set repeats.
+# casic-binary-setup enables every NAV message at "one per epoch", so they
+# all follow this interval together and no rate divisor needs touching.
+# Re-measure with ntpshmmon anyway; "should not move" is not a measurement.
+#
+# If this is ever raised again, note that 115200 stops being load-bearing at
+# 1 Hz (~591 B/s, ~5% of the link) but must stay anyway -- gpsd is configured
+# for it, and the CFG-PRT readback below gates the rate send on it.
+INIT_INTERVAL_MS = 1000
 INIT_CANDIDATES = (9600, INIT_BAUD)
 # Narrower than PROBE_TIMEOUT (1.5 s): PROBE_TIMEOUT is sized for probe's
 # exploratory sweep of a receiver that might not answer at all. This window
@@ -2117,8 +2157,12 @@ def _init_sequence(port, deadline):
     against an assumed sky -- 0.8% of margin from silently declining to
     raise the rate, with no diagnosable symptom if any width estimate ever
     grew. The CFG-PRT readback below already establishes the one condition
-    that makes 5 Hz safe (the port really is at 115200), so it already does
-    the guard's job for this case. Routing through apply() also cost four
+    the guard would be checking -- that the port really is at 115200 -- so
+    it already does the guard's job for this case. (That mattered more when
+    INIT_INTERVAL_MS was 200: 5 Hz cannot clock out over a 9600 link. At
+    today's 1 Hz the readback is no longer load-bearing for bandwidth, but
+    it still gates the send, so the guarantee survives the rate being
+    raised again.) Routing through apply() also cost four
     extra frames on the wire -- a CFG-RATE probe and a CFG-PRT confirm on
     every apply(SetBaud(...)) call, whether a reply was reachable yet or
     not -- against a script this replaces that sent 3 and read nothing.
@@ -4168,7 +4212,11 @@ _PRT_AT_WRONG_BAUD = CASIC.encode(*CFG_PRT.key,
 # are literal (not INIT_BAUD/INIT_INTERVAL_MS) for the same import-time
 # reason as the readbacks above.
 _INIT_SPEED = nmea_wrap(PCAS01.build(cmd=BAUD_CODE[115200]))
-_INIT_RATE = nmea_wrap(PCAS02.build(interval=200))
+# Must track INIT_INTERVAL_MS by hand. That is not an oversight: the
+# "proven" check below compares init's actual writes against this, so a
+# change to the constant that forgets this line fails --selftest loudly
+# instead of quietly shipping a rate nobody chose.
+_INIT_RATE = nmea_wrap(PCAS02.build(interval=1000))
 _INIT_CFG_PRT_POLL = CASIC.encode(*CFG_PRT.key)
 
 _INIT_WRITES_CACHE = {}
