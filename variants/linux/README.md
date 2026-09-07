@@ -52,6 +52,24 @@ Alternatively, build directly with PlatformIO (no version metadata):
 FIRMWARE_VERSION=dev pio run -e linux_repeater
 ```
 
+**Container cross-build.** `build-docker.sh` builds for arm64 inside a Debian
+container, which is how to build from a non-Linux machine (or without
+installing the toolchain on the host). `BASE_IMAGE` picks the libgpiod major
+version the binary is built against, and each base gets its own build
+directory so the two cannot be mixed:
+
+```sh
+./build-docker.sh linux_repeater
+# bookworm (libgpiod 1.x) -> .pio/build/linux_repeater/meshcored
+
+BASE_IMAGE=debian:trixie ./build-docker.sh linux_repeater
+# trixie (libgpiod 2.x)   -> .pio/build-trixie/linux_repeater/meshcored
+```
+
+PlatformIO's package cache lives in a Docker volume, so repeat builds skip the
+download; on Apple Silicon the container is native and a warm build takes
+about a minute.
+
 ## Setup
 
 ### 1. Install the binary
@@ -224,6 +242,33 @@ sudo systemctl start meshcored
 > When running **directly** (not under systemd), `meshcored --fsdir /var/lib/meshcore --erase` is the equivalent one-shot full reset. Do **not** add `--erase` to the service unit: systemd re-runs `ExecStart` on every restart, so it would wipe the filesystem and regenerate the identity each time. (The firmware's own `reboot()` strips `--erase` to avoid self-wiping, but that protection does not extend to a systemd restart.)
 
 > **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `com_prefs` and the INI values are no longer read for those fields. To apply a changed radio parameter, use the CLI (`set freq`, `set sf`, etc.) or reset prefs as above.
+
+## Deploying to a remote node
+
+`./deploy.sh` builds and installs onto a node over ssh:
+
+```sh
+./deploy.sh                      # build + deploy to $MESHCORE_HOST (default: pimesh)
+./deploy.sh othernode            # another ssh host
+SKIP_BUILD=1 ./deploy.sh         # reuse the existing build artifact
+```
+
+It asks the node which Debian release it runs, picks the matching container base
+so libgpiod's major version lines up, builds, copies `meshcored` (and any CLI
+tools shipped beside it in `variants/linux/`) over, restarts the service and
+then verifies it actually came back up — printing the node's own journal if it
+did not. Setup steps (the `meshcore` user and group, group memberships, the unit
+file when absent) are idempotent and silent on an already-provisioned node.
+
+It deliberately leaves three things alone: udev rules, `/etc/meshcored/meshcored.ini`
+and an existing unit file, and gpsd/chrony configuration. Those are node-specific
+and covered above.
+
+The previous binary is kept, so a bad deploy is recoverable:
+
+```sh
+ssh <host> 'sudo mv /usr/bin/meshcored.prev /usr/bin/meshcored && sudo systemctl restart meshcored'
+```
 
 ## Known Gaps / TODO
 

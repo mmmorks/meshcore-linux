@@ -1,5 +1,8 @@
 #include "ConfigSerializer.h"
 
+#include <stdlib.h>   // atoi/atol/atof -- reaches these via Arduino.h on MCU
+                      // targets, but not in the host `native` test build
+
 bool ConfigSerializer::saveSerial(Stream& s) {
   Context context(&s, OP::WRITE);
   _context = &context;  // set the context for structure() call
