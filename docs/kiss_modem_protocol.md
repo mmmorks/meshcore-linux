@@ -215,7 +215,7 @@ All values little-endian.
 |-------------|---------|-----------------------|
 | Noise floor | 2 bytes | int16_t, dBm (signed) |
 
-The modem recalibrates the noise floor every 2 seconds with an AGC reset every 30 seconds.
+The modem estimates the noise floor continuously from a fixed-rate sample of the channel, with an AGC reset every 30 seconds.
 
 ### Stats (Stats response)
 

@@ -601,6 +601,8 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 - `get int.thresh`
 - `set int.thresh <value>`
 
+**Description:** A margin in dB above the estimated noise floor. The channel counts as busy when the current RSSI exceeds `noise_floor + int.thresh`, and `0` disables the check. The margin actually applied is never narrower than 3.5 times the noise estimator's standard deviation, which ranges from 0.5 to 3.0 dB — so the effective floor under the setting is between 1.75 and 10.5 dB, higher on a noisier channel. A margin narrower than that would fire on noise alone and defer every packet until the CAD retry budget expired, which protects nothing.
+
 **Parameters:**
 - `value`: Interference threshold value
 

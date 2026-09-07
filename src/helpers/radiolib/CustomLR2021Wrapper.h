@@ -93,11 +93,16 @@ public:
 
   uint8_t getSpreadingFactor() const override { return ((CustomLR2021 *)_radio)->getSpreadingFactor(); }
   
+  // Changing the LNA gain state moves the noise floor, and this path does not
+  // go through setParams(). See RadioLibWrapper::resetNoiseFloor(); reset only
+  // on a successful change, since a rejected one leaves the frontend alone.
   bool setRxBoostedGainMode(bool en) override {
     ((CustomLR2021 *)_radio)->standby(); // LR2021 must be in standby to accept setRxBoostedGainMode
     int16_t status = ((CustomLR2021 *)_radio)->setRxBoostedGainMode(en ? LR2021_RX_BOOST_LEVEL: 0);
     RadioLibWrapper::idle(); // trigger startReceive()
-    return status == RADIOLIB_ERR_NONE;
+    if (status != RADIOLIB_ERR_NONE) return false;
+    resetNoiseFloor();
+    return true;
   }
 
   bool getRxBoostedGainMode() const override {
