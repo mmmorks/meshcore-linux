@@ -465,7 +465,8 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
   // safe_copy() allocation, so a duplicate key knows there is something of
   // its own to free before overwriting it again.
   bool spidev_owned = false, lora_gpiochip_owned = false,
-       advert_name_owned = false, admin_password_owned = false;
+       advert_name_owned = false, admin_password_owned = false,
+       console_path_owned = false;
 
   bool first_line = true;
   char line[512];
@@ -565,6 +566,8 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
       assign_string(key, value, &spidev, &spidev_owned, 32, &result.bad_values);
     } else if (strcmp(key, "lora_gpiochip") == 0) {
       assign_string(key, value, &lora_gpiochip, &lora_gpiochip_owned, 32, &result.bad_values);
+    } else if (strcmp(key, "console_path") == 0) {
+      assign_string(key, value, &console_path, &console_path_owned, 108, &result.bad_values);
     } else if (strcmp(key, "lora_freq") == 0) {
       if (parse_float(key, value, &fval, &result.bad_values)) lora_freq = fval;
     } else if (strcmp(key, "lora_bw") == 0) {
