@@ -4,11 +4,17 @@
 #include <strings.h>
 #include <ctype.h>
 #include <errno.h>
+#include <climits>
 #include <exception>
 #ifdef ARDULINUX_HARDWARE
 #include "linux/gpio/LinuxGPIOPin.h"
 #endif
+#ifdef ARDULINUX_HARDWARE
+#include "EventGPIOPin.h"
+#endif
 #include "LinuxBoard.h"
+#include "LinuxEventLoop.h"
+#include "LinuxRadioWait.h"
 #include "AppInfo.h"
 
 // Still hardcoded -- see "Known Gaps" in variants/linux/README.md -- but named,
@@ -37,6 +43,41 @@ int initGPIOPin(uint8_t pinNum, const std::string gpioChipName, uint8_t line)
     return 1;
   } catch (...) {
     printf("ERROR: cannot claim GPIO line %d on %s for pin %d (unknown exception)\n",
+           (int)line, gpioChipName.c_str(), (int)pinNum);
+    return 1;
+  }
+#else
+  return 0;
+#endif
+}
+
+// Bind the LoRa IRQ line as an EventGPIOPin so the main loop can block on its
+// edge-event descriptor instead of spinning. Returns 0 on success, 1 on
+// failure (same convention as initGPIOPin).
+//
+// Falling back to a plain LinuxGPIOPin is not needed here: EventGPIOPin only
+// throws when the line cannot be acquired at all, and it degrades internally
+// when edge detection specifically is unavailable.
+static int initEventGPIOPin(LinuxEventSource** out, uint8_t pinNum,
+                            const std::string gpioChipName, uint8_t line) {
+#ifdef ARDULINUX_HARDWARE
+  char gpio_name[32];
+  snprintf(gpio_name, sizeof(gpio_name), "GPIO%d", pinNum);
+
+  try {
+    EventGPIOPin* pin = new EventGPIOPin(pinNum, gpioChipName.c_str(), line, gpio_name);
+    pin->setSilent();
+    gpioBind(pin);
+    *out = pin;
+    printf("LoRa IRQ pin %d bound with edge detection: %s\n",
+           (int)pinNum, pin->hasEdgeDetection() ? "yes" : "NO (polling fallback)");
+    return 0;
+  } catch (const std::exception& e) {
+    printf("ERROR: cannot claim IRQ GPIO line %d on %s for pin %d: %s\n",
+           (int)line, gpioChipName.c_str(), (int)pinNum, e.what());
+    return 1;
+  } catch (...) {
+    printf("ERROR: cannot claim IRQ GPIO line %d on %s for pin %d (unknown exception)\n",
            (int)line, gpioChipName.c_str(), (int)pinNum);
     return 1;
   }
@@ -124,7 +165,8 @@ void LinuxBoard::begin() {
     failures += initGPIOPin(config.lora_busy_pin, config.lora_gpiochip, config.lora_busy_pin);
   }
   if (config.lora_irq_pin != RADIOLIB_NC) {
-    failures += initGPIOPin(config.lora_irq_pin, config.lora_gpiochip, config.lora_irq_pin);
+    failures += initEventGPIOPin(&irq_event_source, config.lora_irq_pin,
+                                 config.lora_gpiochip, config.lora_irq_pin);
   }
   if (config.lora_reset_pin != RADIOLIB_NC) {
     failures += initGPIOPin(config.lora_reset_pin, config.lora_gpiochip, config.lora_reset_pin);
@@ -153,6 +195,83 @@ void LinuxBoard::begin() {
 // into this member of the same name.
 void LinuxBoard::reboot() {
   ::reboot();
+}
+
+void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
+  LinuxEventSource* src = irqEventSource();
+
+  // Without edge detection nothing can wake us, so the caller's ceiling would
+  // be pure latency: poll tightly instead. Same tradeoff (and same value) as
+  // the delay(1) fallback in ESP32Board::sleep().
+  const bool have_events = (src != NULL && src->eventFd() >= 0);
+  // poll(2) (which EventLoop.wait() below calls into) treats a negative
+  // timeout as "block forever". max_wait_ms > INT_MAX would cast negative and
+  // silently turn a bounded wait into an infinite one, so clamp instead.
+  const uint32_t wait_ms    = max_wait_ms > (uint32_t) INT_MAX ? (uint32_t) INT_MAX : max_wait_ms;
+  const int      timeout_ms = have_events ? (int) wait_ms : 1;
+
+  EventLoop.reset();
+  EventLoop.setEventSource(src);
+
+  // Only descriptors that loop() will actually drain this iteration may be
+  // registered here. POLLIN is level-triggered, so a registered descriptor
+  // that nothing reads stays readable forever and turns this wait back into
+  // the busy loop it exists to remove. A byte source that is only drained
+  // conditionally (a GPS stream while GPS is switched off, say) is better
+  // served off the poll timeout than registered.
+
+  // Refresh the cached IRQ level immediately before blocking. Packet
+  // correctness does not come from the edge-event descriptor above; it comes
+  // from ArduLinux's gpioIdle(), which fires RadioLib's ISR on a LOW->HIGH
+  // transition against a *cached* previous level. Nothing else in the
+  // MeshCore call path refreshes that cache (no delay() calls in
+  // Dispatcher.cpp/Mesh.cpp/MyMesh.cpp, and RadioLib's own
+  // digitalRead(getIrq()) calls live only in blocking paths MeshCore doesn't
+  // use), so the cache is stale from the moment gpioIdle() handles an
+  // interrupt until the next iteration's gpioIdle() call. Without this line
+  // the safe timeout ceiling would be bounded by packet airtime -- past that,
+  // DIO1 stays latched HIGH with no further rising edge to recover on, and RX
+  // stops silently rather than merely adding latency. This is what lets the
+  // caller choose max_wait_ms freely, and it is the obligation
+  // MainBoard::idleUntilEvent() documents for every implementer.
+  // Cost is one ioctl per wake; it is latency-safe, because if the line is
+  // already HIGH here an edge event is already queued and the wait below
+  // returns immediately instead of blocking. Do not remove this as
+  // "redundant" with gpioIdle() -- it is the only thing keeping a longer
+  // timeout safe.
+  if (config.lora_irq_pin != RADIOLIB_NC) digitalRead(config.lora_irq_pin);
+
+  EventLoop.wait(timeout_ms);
+}
+
+namespace {
+
+// Samples the LoRa IRQ line for waitForIrqAsserted().
+//
+// digitalRead() rather than a bare level read, and that is deliberate: in
+// ardulinux it runs GPIOPin::readPin() -> refreshState(), which reads the
+// hardware, updates the cached level and fires the attached ISR on the
+// configured edge. Sampling the line here therefore also keeps that cache
+// coherent while the main loop is parked inside a scan, for exactly the reason
+// idleUntilEvent() reads the pin before blocking.
+class RadioIrqLevel : public LinuxIrqLevel {
+public:
+  explicit RadioIrqLevel(uint32_t pin) : _pin(pin) { }
+  bool irqAsserted() override { return digitalRead(_pin) == HIGH; }
+
+private:
+  uint32_t _pin;
+};
+
+}  // namespace
+
+bool LinuxBoard::waitForRadioIrq(uint32_t timeout_ms) {
+  // Nothing to wait on. Callers read the operation's result over SPI anyway, so
+  // this costs them the wait, not the answer.
+  if (config.lora_irq_pin == RADIOLIB_NC) return false;
+
+  RadioIrqLevel level(config.lora_irq_pin);
+  return waitForIrqAsserted(level, irqEventSource(), EventLoop, timeout_ms);
 }
 
 // Trim whitespace from both ends, returning the trimmed string.
