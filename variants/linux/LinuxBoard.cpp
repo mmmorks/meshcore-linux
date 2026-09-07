@@ -13,6 +13,7 @@
 #include "EventGPIOPin.h"
 #endif
 #include "LinuxBoard.h"
+#include "LinuxConsole.h"
 #include "LinuxEventLoop.h"
 #include "LinuxRadioWait.h"
 #include "AppInfo.h"
@@ -193,7 +194,17 @@ void LinuxBoard::begin() {
 // (CommonCLI::handleCommand), so that would take an unattended repeater
 // off-air. Qualified as ::reboot() to resolve to the global one and not recurse
 // into this member of the same name.
+//
+// execv() keeps every descriptor that is not close-on-exec, and the console's
+// listener is the one that must not reach the new image: begin() there decides
+// whether a control socket already belongs to another instance by connecting to
+// it, and an inherited listener answers, so the daemon would decline its own
+// path. LinuxConsole marks its descriptors close-on-exec; closing them here as
+// well means a descriptor that ever escaped that -- a new one added there, or
+// an exec that reaches this process by another route -- still cannot resurrect
+// the listener. powerOff() needs none of this: exit(0) closes everything.
 void LinuxBoard::reboot() {
+  Console.end();
   ::reboot();
 }
 
@@ -213,12 +224,18 @@ void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   EventLoop.reset();
   EventLoop.setEventSource(src);
 
-  // Only descriptors that loop() will actually drain this iteration may be
-  // registered here. POLLIN is level-triggered, so a registered descriptor
-  // that nothing reads stays readable forever and turns this wait back into
-  // the busy loop it exists to remove. A byte source that is only drained
-  // conditionally (a GPS stream while GPS is switched off, say) is better
-  // served off the poll timeout than registered.
+  // Exactly the descriptor(s) LinuxConsole::rawReadByte() will actually consume
+  // this iteration. The console owns that choice because it owns the precedence
+  // -- registering one it will not drain leaves it permanently POLLIN and
+  // reinstates the busy loop for as little as one concurrent `meshcorectl`.
+  Console.registerPollFds(EventLoop);
+
+  // Nothing else belongs here unless loop() will drain it every iteration.
+  // POLLIN is level-triggered, so a registered descriptor that nothing reads
+  // stays readable forever and turns this wait back into the busy loop it
+  // exists to remove. A byte source that is only drained conditionally (a GPS
+  // stream while GPS is switched off, say) is better served off the poll
+  // timeout than registered.
 
   // Refresh the cached IRQ level immediately before blocking. Packet
   // correctness does not come from the edge-event descriptor above; it comes

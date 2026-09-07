@@ -72,11 +72,15 @@ about a minute.
 
 ## Setup
 
-### 1. Install the binary
+### 1. Install the binaries
 
 ```sh
 sudo install -m 755 .pio/build/linux_repeater/meshcored /usr/bin/meshcored
+sudo install -m 755 variants/linux/meshcorectl /usr/bin/meshcorectl
 ```
+
+Install `meshcorectl` now — once `meshcored` runs as a service it is the only way
+to reach the CLI (see [The control CLI](#the-control-cli-meshcorectl)).
 
 ### 2. Create the config file
 
@@ -242,7 +246,8 @@ sudo journalctl -u meshcored -f
 
 ### 5. Reconfiguring after first run
 
-Node name, password, and location can be changed via the serial CLI after first boot:
+Node name, password, and location can be changed via the CLI after first boot
+(over `meshcorectl`, see [The control CLI](#the-control-cli-meshcorectl)):
 
 ```
 set name <name>
@@ -271,6 +276,66 @@ sudo systemctl start meshcored
 > When running **directly** (not under systemd), `meshcored --fsdir /var/lib/meshcore --erase` is the equivalent one-shot full reset. Do **not** add `--erase` to the service unit: systemd re-runs `ExecStart` on every restart, so it would wipe the filesystem and regenerate the identity each time. (The firmware's own `reboot()` strips `--erase` to avoid self-wiping, but that protection does not extend to a systemd restart.)
 
 > **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `com_prefs` and the INI values are no longer read for those fields. To apply a changed radio parameter, use the CLI (`set freq`, `set sf`, etc.) or reset prefs as above.
+
+## The control CLI (`meshcorectl`)
+
+Everything the MeshCore docs describe as the "serial CLI" — `set`, `get`,
+`advert`, `neighbors`, and the rest — is reached here through `meshcorectl`.
+
+The Arduino `Serial` object is output-only on Linux, so `meshcored` prints to
+stdout and listens for commands on a **Unix-domain control socket**. The first
+writable path wins, and startup logs which one it picked:
+
+| Order | Path |
+|-------|------|
+| 1 | `$MESHCORED_CONTROL_SOCKET`, if set |
+| 2 | `/run/meshcored/meshcored.sock` (created by the unit's `RuntimeDirectory=`) |
+| 3 | `$XDG_RUNTIME_DIR/meshcored.sock` |
+| 4 | `/tmp/meshcored.sock` |
+
+The socket is mode `0660` and owned by the user running the daemon, so reaching
+it means being that user, being in its group, or being root.
+
+**The `/tmp` fallback is a predictable, shared path.** Unlike `/run/meshcored`
+(a systemd `RuntimeDirectory`, mode `0750`) or `$XDG_RUNTIME_DIR` (per-user,
+mode `0700`), `/tmp` is world-writable and its name never changes, so on a
+multi-user host another local user can pre-create or race for
+`/tmp/meshcored.sock` before the daemon starts. `meshcored` only takes over a
+path it can prove is not already answering connections (see `try_bind()` in
+`variants/linux/LinuxConsole.cpp`), so this is not an admin-socket takeover —
+but it is still a path only a single-user development box should rely on.
+Under systemd or with `$XDG_RUNTIME_DIR` set, this fallback is never reached.
+
+Three ways to drive it:
+
+```sh
+sudo meshcorectl                             # REPL: line editing, history, Tab completion
+meshcorectl set name my-repeater             # one-shot: send, print reply, exit
+printf 'ver\nneighbors\n' | meshcorectl      # piped: one command per line
+```
+
+The REPL needs no `socat` or `rlwrap`: arrow-key editing, Ctrl-R search, Tab
+completion of known commands, and history in `~/.meshcorectl_history`.
+`MESHCORED_CONTROL_SOCKET` overrides the path for the client exactly as it does
+for the daemon, which is how you reach a node that is not the packaged service.
+
+Only **one client at a time** is served; a second connection is refused
+immediately with `ERR: control socket busy, another client is connected` and
+closed. Raw tools work too: `sudo socat - UNIX-CONNECT:/run/meshcored/meshcored.sock`
+(also subject to the same one-client rule).
+
+`meshcorectl` exits `0` only if every command it sent was actually run by the
+daemon — that includes `reboot`, `clkreboot` and `poweroff`, whose only "reply"
+is their own echo before the daemon goes away. It exits `1` if the socket is
+missing or unusable, if the connection is refused as busy, if a command draws no
+reply at all, or if a *later* command in a piped script finds the daemon already
+gone (the case after one of those three ran earlier in the same script). A piped
+script stops at the first such failure rather than sending the remaining lines
+into a dead or busy connection.
+
+Running `meshcored` in a foreground terminal with no service behind it, you can
+skip the socket and type commands straight into its stdin. A connected socket
+client takes priority over stdin while it is attached.
 
 ## Operation
 

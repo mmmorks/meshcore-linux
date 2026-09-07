@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""meshcorectl - talk to a running meshcored over its control socket.
+
+  meshcorectl                    interactive REPL (line editing, history, tab-complete)
+  meshcorectl set name foo       one-shot: send one command, print the reply, exit
+  echo -e "advert\\nneighbors" | meshcorectl   pipe: run each line, print replies
+
+The interactive mode is a self-contained readline client (equivalent to wrapping
+a raw socket in rlwrap): arrow-key editing, Ctrl-R reverse search, persistent
+history in ~/.meshcorectl_history, and Tab completion of known commands. No socat
+or rlwrap needed.
+
+Socket path: $MESHCORED_CONTROL_SOCKET, else /run/meshcored/meshcored.sock.
+Access: run as root or a member of the `meshcore` group.
+
+Exit status is 0 only if every command was actually run by the daemon. It is 1
+if the socket is missing or unusable, if meshcored refuses the connection
+because another client already holds the console, if a command draws no reply
+at all, or if the daemon closes the socket mid-script (which is what `reboot`
+and friends do). Remaining lines of a piped script are not attempted after any
+of those.
+"""
+import os
+import sys
+import time
+import socket
+import select
+import atexit
+
+SOCK = os.environ.get("MESHCORED_CONTROL_SOCKET", "/run/meshcored/meshcored.sock")
+HISTFILE = os.path.expanduser("~/.meshcorectl_history")
+
+# Top-level commands, in the order the firmware dispatches them:
+# examples/simple_repeater/MyMesh.cpp handleCommand() takes the first three,
+# then falls through to src/helpers/CommonCLI.cpp handleCommand() for the rest.
+# Anything not matched there comes back as "Unknown command".
+#
+# Entries ending in a bare word still take arguments -- "neighbor.remove",
+# "password", "sensor get/set", "setperm", "tempradio" and "time" all match on a
+# trailing space in the firmware, so "time" alone is an unknown command. Use
+# "time <epoch-seconds>" to set the clock and "clock" to read it back.
+#
+# "region load" is listed for completeness but is not usable from here: it puts
+# the firmware into a multi-line mode (CommonCLI.cpp region_load_active) that
+# reads indented region names and ends on a blank line, and both loops below
+# strip indentation and skip blank lines. Use "region put"/"region def" instead.
+#
+# "clock sync" is listed because it exists, but it only works over the mesh: it
+# needs the sender's timestamp, and the control socket always passes 0 (see the
+# handleCommand(0, ...) calls in examples/simple_repeater/main.cpp), so it
+# replies "ERR: clock cannot go backwards" every time. Use "time" instead.
+TOP = [
+    "advert", "advert.zerohop", "board", "clear stats", "clkreboot", "clock",
+    "clock sync", "discover.neighbors", "erase", "get", "gps", "gps advert",
+    "gps interval", "gps off", "gps on", "gps setloc", "gps sync",
+    "log", "log erase", "log start", "log stop",
+    "neighbors", "neighbor.remove", "password", "poweroff", "powersaving",
+    "powersaving off", "powersaving on", "reboot",
+    "region", "region allowf", "region def", "region default", "region denyf",
+    "region get", "region home", "region list allowed", "region list denied",
+    "region load", "region put", "region remove", "region save",
+    "sensor get", "sensor list", "sensor set", "set", "setperm", "shutdown",
+    "start ota", "stats-core", "stats-packets", "stats-radio", "tempradio",
+    "time", "ver",
+]
+
+# Keys usable after "set " (CommonCLI.cpp handleSetCmd).
+#
+# The bridge.* setters are absent on purpose: every one of them sits behind
+# WITH_BRIDGE / WITH_RS232_BRIDGE / WITH_ESPNOW_BRIDGE (CommonCLI.cpp:720-768),
+# and no linux env defines any of the three, so the firmware this talks to
+# answers "unknown config: bridge.enabled ...". ("bridge.type" is a getter and
+# is not guarded, so it stays in GETONLY below.)
+SETKEYS = [
+    "adc.multiplier", "advert.interval", "af", "agc.reset.interval",
+    "allow.read.only", "cad",
+    "direct.txdelay", "dutycycle", "flood.advert.interval", "flood.max",
+    "flood.max.advert", "flood.max.unscoped", "freq", "guest.password",
+    "int.thresh", "lat", "lon", "loop.detect", "multi.acks", "name",
+    "owner.info", "path.hash.mode", "prv.key", "radio", "radio.fem.rxgain",
+    "radio.rxgain", "repeat", "rxdelay", "tx", "txdelay",
+]
+
+# "get" accepts everything "set" does, plus these read-only keys
+# (CommonCLI.cpp handleGetCmd, and "get acl" from MyMesh.cpp).
+GETONLY = [
+    "acl", "bootloader.ver", "bridge.type", "public.key", "pwrmgt.bootmv",
+    "pwrmgt.bootreason", "pwrmgt.source", "pwrmgt.support", "role",
+]
+GETKEYS = sorted(SETKEYS + GETONLY)
+
+
+def connect():
+    if not os.path.exists(SOCK):
+        sys.exit("meshcorectl: control socket not found at %s\n"
+                 "  is meshcored running? override with MESHCORED_CONTROL_SOCKET=/path"
+                 % SOCK)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except OSError as e:
+        sys.exit("meshcorectl: cannot connect to %s: %s" % (SOCK, e))
+    return s
+
+
+class Refused(Exception):
+    """A command the daemon did not run. The message says how we know."""
+
+
+def drain(sock, wait=0.2):
+    """Whatever the daemon has already put in the socket, as text.
+
+    Only ever called on a connection that is already known to be broken, so an
+    error here means there is nothing left to recover -- never a traceback.
+    """
+    buf = b""
+    try:
+        while select.select([sock], [], [], wait)[0]:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError:
+        pass
+    return buf.decode(errors="replace").replace("\r", "").strip()
+
+
+def send_command(sock, line, idle=0.4, first=2.0, total=6.0):
+    """Send one command and return the daemon's reply, or raise Refused.
+
+    The daemon echoes a command character by character as it consumes it and
+    only then prints the reply (MC_CLI.print(c) in the repeater's loop()), so
+    the echo doubles as proof that the command was actually read. Whatever the
+    daemon says without that echo in front of it -- the refusal a second client
+    gets -- describes why nothing ran, and is not a reply to anything.
+    """
+    try:
+        sock.sendall((line + "\r").encode())
+    except (BrokenPipeError, ConnectionResetError):
+        # `reboot`, `poweroff` and `shutdown` take the daemon down without
+        # replying, so a script that continues past one finds the socket gone;
+        # a refusal also closes the socket, and leaves its reason behind in the
+        # receive buffer. Read that before guessing.
+        raise Refused(drain(sock) or
+                      "meshcored closed the control socket before '%s' could be "
+                      "sent\n  an earlier command most likely rebooted or shut "
+                      "it down" % line)
+
+    buf = b""
+    deadline = time.monotonic() + total
+    while True:
+        # The first byte is worth waiting longer for than the rest: the reply
+        # follows its echo back to back, but the echo itself waits on the
+        # daemon's next loop iteration, and an empty answer is an error now
+        # rather than a blank line.
+        r, _, _ = select.select([sock], [], [], idle if buf else first)
+        if not r:                  # idle gap -> reply is complete
+            break
+        chunk = sock.recv(4096)
+        if not chunk:              # daemon closed the connection
+            break
+        buf += chunk
+        if time.monotonic() > deadline:
+            break
+
+    text = buf.decode(errors="replace").replace("\r", "")
+    echo = line + "\n"
+    if not text.startswith(echo):
+        raise Refused(text.strip("\n") or
+                      "no reply from meshcored at %s for '%s'\n  the connection "
+                      "was accepted but the command was never read; check that "
+                      "meshcored is still running" % (SOCK, line))
+    return text[len(echo):].strip("\n")
+
+
+def make_completer():
+    """Complete against the whole line, not just the last word.
+
+    interactive() clears readline's delimiter set, so `text` is everything typed
+    so far. Matching on the full line is what makes the multi-word entries usable
+    -- "region li" only reaches "region list allowed" if the completer can see
+    both words.
+    """
+    def completer(text, state):
+        stripped = text.lstrip()
+        indent = text[:len(text) - len(stripped)]
+        for prefix, pool in (("set ", SETKEYS), ("get ", GETKEYS)):
+            if stripped.startswith(prefix):
+                arg = stripped[len(prefix):]
+                matches = [prefix + k for k in pool if k.startswith(arg)]
+                break
+        else:
+            matches = [c for c in TOP if c.startswith(stripped)]
+        matches = sorted(set(matches))
+        return indent + matches[state] if state < len(matches) else None
+    return completer
+
+
+def report(refusal):
+    """Print why a command did not run, and give the exit status."""
+    sys.stderr.write("meshcorectl: %s\n" % refusal)
+    return 1
+
+
+def interactive():
+    import readline
+    try:
+        readline.read_history_file(HISTFILE)
+    except OSError:
+        pass
+    atexit.register(lambda: _save_history(readline))
+    readline.set_history_length(1000)
+    readline.set_completer_delims("")
+    readline.set_completer(make_completer())
+    readline.parse_and_bind("tab: complete")
+
+    sock = connect()
+    print("meshcorectl -> %s   (Tab completes, Ctrl-D quits)" % SOCK)
+    status = 0
+    while True:
+        try:
+            line = input("meshcore> ").strip()
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            continue
+        if not line:
+            continue
+        if line in ("quit", "exit"):
+            break
+        try:
+            out = send_command(sock, line)
+        except Refused as refusal:
+            status = report(refusal)
+            break
+        if out:
+            print(out)
+    sock.close()
+    return status
+
+
+def _save_history(readline):
+    try:
+        readline.write_history_file(HISTFILE)
+    except OSError:
+        pass
+
+
+def run_lines(lines):
+    """Run each line over one connection. Returns the process exit status."""
+    sock = connect()
+    status = 0
+    for raw in lines:
+        cmd = raw.strip()
+        if not cmd:
+            continue
+        try:
+            out = send_command(sock, cmd)
+        except Refused as refusal:
+            # Nothing ran, and every cause of that also leaves the connection
+            # useless for the rest of the script.
+            status = report(refusal)
+            break
+        if out:
+            print(out)
+    sock.close()
+    return status
+
+
+def main():
+    args = sys.argv[1:]
+    if args:
+        return run_lines([" ".join(args)])     # one-shot
+    if not sys.stdin.isatty():
+        return run_lines(sys.stdin)            # piped script
+    return interactive()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

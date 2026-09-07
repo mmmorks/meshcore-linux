@@ -103,7 +103,8 @@ public:
     }
   }
 
-  // Re-exec this process image rather than exit. Defined in LinuxBoard.cpp.
+  // Tear the control socket down and re-exec this process image. Defined in
+  // LinuxBoard.cpp, which is where LinuxConsole is visible.
   void reboot() override;
 
   // Block on the LoRa IRQ edge descriptor (plus any other descriptor that will
