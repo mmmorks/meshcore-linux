@@ -10,6 +10,7 @@
 #include <string.h>
 #include <RadioLib.h>
 #include <helpers/KeyValueStore.h>
+#include "LinuxEventSource.h"
 
 class LinuxConfig {
 public:
@@ -105,6 +106,34 @@ public:
   // Re-exec this process image rather than exit. Defined in LinuxBoard.cpp.
   void reboot() override;
 
+  // Block on the LoRa IRQ edge descriptor instead of spinning. Defined in
+  // LinuxBoard.cpp; see variants/linux/LinuxEventLoop.h for the poll wrapper,
+  // which can watch further descriptors alongside it if a caller has any it
+  // will drain in the same iteration.
+  void idleUntilEvent(uint32_t max_wait_ms) override;
+
+  // Sleep until the LoRa IRQ line goes high or timeout_ms elapses, returning
+  // true if it went high. The narrow sibling of idleUntilEvent(): same event
+  // source, same fallback, but it watches only the radio and is driven by a
+  // caller that has just armed a specific operation and needs its completion.
+  //
+  // Used for hardware CAD, where RadioLib's own scanChannel() would otherwise
+  // busy-spin on the line with no deadline. A line that cannot report -- dead,
+  // or never configured at all -- costs the caller the full timeout and a
+  // false return, never a short-circuited one: the caller reads the result over
+  // SPI afterwards, and that read is only meaningful once the operation has had
+  // its deadline to complete.
+  bool waitForRadioIrq(uint32_t timeout_ms);
+
+  // Wake-up source for the Linux event loop (the LoRa IRQ line), or NULL when
+  // edge detection is unavailable. Typed as the abstract interface so this
+  // header stays free of any libgpiod dependency.
+  LinuxEventSource* irqEventSource() const { return irq_event_source; }
+
+protected:
+  LinuxEventSource* irq_event_source = nullptr;
+
+public:
   LinuxConfig config;
 };
 

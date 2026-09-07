@@ -281,9 +281,71 @@ sudo systemctl start meshcored
 
 > **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `prefs.json` and the INI values are no longer read for those fields. To apply a changed radio parameter, use the CLI (`set freq`, `set sf`, etc.) or reset prefs as above.
 
+## Operation
+
+### Idle CPU usage
+
+`meshcored` blocks in `poll()` between events rather than spinning: expect **well
+under 1% CPU at idle** with edge detection, and roughly **1–3%** in the polling
+fallback. Startup logs which mode a bound LoRa IRQ pin ended up in:
+
+```
+LoRa IRQ pin 25 bound with edge detection: yes
+```
+
+`NO (polling fallback)` means the kernel or libgpiod on this device could not set
+up edge events for that line, so the daemon uses a 1 ms poll timeout instead of
+the normal 50 ms `IDLE_MAX_WAIT_MS`. Packet RX/TX is unaffected; it just costs
+CPU.
+
+Edge detection can also be lost later in a run:
+
+```
+EventGPIOPin(GPIO25): edge detection lost on mode change (...); falling back to timeout polling
+```
+
+The daemon stays correct but degrades to timeout polling for the rest of the run.
+This is not expected in normal operation — worth reporting, with the `(...)`
+errno text and your libgpiod and kernel versions.
+
+### Channel Activity Detection
+
+Off by default. When enabled, the radio runs a hardware CAD scan immediately
+before each transmit and defers if it detects a LoRa signal. The change takes
+effect within 2 seconds, no restart needed:
+
+```
+set cad on      # or: set cad off
+get cad
+```
+
+CAD complements `int.thresh` rather than replacing it; either, both or neither
+may be active:
+
+- **`int.thresh`** compares RSSI against the measured noise floor. It sees any
+  energy, including non-LoRa interference, but cannot see a signal below the
+  noise floor.
+- **`cad`** correlates against the LoRa preamble, so it detects a real LoRa
+  transmission *below* the noise floor where RSSI is blind — but ignores non-LoRa
+  energy entirely.
+
+Enabling `int.thresh` alongside `cad` also reduces how often the scan runs: the
+RSSI check is evaluated first, and a busy verdict there skips the scan.
+
+**Cost at high spreading factors.** A scan takes about four symbol times: roughly
+20 ms at SF8/62.5 kHz, but around 265 ms at SF12/62.5 kHz. Transmit attempts
+retry every 200 ms while the channel reads busy, so at SF12 a node holding a
+queued packet on a contended channel spends over half that window inside a scan —
+with the modem in standby, **not listening**. That is inherent to CAD-before-TX,
+but worth knowing before enabling it on a high-SF preset.
+
 ## Known Gaps / TODO
 
 - **Config path is hardcoded**, meshcored always loads `/etc/meshcored/meshcored.ini`; there is no flag to point it elsewhere. (The data *path* is separate and configurable: it is the ArduLinux VFS root, set with `--fsdir`.)
 - **Only repeater firmware**, there is no `linux_companion` target yet; companion radio support (BLE/serial interface to a phone app) is not implemented for Linux.
 - **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 5.
-- **No power management**, `board.sleep()` is a no-op; the power-saving loop in `main.cpp` never actually sleeps.
+- **No suspend or wake-on-radio**, `board.sleep()` is an ordinary `sleep(3)`: the process idles, but the host is not suspended and nothing arms a wake source, so `powersaving_enabled` saves no more power than the normal idle described under [Idle CPU usage](#idle-cpu-usage). It also cannot be interrupted by an incoming packet, so leaving it off is the better default on Linux.
+- **libgpiod v2 is compile-verified only.** `EventGPIOPin`'s v2 path (Debian
+  trixie and newer) builds cleanly in the trixie `build-docker.sh` container, but has never been
+  exercised at runtime against real hardware — all runtime verification to date is
+  on libgpiod v1 (bookworm). Treat it as unproven.

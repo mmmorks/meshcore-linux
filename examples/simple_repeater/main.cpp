@@ -30,6 +30,26 @@ static char ethernet_command[160];
 // For power saving
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
+// How long loop() is willing to idle between iterations, for boards that
+// implement MainBoard::idleUntilEvent().
+//
+// The bound is the shortest deadline not already delivered by the radio IRQ,
+// and there are two. Dispatcher::getCADFailRetryDelay() is 200 ms, which 50 ms
+// clears with 4x margin. The delayed-inbound queue is the tighter one: its
+// delay is randomised per packet but floored at exactly 50 ms, because
+// checkRecv() processes anything below that immediately rather than queueing
+// it. So a queued inbound packet can be serviced up to one full iteration late.
+//
+// That is latency, not error. The delay being quantised is a randomised
+// collision-spreading interval, and nodes do not wake in step with one another,
+// so rounding it up adds jitter to a quantity that is already jitter -- it
+// cannot bunch two nodes onto the same slot the way a synchronised delay would.
+// Nothing else needs a faster iteration: RX-done and TX-done arrive on the IRQ.
+// Boards with no implementation ignore this entirely and keep busy-looping.
+#ifndef IDLE_MAX_WAIT_MS
+  #define IDLE_MAX_WAIT_MS  50
+#endif
+
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
 #define USER_BTN_HOLD_OFF_MILLIS 1500
@@ -213,4 +233,10 @@ void loop() {
     // Small delay to prevent busy loop on platforms without power saving
     delay(1);
   }
+
+  // Idle instead of spinning between iterations. Default implementation is a
+  // no-op, so this is safe on every board; those that implement it block on
+  // the radio IRQ (and any other descriptor they will drain) until it fires or
+  // IDLE_MAX_WAIT_MS elapses.
+  board.idleUntilEvent(IDLE_MAX_WAIT_MS);
 }
