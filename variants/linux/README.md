@@ -119,14 +119,16 @@ Key settings:
 | `current_limit` | `140` | Radio over-current protection limit in mA |
 | `dio2_as_rf_switch` | `0` | `1` = use DIO2 to drive the TX/RX RF switch. **Required for the Waveshare Core1262** (without it the radio inits but TX/RX are dead); depends on module wiring |
 | `rx_boosted_gain` | `1` | `1` enables the SX126x RX boosted-gain mode; `0` disables |
+| `use_regulator_ldo` | `0` | `1` powers the radio from the LDO instead of the DC-DC converter. Only for modules built without the DC-DC inductor |
+| `rx_register_patch` | `0` | `1` applies the SX126x RX-sensitivity patch (bit 0 of register `0x8B5`). Try it if a HAT receives poorly |
 | `advert_name` | `"Linux Repeater"` | Node name, first-run default only |
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
 
 Comments (`#`, `;`), blank lines and `[section]` headers are ignored. Boolean
-settings (`dio2_as_rf_switch`, `rx_boosted_gain`) accept `1`/`0`,
-`true`/`false`, `on`/`off` or `yes`/`no`, case-insensitively; anything else is
-a fatal invalid value.
+settings (`dio2_as_rf_switch`, `rx_boosted_gain`, `use_regulator_ldo`,
+`rx_register_patch`) accept `1`/`0`, `true`/`false`, `on`/`off` or `yes`/`no`,
+case-insensitively; anything else is a fatal invalid value.
 
 #### Config validation
 
@@ -303,4 +305,3 @@ ssh <host> 'sudo mv /usr/bin/meshcored.prev /usr/bin/meshcored && sudo systemctl
 - **Only repeater firmware**, there is no `linux_companion` target yet; companion radio support (BLE/serial interface to a phone app) is not implemented for Linux.
 - **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 5.
 - **No power management**, `board.sleep()` is a no-op; the power-saving loop in `main.cpp` never actually sleeps.
-- **Upstream-sync fragility**, the radio wrapper (`LinuxSX1262Wrapper`) implements the `RadioLibWrapper` interface by hand, so it can drift from upstream in two ways: a new **pure-virtual** method breaks the Linux build (e.g. `setParams()`), and a new **virtual-with-default** method silently no-ops on Linux until overridden (e.g. `set`/`getRxBoostedGainMode()`, which reported and applied the wrong state until added). Mirror `CustomSX1262Wrapper` when syncing.
