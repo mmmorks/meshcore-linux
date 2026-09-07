@@ -123,6 +123,33 @@ Key settings:
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
 
+Comments (`#`, `;`), blank lines and `[section]` headers are ignored. Boolean
+settings (`dio2_as_rf_switch`, `rx_boosted_gain`) accept `1`/`0`,
+`true`/`false`, `on`/`off` or `yes`/`no`, case-insensitively; anything else is
+a fatal invalid value.
+
+#### Config validation
+
+Every problem is reported on its own `ERROR:` line at startup:
+
+| Problem | Response |
+|---------|----------|
+| **Invalid value** — a GPIO pin outside `0..255`, a malformed or out-of-range number, an unrecognised boolean spelling, or empty | **Fatal**, the daemon refuses to start |
+| **Unrecognised key** — e.g. `lora_frequency` for `lora_freq` | **Warning**, key ignored, startup continues |
+| **File missing or unreadable** | **Warning**, built-in defaults used. The radio then fails to start, since no pins are configured |
+
+```
+ERROR: meshcored.ini: unknown key 'lora_frequency' (ignored)
+WARNING: 1 unrecognised key(s) in /etc/meshcored/meshcored.ini ...
+
+ERROR: meshcored.ini: lora_irq_pin = '260' is not a valid GPIO pin (expected 0..255)
+FATAL: 1 invalid value(s) in /etc/meshcored/meshcored.ini ...
+```
+
+**Read the warnings after editing.** An ignored key does not merely fail to
+apply: for a first-run default, the built-in value is persisted on the first
+boot, and fixing the INI afterwards changes nothing.
+
 ### 3. Enable SPI and GPIO access
 
 First make sure the SPI interface is actually enabled, the radio needs a
