@@ -6,6 +6,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <string.h>
 #include <RadioLib.h>
 #include <helpers/KeyValueStore.h>
 
@@ -32,17 +34,26 @@ public:
   bool dio2_as_rf_switch = false;
   bool rx_boosted_gain = true;
 
-  char* spidev = "/dev/spidev0.0";
-  char* lora_gpiochip = "gpiochip0";
+  const char* spidev = "/dev/spidev0.0";
+  const char* lora_gpiochip = "gpiochip0";
 
   float lora_tcxo = 1.8f;
 
-  char *advert_name = "Linux Repeater";
-  char *admin_password = "password";
+  const char *advert_name = "Linux Repeater";
+  const char *admin_password = "password";
   float lat = 0.0f;
   float lon = 0.0f;
 
-  int load(const char *filename);
+  // Outcome of parsing meshcored.ini. Two failure kinds, kept apart because
+  // they deserve opposite responses (see LinuxBoard::begin()): a value the
+  // operator wrote that could not be honoured, versus a key nothing consumes.
+  struct LoadResult {
+    bool opened       = false;  // false: the file could not be read at all
+    int  bad_values   = 0;      // values that failed validation
+    int  unknown_keys = 0;      // keys nothing consumes; ignored
+  };
+
+  LoadResult load(const char *filename);
 };
 
 class LinuxBoard : public mesh::MainBoard {
@@ -71,13 +82,9 @@ public:
     exit(0);
   }
 
-  void reboot() override {
-    exit(0);
-  }
-
-  // Upstream attaches variant-specific prefs to the 'custom' Json object; the
-  // linux target carries its runtime config in meshcored.ini instead, so this
-  // is a no-op, matching ESP32Board/NRF52Board/STM32Board.
+  // Upstream lets a variant hang its own prefs off the 'custom' JSON object;
+  // this target carries its runtime config in meshcored.ini instead, so this is
+  // a no-op, matching ESP32Board/NRF52Board/STM32Board.
   void attachDynamicPrefs(KeyValueStore* prefs) { }
 
   void sleep(uint32_t secs) override {
@@ -88,10 +95,18 @@ public:
     }
   }
 
+  // Re-exec this process image rather than exit. Defined in LinuxBoard.cpp.
+  void reboot() override;
+
   LinuxConfig config;
 };
 
 class LinuxRTCClock : public mesh::RTCClock {
+  // Latches the first settimeofday() failure. The callers are on timers (GPS
+  // time sync, the mesh clock correction), so an unlatched report would repeat
+  // for the life of the daemon.
+  bool _settime_warned = false;
+
 public:
   LinuxRTCClock() { }
   void begin() {
@@ -105,6 +120,28 @@ public:
     struct timeval tv;
     tv.tv_sec = time;
     tv.tv_usec = 0;
-    settimeofday(&tv, NULL);
+    if (settimeofday(&tv, NULL) == 0) {
+      // Deliberately not deduped like the warning below: this line's whole
+      // value is showing *every* time GPS/mesh sync steps the clock, so a
+      // clock fighting something else on the host (NTP, a process with
+      // CAP_SYS_TIME) is visible in the journal instead of silently winning
+      // or losing against it.
+      printf("NOTE: system clock set to %u by mesh/GPS time sync.\n", (unsigned) time);
+      return;
+    }
+
+    // Unlike an MCU, this is the whole host's clock, and setting it needs
+    // CAP_SYS_TIME. The shipped unit runs as an unprivileged `meshcore` user
+    // with NoNewPrivileges=yes, so it does not have it and this always fails --
+    // `clock sync` and GPS time sync would otherwise report success and do
+    // nothing at all. Not fatal: the host's clock is NTP's job on a Linux box,
+    // and getCurrentTime() reads it correctly either way.
+    if (!_settime_warned) {
+      _settime_warned = true;
+      printf("WARNING: cannot set the system clock (%s); mesh/GPS time sync will\n"
+             "         not take effect. This is expected under the shipped systemd\n"
+             "         unit (unprivileged, no CAP_SYS_TIME) -- keep the host on NTP.\n",
+             strerror(errno));
+    }
   }
 };
