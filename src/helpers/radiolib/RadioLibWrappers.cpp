@@ -11,6 +11,14 @@
 #define NUM_NOISE_FLOOR_SAMPLES  64
 #define SAMPLING_THRESHOLD  14
 
+// Payload budget calcMaxPacketMillis() assumes when the modem cannot tell it
+// how long a packet takes. Long on purpose: this deadline exists to break a
+// stuck header IRQ, and one that expires early would clear the flags of a
+// packet still arriving.
+#ifndef MAX_PACKET_FALLBACK_PAYLOAD_US
+  #define MAX_PACKET_FALLBACK_PAYLOAD_US  4000000UL
+#endif
+
 static volatile uint8_t state = STATE_IDLE;
 
 // this function is called when a complete packet
@@ -133,7 +141,21 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
       if (len > sz) { len = sz; }
       int err = _radio->readData(bytes, len);
       if (err != RADIOLIB_ERR_NONE) {
-        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
+        // Signal quality of the packet that just failed. A CRC mismatch (-7) is
+        // the common case and says nothing on its own about *why*: a packet at
+        // the edge of the demodulator and one lost to a collision both land
+        // here. The modem's packet-status registers are written whether or not
+        // the CRC passed, so this reads the same values a successful receive
+        // would report, at no extra SPI cost -- enough to tell a failure
+        // distribution sitting on the SF's SNR floor apart from one spread
+        // across strong signals.
+        //
+        // SNR is scaled by 4 rather than truncated because the threshold this
+        // is meant to resolve is a fraction of a dB wide, and %f is not
+        // portable across every platform this file builds for. Same quarter-dB
+        // convention as Packet::_snr.
+        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d) len=%d rssi=%d snr4=%d",
+                           err, len, (int)getLastRSSI(), (int)(getLastSNR() * 4));
         len = 0;
         n_recv_errors++;
       } else {
@@ -252,7 +274,22 @@ PacketMillis RadioLibWrapper::calcMaxPacketMillis(uint8_t sf, float bw, uint8_t 
   // airtime for max packet at current radio settings
   uint32_t total_us   = _radio->getTimeOnAir(MAX_TRANS_UNIT);
   // airtime for payload only (no preamble, header or SOF)
-  uint32_t payload_us = total_us > preamble_us ? total_us - preamble_us : 4000 - preamble_us; // fallback to 4 secs at worst case
+  uint32_t payload_us;
+  if (total_us > preamble_us) {
+    payload_us = total_us - preamble_us;
+  } else {
+    // getTimeOnAir() gave nothing usable (it returns 0 on an unconfigured
+    // modem). Fall back to the 4 s this has always claimed -- as 4 s of
+    // *payload*, not as 4 s of total airtime minus the preamble.
+    //
+    // The value used to be 4000, i.e. 4 ms, and the subtraction underflowed for
+    // any setting whose preamble exceeds that: every one of them. An underflow
+    // here is not a mis-sized deadline but the absence of one, because the
+    // result becomes a ~49-day payload watchdog, so CustomSX1262::isReceiving()
+    // would hold a latched HEADER_VALID true forever and isReceiving() would
+    // never again report the channel idle.
+    payload_us = MAX_PACKET_FALLBACK_PAYLOAD_US;
+  }
   // rescale payload_us for max possible CR
   if (cr >= 5 && cr < 8) { payload_us = (payload_us * 8) / cr; }
 
