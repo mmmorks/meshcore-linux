@@ -445,6 +445,10 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
       if (parse_bool(key, value, &bval, &result.bad_values)) dio2_as_rf_switch = bval;
     } else if (strcmp(key, "rx_boosted_gain") == 0) {
       if (parse_bool(key, value, &bval, &result.bad_values)) rx_boosted_gain = bval;
+    } else if (strcmp(key, "use_regulator_ldo") == 0) {
+      if (parse_bool(key, value, &bval, &result.bad_values)) use_regulator_ldo = bval;
+    } else if (strcmp(key, "rx_register_patch") == 0) {
+      if (parse_bool(key, value, &bval, &result.bad_values)) rx_register_patch = bval;
     } else if (strcmp(key, "lora_irq_pin") == 0) {
       if (parse_pin(key, value, PIN_REQUIRED, &pin, &result.bad_values)) lora_irq_pin = (uint32_t) pin;
     } else if (strcmp(key, "lora_reset_pin") == 0) {
