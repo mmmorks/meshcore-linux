@@ -21,3 +21,10 @@ admin_password = changeme
 lat = 0.0
 lon = 0.0
 
+
+# This HAT has no onboard GPS. If one is added (e.g. a USB receiver fed to a
+# local gpsd), see gps_device/gps_baud/gps_en_pin in meshcored.ini.waveshare
+# and "Disciplining the host clock from GNSS" in README.md. defer_clock
+# overrides whether meshcored sets the system clock from GPS/mesh time sync;
+# unset (default) follows gps_device's transport.
+# defer_clock = true

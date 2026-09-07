@@ -6,6 +6,8 @@
 #include <LinuxBoard.h>
 #include <helpers/radiolib/CustomSX1276Wrapper.h>
 #include <helpers/sensors/EnvironmentSensorManager.h>
+#include <helpers/sensors/MicroNMEALocationProvider.h>
+#include "LinuxGpsStream.h"
 #ifdef DISPLAY_CLASS
   #include <helpers/ui/SSD1306Display.h>
   #include <helpers/ui/MomentaryButton.h>
@@ -19,6 +21,13 @@ extern LinuxBoard board;
 extern WRAPPER_CLASS radio_driver;
 extern LinuxRTCClock rtc_clock;
 extern EnvironmentSensorManager sensors;
+extern LinuxGpsStream gps_serial;
+extern MicroNMEALocationProvider gps_location;
+
+// True if there is a GPS to talk to: an opened serial device, or a configured
+// gpsd source (which may connect later). Consumed by
+// EnvironmentSensorManager::initBasicGPS() on the Linux build.
+bool linux_gps_present();
 
 #ifdef DISPLAY_CLASS
   extern DISPLAY_CLASS display;

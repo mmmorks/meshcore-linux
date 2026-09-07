@@ -32,7 +32,13 @@ RADIO_CLASS radio = radio_module;
 WRAPPER_CLASS radio_driver(radio, board);
 
 LinuxRTCClock rtc_clock;
-EnvironmentSensorManager sensors;
+LinuxGpsStream gps_serial;
+MicroNMEALocationProvider gps_location(gps_serial, &rtc_clock, -1, -1, NULL);
+EnvironmentSensorManager sensors(gps_location);
+
+bool linux_gps_present() {
+  return gps_serial.isPresent();
+}
 
 #ifdef DISPLAY_CLASS
   DISPLAY_CLASS display;
@@ -41,6 +47,20 @@ EnvironmentSensorManager sensors;
 
 bool radio_init() {
   rtc_clock.begin();
+
+  // begin() dispatches on the device string, so the empty-means-disabled test
+  // lives inside it rather than here.
+  gps_serial.begin(board.config.gps_device, board.config.gps_baud);
+
+  // Has to follow begin(), which is what establishes the transport. The
+  // transport-derived default only catches the gpsd:// case; `defer_clock` in
+  // meshcored.ini overrides it explicitly for setups the transport string
+  // cannot see for itself (e.g. a serial gps_device the operator is feeding
+  // to chrony some other way, alongside CAP_SYS_TIME).
+  bool defer = board.config.defer_clock >= 0
+             ? (board.config.defer_clock != 0)
+             : (gps_serial.transport() == LinuxGpsStream::GPSD_SOCKET);
+  rtc_clock.setExternallyDisciplined(defer);
 
   // Rebuild the radio on a Module carrying the configured pins. Assigning over
   // the object rather than replacing it is deliberate and required: radio_driver
