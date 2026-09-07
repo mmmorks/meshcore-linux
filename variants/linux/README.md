@@ -104,6 +104,7 @@ Key settings:
 |-----|---------|-------|
 | `spidev` | `/dev/spidev0.0` | SPI device node |
 | `lora_gpiochip` | `gpiochip0` | Name of the `/dev/gpiochip*` device (or kernel label). `gpiochip0` is correct for Pi 3/4/Zero 2W; Pi 5 may need `gpiochip4` or `pinctrl-rp1` depending on kernel |
+| `console_path` | (auto) | Where to publish the CLI console. Unset, the daemon picks `/run/meshcored/console` under the systemd unit, else a per-user path; see [The control CLI](#the-control-cli) |
 | `lora_irq_pin` | (none) | GPIO line number for IRQ |
 | `lora_reset_pin` | (none) | GPIO line number for RESET |
 | `lora_nss_pin` | (none) | GPIO line number for NSS/CS (if not handled by the SPI driver) |
@@ -249,19 +250,16 @@ sudo journalctl -u meshcored -f
 > If you smoke-tested by running directly first, clear any stale state so the
 > service first-boots with the INI defaults: `sudo rm -rf /var/lib/meshcore/*`
 
-> For the local CLI console under systemd, uncomment
-> `console_path = /run/meshcored/console` in `/etc/meshcored/meshcored.ini`
-> (the unit's `RuntimeDirectory` provides `/run/meshcored`). See
+> Under the unit the CLI console appears at `/run/meshcored/console` with no
+> INI change: the daemon finds the unit's `RuntimeDirectory` on its own. See
 > [§5](#5-reconfiguring-after-first-run).
 
 ### 5. Reconfiguring after first run
 
-`meshcored` exposes a local CLI at the path set by `console_path` in
-`meshcored.ini`, kept separate from the logs (which go to stdout / journald).
-Under the systemd unit, uncomment `console_path = /run/meshcored/console` — the
-unit's `RuntimeDirectory` creates that directory, owned by the `meshcore` user.
-
-Connect with [`meshcore-cli`](https://github.com/fdlamotte/meshcore-cli):
+`meshcored` exposes a local CLI console, kept separate from the logs (which go
+to stdout / journald). Under the systemd unit it is `/run/meshcored/console`.
+Connect with [`meshcore-cli`](https://github.com/fdlamotte/meshcore-cli), or any
+serial terminal (see [The control CLI](#the-control-cli)):
 
 ```sh
 sudo meshcore-cli -r -s /run/meshcored/console
@@ -284,9 +282,8 @@ set sf 7
 > **Security:** connecting to the console grants the privileged, *unauthenticated*
 > local CLI — it can change the radio, read the private key (`get prv.key`), erase
 > state, etc. The console is owner-only (mode `0600`), so keep the daemon's user
-> (`root`/`meshcore`) trusted. When `console_path` is unset (e.g. running
-> `meshcored` **directly**, not under systemd) it defaults to
-> `$XDG_RUNTIME_DIR/meshcore/console` (else `/tmp/meshcore-<uid>/console`).
+> (`root`/`meshcore`) trusted. Where the console is published is described in
+> [The control CLI](#the-control-cli).
 
 Logs stream to journald (`sudo journalctl -u meshcored -f`); the daemon
 line-buffers stdout itself, so no `stdbuf` wrapper is needed.
@@ -311,6 +308,48 @@ sudo systemctl start meshcored
 > When running **directly** (not under systemd), `meshcored --fsdir /var/lib/meshcore --erase` is the equivalent one-shot full reset. Do **not** add `--erase` to the service unit: systemd re-runs `ExecStart` on every restart, so it would wipe the filesystem and regenerate the identity each time. (The firmware's own `reboot()` strips `--erase` to avoid self-wiping, but that protection does not extend to a systemd restart.)
 
 > **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `prefs.json` and the INI values are no longer read for those fields. To apply a changed radio parameter on a running node, use the console CLI (`set freq`, `set sf`, etc.; see [§5](#5-reconfiguring-after-first-run)) or reset prefs as above.
+
+## The control CLI
+
+Everything the MeshCore docs describe as the "serial CLI" — `set`, `get`,
+`advert`, `neighbors`, and the rest — is reached here through the console.
+
+The Arduino `Serial` object is output-only on Linux, so `meshcored` prints its
+logs to stdout and serves the CLI on a **pseudo-terminal**, published as a
+symlink at a stable path. `console_path` in `meshcored.ini` sets it; unset, the
+first of these that can be published wins, and startup logs which one it was:
+
+| Order | Path | When |
+|-------|------|------|
+| 1 | `console_path`, if set | |
+| 2 | `/run/meshcored/console` | the directory exists and is writable: the unit's `RuntimeDirectory=` |
+| 3 | `$XDG_RUNTIME_DIR/meshcore/console` | running directly as a logged-in user |
+| 4 | `/tmp/meshcore-<uid>/console` | neither of the above |
+
+The device behind the symlink is mode `0600` and owned by the user running the
+daemon, so reaching it means being that user or root. A path is skipped, with a
+line on stderr, if another live `meshcored` already holds it, if something that
+is not a symlink sits there, or if its parent directory is not owned by the
+daemon's own user with no group or other permissions — anyone who can write that
+directory can point `console` at a terminal of their own and read what the
+operator types at it. (The unit's `RuntimeDirectoryMode=0700` satisfies that;
+so do the `0700` directories the daemon creates for the per-user paths.) A
+symlink left by a crashed daemon is reclaimed. `reboot` unpublishes the console
+before re-executing, so the new process starts from a clean path.
+
+Because the console is a terminal device, any serial tool can attach:
+`meshcore-cli -r -s <path>`, `screen`, `minicom`, `picocom`. There is no
+single-client rule: two tools attached at once share one CLI and see each
+other's traffic.
+
+Running `meshcored` in a **foreground** terminal, you can also type commands
+straight into its stdin. Replies are printed to stdout either way; a command
+typed at the terminal is not copied to the console, and a command sent over the
+console is answered there. The terminal is put in raw mode for this and handed
+back as it was, on `Ctrl-C` and `SIGTERM` as well as on a clean exit. Started in
+the background (`meshcored &`, or under systemd) it leaves stdin alone
+altogether — reading a terminal from a background job would only stop the job —
+so there the console is the way in.
 
 ## Operation
 

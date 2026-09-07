@@ -45,8 +45,9 @@ public:
   const char* spidev = "/dev/spidev0.0";
   const char* lora_gpiochip = "gpiochip0";
 
-  // Local CLI console path. Empty => a per-user default
-  // ($XDG_RUNTIME_DIR/meshcore/console, else /tmp/meshcore-<uid>/console).
+  // Local CLI console path. Empty => the default search order: the systemd
+  // unit's /run/meshcored/console when that directory exists, else
+  // $XDG_RUNTIME_DIR/meshcore/console, else /tmp/meshcore-<uid>/console.
   // Connect with `meshcore-cli -r -s <path>`.
   const char* console_path = "";
 
@@ -108,7 +109,8 @@ public:
     }
   }
 
-  // Re-exec this process image rather than exit. Defined in LinuxBoard.cpp.
+  // Unpublish the console and re-exec this process image rather than exit.
+  // Defined in LinuxBoard.cpp.
   void reboot() override;
 
   // Block on the LoRa IRQ edge descriptor instead of spinning. Defined in

@@ -18,12 +18,13 @@ SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
 
-// CLI console stream. On Linux the interactive CLI runs over a Unix-domain
-// socket (so the socket carries only the CLI while Serial keeps the logs); on
-// MCU targets, and as the Linux fallback, it is just Serial.
+// CLI console stream. On Linux the interactive CLI runs over a pseudo-terminal
+// (so the PTY carries only the CLI while Serial keeps the logs) and over stdin
+// when meshcored runs in the foreground of a terminal; on MCU targets it is
+// just Serial.
 #if defined(ARDULINUX_PLATFORM) || defined(LINUX_PLATFORM)
+  #include <stdio.h>
   #include <helpers/LinuxConsole.h>
-  static LinuxConsole linux_console;
 #endif
 static Stream* console = &Serial;
 
@@ -65,6 +66,16 @@ static unsigned long userBtnDownAt = 0;
 #endif
 
 void setup() {
+#if defined(ARDULINUX_PLATFORM) || defined(LINUX_PLATFORM)
+  // Line-buffer the debug log. Serial is stdout here, and the C library gives
+  // stdout line buffering only when it is a terminal; under the systemd unit
+  // (StandardOutput=journal) it is a socket and defaults to a 4 KB block
+  // buffer, so `journalctl -u meshcored -f` would show nothing until 4 KB of
+  // log had piled up. Before the first write, which is why it is here and not
+  // in Console.begin(): board.begin() below already logs.
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
+
   Serial.begin(115200);
   delay(1000);
 
@@ -75,15 +86,18 @@ void setup() {
 #endif
 
 #if defined(ARDULINUX_PLATFORM) || defined(LINUX_PLATFORM)
-  // Bring up the local CLI console (config path, or a per-user default). Log
-  // which console is active so a failure (e.g. an unwritable configured path) is
-  // diagnosable rather than a silent no-CLI daemon; on failure the CLI stays on
-  // Serial (stdin/stdout).
-  if (linux_console.begin(board.config.console_path)) {
-    console = &linux_console;
-    Serial.print("CLI console on "); Serial.println(linux_console.path());
+  // Bring up the local CLI console: the PTY at console_path (or the default
+  // search order), plus stdin when this is running in the foreground of a
+  // terminal. Log which so a failure (an unwritable configured path, say) is
+  // diagnosable rather than a silent no-CLI daemon. Serial's read() is a stub
+  // on Linux, so there is no fallback to it: without a PTY the CLI is
+  // reachable only from a terminal's stdin.
+  Console.begin(board.config.console_path);
+  console = &Console;
+  if (Console.hasPty()) {
+    Serial.print("CLI console on "); Serial.println(Console.path());
   } else {
-    Serial.println("CLI console: unavailable (see stderr), using stdio");
+    Serial.println("CLI console: no PTY (see stderr); stdin only, if this is a foreground terminal");
   }
 #endif
 

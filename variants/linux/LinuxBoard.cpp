@@ -12,6 +12,7 @@
 #endif
 #include "LinuxBoard.h"
 #include "LinuxEventLoop.h"
+#include <helpers/LinuxConsole.h>
 #include "LinuxRadioWait.h"
 #include "AppInfo.h"
 
@@ -191,7 +192,17 @@ void LinuxBoard::begin() {
 // (CommonCLI::handleCommand), so that would take an unattended repeater
 // off-air. Qualified as ::reboot() to resolve to the global one and not recurse
 // into this member of the same name.
+//
+// The console comes down first. Its descriptors are close-on-exec, so the new
+// image inherits none of them, but its symlink is on disk: left behind, it
+// points at a /dev/pts/N the exec has just freed, and the new image's begin()
+// would either find it dangling and reclaim it (fine) or find that number
+// already reused by an unrelated terminal and decline its own path (not fine,
+// and only the log would say where the CLI went). Unpublishing here makes the
+// outcome depend on nothing but this call. powerOff() needs none of this:
+// exit(0) runs the destructor.
 void LinuxBoard::reboot() {
+  Console.end();
   ::reboot();
 }
 
@@ -211,12 +222,21 @@ void LinuxBoard::idleUntilEvent(uint32_t max_wait_ms) {
   EventLoop.reset();
   EventLoop.setEventSource(src);
 
-  // Only descriptors that loop() will actually drain this iteration may be
-  // registered here. POLLIN is level-triggered, so a registered descriptor
-  // that nothing reads stays readable forever and turns this wait back into
-  // the busy loop it exists to remove. A byte source that is only drained
-  // conditionally (a GPS stream while GPS is switched off, say) is better
-  // served off the poll timeout than registered.
+  // The console's inputs: the PTY master and, in a foreground terminal, stdin.
+  // Both are safe to watch permanently because loop() drains whichever has a
+  // byte on every iteration, and the PTY master never reports a hangup (the
+  // console holds the slave open itself), so a detached console is idle rather
+  // than a level condition. Either accessor is -1 when it does not apply, which
+  // registerFd() ignores.
+  EventLoop.registerFd(Console.ptyFd());
+  EventLoop.registerFd(Console.stdinFd());
+
+  // Nothing else belongs here unless loop() will drain it every iteration.
+  // POLLIN is level-triggered, so a registered descriptor that nothing reads
+  // stays readable forever and turns this wait back into the busy loop it
+  // exists to remove. A byte source that is only drained conditionally (a GPS
+  // stream while GPS is switched off, say) is better served off the poll
+  // timeout than registered.
 
   // Refresh the cached IRQ level immediately before blocking. Packet
   // correctness does not come from the edge-event descriptor above; it comes
