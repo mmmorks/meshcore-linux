@@ -1010,6 +1010,20 @@ region save
 
 ---
 
+#### View or change the GPS read interval
+**Usage:**
+- `gps interval`
+- `gps interval <seconds>`
+
+**Parameters:**
+- `seconds`: seconds between location reads, `0` to `86400`. `0` restores the firmware default (1 s)
+
+**Default:** `0`
+
+**Note:** The bare form reports the stored value. The setting is persisted and re-applied at boot. A non-numeric or out-of-range argument is rejected with an error rather than clamped.
+
+---
+
 #### Sync this node's clock with GPS time
 **Usage:** 
 - `gps sync`
