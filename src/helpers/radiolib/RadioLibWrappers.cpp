@@ -133,7 +133,21 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
       if (len > sz) { len = sz; }
       int err = _radio->readData(bytes, len);
       if (err != RADIOLIB_ERR_NONE) {
-        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d)", err);
+        // Signal quality of the packet that just failed. A CRC mismatch (-7) is
+        // the common case and says nothing on its own about *why*: a packet at
+        // the edge of the demodulator and one lost to a collision both land
+        // here. The modem's packet-status registers are written whether or not
+        // the CRC passed, so this reads the same values a successful receive
+        // would report, at no extra SPI cost -- enough to tell a failure
+        // distribution sitting on the SF's SNR floor apart from one spread
+        // across strong signals.
+        //
+        // SNR is scaled by 4 rather than truncated because the threshold this
+        // is meant to resolve is a fraction of a dB wide, and %f is not
+        // portable across every platform this file builds for. Same quarter-dB
+        // convention as Packet::_snr.
+        MESH_DEBUG_PRINTLN("RadioLibWrapper: error: readData(%d) len=%d rssi=%d snr4=%d",
+                           err, len, (int)getLastRSSI(), (int)(getLastSNR() * 4));
         len = 0;
         n_recv_errors++;
       } else {
