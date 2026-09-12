@@ -52,6 +52,24 @@ Alternatively, build directly with PlatformIO (no version metadata):
 FIRMWARE_VERSION=dev pio run -e linux_repeater
 ```
 
+**Container cross-build.** `build-docker.sh` builds for arm64 inside a Debian
+container, which is how to build from a non-Linux machine (or without
+installing the toolchain on the host). `BASE_IMAGE` picks the libgpiod major
+version the binary is built against, and each base gets its own build
+directory so the two cannot be mixed:
+
+```sh
+./build-docker.sh linux_repeater
+# bookworm (libgpiod 1.x) -> .pio/build/linux_repeater/meshcored
+
+BASE_IMAGE=debian:trixie ./build-docker.sh linux_repeater
+# trixie (libgpiod 2.x)   -> .pio/build-trixie/linux_repeater/meshcored
+```
+
+PlatformIO's package cache lives in a Docker volume, so repeat builds skip the
+download; on Apple Silicon the container is native and a warm build takes
+about a minute.
+
 ## Setup
 
 ### 1. Install the binary
