@@ -8,13 +8,13 @@ Wants=network.target
 Type=simple
 User=meshcore
 Group=meshcore
-# Local CLI console. Set its path in meshcored.ini
-# (console_path = /run/meshcored/console); RuntimeDirectory creates /run/meshcored
-# owned by meshcore, mode 0700, and removes it on stop. /run (not /tmp) is used
-# because PrivateTmp=yes gives the service a private /tmp a client outside the
-# unit could not reach. The console is owner-only (mode 0600) and grants the
-# privileged, unauthenticated CLI. Connect with:
-#   meshcore-cli -r -s /run/meshcored/console
+# Local CLI console. RuntimeDirectory creates /run/meshcored owned by meshcore,
+# mode 0700, and removes it on stop; meshcored publishes the console there as
+# /run/meshcored/console whenever the directory exists (console_path in
+# meshcored.ini overrides). /run (not /tmp) because PrivateTmp=yes gives the
+# service a private /tmp a client outside the unit could not reach. The console
+# is owner-only (mode 0600) and grants the privileged, unauthenticated CLI.
+# Connect with `meshcore-cli -r -s /run/meshcored/console`, or any serial terminal.
 RuntimeDirectory=meshcored
 RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/meshcored --fsdir /var/lib/meshcore
