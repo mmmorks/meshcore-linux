@@ -19,6 +19,17 @@ static uint32_t _atoi(const char* sp) {
   return n;
 }
 
+// _atoi() returns 0 for garbage input, same as for a real "0" -- callers that
+// need to tell "you typed 0" from "you typed a typo" check the string first.
+static bool isAllDigits(const char* s) {
+  if (*s == 0) return false;
+  while (*s) {
+    if (*s < '0' || *s > '9') return false;
+    s++;
+  }
+  return true;
+}
+
 static bool isValidName(const char *n) {
   while (*n) {
     if (*n == '[' || *n == ']' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
@@ -389,6 +400,45 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "ok");
       } else {
         strcpy(reply, "error");
+      }
+    } else if (memcmp(command, "gps interval", 12) == 0
+               && (command[12] == 0 || command[12] == ' ')) {
+      // Seconds between location reads. 0 means "use the firmware default"
+      // (1 s), matching how applyGpsPrefs() interprets a zero pref.
+      //
+      // The prefix match needs the delimiter check: without it "gps intervalX"
+      // matches here and then parses command[13] -- past the 'X' -- as the
+      // argument, so a mistyped command silently sets the interval to 0 instead
+      // of falling through to the generic "gps" handler and being rejected.
+      char* arg = &command[12];
+      while (*arg == ' ') arg++;
+      char* arg_end = arg + strlen(arg);   // a trailing space must not fail the digit test
+      while (arg_end > arg && arg_end[-1] == ' ') arg_end--;
+      *arg_end = 0;
+      if (*arg == 0) {   // bare `gps interval` (or only spaces): report
+        sprintf(reply, "> %u", (unsigned) _prefs->gps_interval);
+      } else if (!isAllDigits(arg)) {
+        // _atoi() would silently read a typo like "abc" as 0, resetting the
+        // pref to the firmware default instead of reporting the mistake.
+        strcpy(reply, "Error: interval must be a number of seconds");
+      } else if (arg_end - arg > 5 || _atoi(arg) > 86400) {
+        // Reject on length before parsing: _atoi() accumulates into a uint32_t
+        // with no overflow check, so a long enough run of digits wraps back
+        // into range and would be accepted ("4294967300" lands on 4). The cap
+        // is five digits, so no valid value is lost. Out-of-range values are
+        // reported rather than clamped, matching the advert.interval handlers.
+        strcpy(reply, "Error: interval range is 0-86400 seconds");
+      } else {
+        char secs_str[12];
+        uint32_t secs = _atoi(arg);
+        sprintf(secs_str, "%u", (unsigned) secs);
+        if (_sensors->setSettingValue("gps_interval", secs_str)) {
+          _prefs->gps_interval = secs;
+          savePrefs();
+          strcpy(reply, "ok");
+        } else {
+          strcpy(reply, "gps interval not found");
+        }
       }
     } else if (memcmp(command, "gps", 3) == 0) {
       LocationProvider * l = _sensors->getLocationProvider();
