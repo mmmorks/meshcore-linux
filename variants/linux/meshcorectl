@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""meshcorectl - talk to a running meshcored over its console.
+
+  meshcorectl                    interactive REPL (line editing, history, tab-complete)
+  meshcorectl set name foo       one-shot: send one command, print the reply, exit
+  echo -e "advert\\nneighbors" | meshcorectl   pipe: run each line, print replies
+  meshcorectl -s PATH [...]      use the console at PATH
+
+The interactive mode is a self-contained readline client (equivalent to
+attaching a serial terminal, with rlwrap on top): arrow-key editing, Ctrl-R
+reverse search, persistent history in ~/.meshcorectl_history, and Tab
+completion of known commands. Nothing beyond the Python standard library.
+
+Console path: -s PATH, else $MESHCORED_CONSOLE, else the first of
+/run/meshcored/console, $XDG_RUNTIME_DIR/meshcore/console and
+/tmp/meshcore-<uid>/console that exists -- the order meshcored publishes in.
+Access: the console is owner-only, so run as the daemon's user or as root.
+
+Exit status is 0 only if every command was actually run by the daemon. It is 1
+if the console is missing or unusable, if a command draws no reply at all, or
+if the daemon closes the console mid-script (which is what `reboot` and friends
+do). Remaining lines of a piped script are not attempted after any of those.
+An interrupt exits 130.
+
+`reboot`, `clkreboot`, `poweroff` and `shutdown` are the exception to "no reply
+means it never ran": taking the console down is what they were asked to do, so
+a hangup right after one is success. A command *after* one of them still fails,
+because by then there is no console to write to.
+"""
+import os
+import sys
+import time
+import select
+import termios
+import tty
+import atexit
+
+HISTFILE = os.path.expanduser("~/.meshcorectl_history")
+
+
+def candidates():
+    """Where a console may be, in the order meshcored publishes."""
+    paths = ["/run/meshcored/console"]
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        paths.append(os.path.join(xdg, "meshcore", "console"))
+    paths.append("/tmp/meshcore-%d/console" % os.getuid())
+    return paths
+
+
+def default_console():
+    env = os.environ.get("MESHCORED_CONSOLE")
+    if env:
+        return env
+    for path in candidates():
+        if os.path.exists(path):   # follows the symlink, so a stale one does not count
+            return path
+    return None
+
+
+CONSOLE = default_console()
+
+# Top-level commands, in the order the firmware dispatches them:
+# examples/simple_repeater/MyMesh.cpp handleCommand() takes the first three,
+# then falls through to src/helpers/CommonCLI.cpp handleCommand() for the rest.
+# Anything not matched there comes back as "Unknown command".
+#
+# Entries ending in a bare word still take arguments -- "neighbor.remove",
+# "password", "sensor get/set", "setperm", "tempradio" and "time" all match on a
+# trailing space in the firmware, so "time" alone is an unknown command. Use
+# "time <epoch-seconds>" to set the clock and "clock" to read it back.
+#
+# "region load" is listed for completeness but is not usable from here: it puts
+# the firmware into a multi-line mode (CommonCLI.cpp region_load_active) that
+# reads indented region names and ends on a blank line, and both loops below
+# strip indentation and skip blank lines. Use "region put"/"region def" instead.
+#
+# "clock sync" is listed because it exists, but it only works over the mesh: it
+# needs the sender's timestamp, and the console always passes 0 (see the
+# handleCommand(0, ...) calls in examples/simple_repeater/main.cpp), so it
+# replies "ERR: clock cannot go backwards" every time. Use "time" instead.
+TOP = [
+    "advert", "advert.zerohop", "board", "clear stats", "clkreboot", "clock",
+    "clock sync", "discover.neighbors", "erase", "get", "gps", "gps advert",
+    "gps interval", "gps off", "gps on", "gps setloc", "gps sync",
+    "log", "log erase", "log start", "log stop",
+    "neighbors", "neighbor.remove", "password", "poweroff", "powersaving",
+    "powersaving off", "powersaving on", "reboot",
+    "region", "region allowf", "region def", "region default", "region denyf",
+    "region get", "region home", "region list allowed", "region list denied",
+    "region load", "region put", "region remove", "region save",
+    "sensor get", "sensor list", "sensor set", "set", "setperm", "shutdown",
+    "start ota", "stats-core", "stats-packets", "stats-radio", "tempradio",
+    "time", "ver",
+]
+
+# Keys usable after "set " (CommonCLI.cpp handleSetCmd).
+#
+# The bridge.* setters are absent on purpose: every one of them sits behind
+# WITH_BRIDGE / WITH_RS232_BRIDGE / WITH_ESPNOW_BRIDGE (CommonCLI.cpp:720-768),
+# and no linux env defines any of the three, so the firmware this talks to
+# answers "unknown config: bridge.enabled ...". ("bridge.type" is a getter and
+# is not guarded, so it stays in GETONLY below.)
+SETKEYS = [
+    "adc.multiplier", "advert.interval", "af", "agc.reset.interval",
+    "allow.read.only", "cad",
+    "direct.txdelay", "dutycycle", "flood.advert.interval", "flood.max",
+    "flood.max.advert", "flood.max.unscoped", "freq", "guest.password",
+    "int.thresh", "lat", "lon", "loop.detect", "multi.acks", "name",
+    "owner.info", "path.hash.mode", "prv.key", "radio", "radio.rxgain",
+    "repeat", "rxdelay", "tx", "txdelay",
+]
+
+# "get" accepts everything "set" does, plus these read-only keys
+# (CommonCLI.cpp handleGetCmd, and "get acl" from MyMesh.cpp).
+# ("extra.sf" belongs here rather than in SETKEYS for the same reason as
+# "bridge.type": its setter is behind USE_LR2021 (CommonCLI.cpp) while its
+# getter is not, so a non-LR2021 firmware answers "get" but not "set".)
+GETONLY = [
+    "acl", "bootloader.ver", "bridge.type", "extra.sf", "public.key",
+    "pwrmgt.bootmv", "pwrmgt.bootreason", "pwrmgt.source", "pwrmgt.support",
+    "role",
+]
+GETKEYS = sorted(SETKEYS + GETONLY)
+
+
+def attach():
+    if CONSOLE is None:
+        sys.exit("meshcorectl: no console found at any of\n  %s\n"
+                 "  is meshcored running? name one with -s PATH or MESHCORED_CONSOLE"
+                 % "\n  ".join(candidates()))
+    try:
+        fd = os.open(CONSOLE, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        sys.exit("meshcorectl: no console at %s\n"
+                 "  is meshcored running? name another with -s PATH or MESHCORED_CONSOLE"
+                 % CONSOLE)
+    except PermissionError:
+        sys.exit("meshcorectl: cannot open %s: permission denied\n"
+                 "  the console is owner-only: run as the daemon's user, or as root"
+                 % CONSOLE)
+    except OSError as e:
+        sys.exit("meshcorectl: cannot open %s: %s" % (CONSOLE, e))
+    if not os.isatty(fd):
+        sys.exit("meshcorectl: %s is not a console device" % CONSOLE)
+    # Raw: the daemon echoes for us, and every byte must pass unchanged in both
+    # directions. Then drop anything a previous session left unread, so the
+    # first reply we see is to a command we sent.
+    tty.setraw(fd)
+    termios.tcflush(fd, termios.TCIFLUSH)
+    return fd
+
+
+# Commands that take the daemon down. Their reply, and often their echo, is
+# lost to the hangup, so an absent reply from one of these is success rather
+# than the "never read" failure it means for anything else.
+TERMINAL = ("reboot", "clkreboot", "poweroff", "shutdown")
+
+
+def is_terminal(line):
+    head = line.split()
+    return bool(head) and head[0] in TERMINAL
+
+
+class Refused(Exception):
+    """A command the daemon did not run. The message says how we know."""
+
+
+def read_some(fd):
+    """One read, or b"" once the daemon has closed its end of the console.
+
+    A hung-up console reads as EIO (or end of file) rather than blocking; that
+    is the only way the daemon's departure shows up here.
+    """
+    try:
+        return os.read(fd, 4096)
+    except BlockingIOError:
+        return None
+    except OSError:
+        return b""
+
+
+def send_command(fd, line, idle=0.4, first=2.0, total=6.0):
+    """Send one command and return the daemon's reply, or raise Refused.
+
+    The daemon echoes a command character by character as it consumes it and
+    only then prints the reply (console->print(c) in the repeater's loop()), so
+    the echo doubles as proof that the command was actually read.
+    """
+    # Drop anything still queued before sending. A reply that arrived after the
+    # previous command's idle gap (`erase` and `start ota` can both outrun it)
+    # would otherwise be read as this command's, and the mismatch reported
+    # against the wrong line.
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except OSError:
+        pass
+    try:
+        os.write(fd, (line + "\r").encode())
+    except OSError:
+        # `reboot`, `poweroff` and `shutdown` take the daemon down without
+        # replying, so a script that continues past one finds the console
+        # hung up.
+        raise Refused("meshcored closed the console before '%s' could be "
+                      "sent\n  an earlier command most likely rebooted or shut "
+                      "it down" % line)
+
+    buf = b""
+    hung_up = False
+    deadline = time.monotonic() + total
+    while True:
+        # The first byte is worth waiting longer for than the rest: the reply
+        # follows its echo back to back, but the echo itself waits on the
+        # daemon's next loop iteration, and an empty answer is an error now
+        # rather than a blank line.
+        r, _, _ = select.select([fd], [], [], idle if buf else first)
+        if not r:                  # idle gap -> reply is complete
+            break
+        chunk = read_some(fd)
+        if chunk == b"":           # daemon closed the console
+            hung_up = True
+            break
+        if chunk:
+            buf += chunk
+        if time.monotonic() > deadline:
+            break
+
+    text = buf.decode(errors="replace").replace("\r", "")
+    echo = line + "\n"
+    at = text.find(echo)           # not startswith: tolerate a stray leading byte
+    if at < 0:
+        if hung_up and is_terminal(line):
+            # The write succeeded and then the console went away, which is what
+            # this command was asked to do. Closing the master vhangups the
+            # slave and flushes its input queue, so the echo can be lost even
+            # though the daemon read and ran the command.
+            return ""
+        raise Refused(text.strip("\n") or
+                      "no reply from meshcored at %s for '%s' within %gs\n  the "
+                      "console opened but no echo came back; the daemon may "
+                      "still run it -- check that meshcored is running"
+                      % (CONSOLE, line, first))
+    return text[at + len(echo):].strip("\n")
+
+
+def make_completer():
+    """Complete against the whole line, not just the last word.
+
+    interactive() clears readline's delimiter set, so `text` is everything typed
+    so far. Matching on the full line is what makes the multi-word entries usable
+    -- "region li" only reaches "region list allowed" if the completer can see
+    both words.
+    """
+    def completer(text, state):
+        stripped = text.lstrip()
+        indent = text[:len(text) - len(stripped)]
+        for prefix, pool in (("set ", SETKEYS), ("get ", GETKEYS)):
+            if stripped.startswith(prefix):
+                arg = stripped[len(prefix):]
+                matches = [prefix + k for k in pool if k.startswith(arg)]
+                break
+        else:
+            matches = [c for c in TOP if c.startswith(stripped)]
+        matches = sorted(set(matches))
+        return indent + matches[state] if state < len(matches) else None
+    return completer
+
+
+def report(refusal):
+    """Print why a command did not run, and give the exit status."""
+    sys.stderr.write("meshcorectl: %s\n" % refusal)
+    return 1
+
+
+def interactive():
+    import readline
+    try:
+        readline.read_history_file(HISTFILE)
+    except OSError:
+        pass
+    atexit.register(lambda: _save_history(readline))
+    readline.set_history_length(1000)
+    readline.set_completer_delims("")
+    readline.set_completer(make_completer())
+    readline.parse_and_bind("tab: complete")
+
+    fd = attach()
+    print("meshcorectl -> %s   (Tab completes, Ctrl-D quits)" % CONSOLE)
+    status = 0
+    try:
+        while True:
+            try:
+                line = input("meshcore> ").strip()
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not line:
+                continue
+            if line in ("quit", "exit"):
+                break
+            try:
+                out = send_command(fd, line)
+            except KeyboardInterrupt:
+                # Ctrl-C while waiting for a reply: abandon this command, keep
+                # the session. The daemon has already read it either way.
+                print()
+                continue
+            except Refused as refusal:
+                status = report(refusal)
+                break
+            if out:
+                print(out)
+    finally:
+        os.close(fd)
+    return status
+
+
+def _save_history(readline):
+    try:
+        readline.write_history_file(HISTFILE)
+    except OSError:
+        pass
+
+
+def run_lines(lines):
+    """Run each line over one console session. Returns the process exit status."""
+    fd = attach()
+    status = 0
+    try:
+        for raw in lines:
+            cmd = raw.strip()
+            if not cmd:
+                continue
+            try:
+                out = send_command(fd, cmd)
+            except Refused as refusal:
+                # Nothing ran, and every cause of that also leaves the console
+                # useless for the rest of the script.
+                status = report(refusal)
+                break
+            if out:
+                print(out)
+    finally:
+        os.close(fd)
+    return status
+
+
+def main():
+    global CONSOLE
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if args and args[0] in ("-s", "--console"):
+        if len(args) < 2:
+            sys.exit("meshcorectl: %s needs a path" % args[0])
+        CONSOLE = args[1]
+        args = args[2:]
+    if args:
+        return run_lines([" ".join(args)])     # one-shot
+    if not sys.stdin.isatty():
+        return run_lines(sys.stdin)            # piped script
+    return interactive()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Interrupted outside a command (or in a piped run): exit the way a
+        # signalled shell command does, without a traceback.
+        sys.stderr.write("\n")
+        sys.exit(130)

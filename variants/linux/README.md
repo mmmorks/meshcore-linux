@@ -72,11 +72,15 @@ about a minute.
 
 ## Setup
 
-### 1. Install the binary
+### 1. Install the binaries
 
 ```sh
 sudo install -m 755 .pio/build/linux_repeater/meshcored /usr/bin/meshcored
+sudo install -m 755 variants/linux/meshcorectl /usr/bin/meshcorectl
 ```
+
+`meshcorectl` is a CLI client that needs nothing installed (see
+[The control CLI](#the-control-cli)); any serial tool works in its place.
 
 ### 2. Create the config file
 
@@ -258,11 +262,12 @@ sudo journalctl -u meshcored -f
 
 `meshcored` exposes a local CLI console, kept separate from the logs (which go
 to stdout / journald). Under the systemd unit it is `/run/meshcored/console`.
-Connect with [`meshcore-cli`](https://github.com/fdlamotte/meshcore-cli), or any
-serial terminal (see [The control CLI](#the-control-cli)):
+Connect with `meshcorectl` (installed in [§1](#1-install-the-binaries)) or with
+[`meshcore-cli`](https://github.com/fdlamotte/meshcore-cli):
 
 ```sh
-sudo meshcore-cli -r -s /run/meshcored/console
+sudo meshcorectl                                  # REPL
+sudo meshcore-cli -r -s /run/meshcored/console    # the same CLI, via meshcore-cli
 ```
 
 ```
@@ -337,7 +342,38 @@ so do the `0700` directories the daemon creates for the per-user paths.) A
 symlink left by a crashed daemon is reclaimed. `reboot` unpublishes the console
 before re-executing, so the new process starts from a clean path.
 
-Because the console is a terminal device, any serial tool can attach:
+Three ways to drive it with `meshcorectl`:
+
+```sh
+sudo meshcorectl                             # REPL: line editing, history, Tab completion
+sudo meshcorectl set name my-repeater        # one-shot: send, print reply, exit
+printf 'ver\nneighbors\n' | sudo meshcorectl  # piped: one command per line
+sudo meshcorectl -s /tmp/meshcore-1000/console ver   # a console at another path
+```
+
+The REPL needs no `socat` or `rlwrap`: arrow-key editing, Ctrl-R search, Tab
+completion of known commands, and history in `~/.meshcorectl_history`.
+`MESHCORED_CONSOLE` names the path for the client, as `-s` does; otherwise it
+tries the same order as the daemon and takes the first that exists.
+
+`sudo` is right for a daemon under the unit, whose console is root-owned in
+`/run/meshcored`. It is wrong for a daemon you started yourself: the fallback
+path is `/tmp/meshcore-<uid>/console`, so `sudo meshcorectl` looks under uid 0
+while the daemon published under yours — and `sudo` also drops
+`XDG_RUNTIME_DIR`, which is the candidate before it. Run it as the same user,
+or name the path with `-s`. (Running the client under `sudo` also writes a
+root-owned `~/.meshcorectl_history`, after which your own runs silently stop
+saving history.)
+
+`meshcorectl` exits `0` only if every command it sent was actually run by the
+daemon — that includes `reboot`, `clkreboot` and `poweroff`, whose only "reply"
+is their own echo before the daemon goes away. It exits `1` if the console is
+missing or unusable, if a command draws no reply at all, or if a *later* command
+in a piped script finds the daemon already gone (the case after one of those
+three ran earlier in the same script). A piped script stops at the first such
+failure rather than sending the remaining lines into a dead console.
+
+Because the console is a terminal device, any serial tool can attach instead:
 `meshcore-cli -r -s <path>`, `screen`, `minicom`, `picocom`. There is no
 single-client rule: two tools attached at once share one CLI and see each
 other's traffic.
