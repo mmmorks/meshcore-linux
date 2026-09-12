@@ -54,6 +54,9 @@ public:
   virtual float getCurrentRSSI() =0;
   virtual uint8_t getSpreadingFactor() const { return LORA_SF; }
   static uint16_t preambleLengthForSF(uint8_t sf) { return sf <= 8 ? 32 : 16; }
+  // LoRa symbol time in microseconds, for a spreading factor and a bandwidth in
+  // kHz. Every airtime and timeout derived from the modem's rate starts here.
+  static uint32_t symbolMicros(uint8_t sf, float bw) { return ((uint32_t)10000 << sf) / (bw * 10); }
   void updatePreamble(uint8_t sf) { _preamble_sf = sf; _radio->setPreambleLength(preambleLengthForSF(sf)); }
   PacketMillis calcMaxPacketMillis(uint8_t sf, float bw, uint8_t cr, uint8_t preambleSymbols);
   virtual int16_t performChannelScan();
