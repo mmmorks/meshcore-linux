@@ -96,7 +96,7 @@ sudo nano /etc/meshcored/meshcored.ini
 The config file has two roles:
 
 - **Hardware config** (always read on every startup): SPI device, GPIO pin numbers, LoRa radio parameters.
-- **First-run node defaults**: `advert_name`, `admin_password`, `lat`, `lon`. On the first boot these are saved to the node's persisted prefs (`com_prefs`). After that, use the serial CLI to change them (`set name`, `set password`, etc.), the INI values are no longer consulted for these fields.
+- **First-run node defaults**: `advert_name`, `admin_password`, `lat`, `lon`. On the first boot these are saved to the node's persisted prefs (`prefs.json`). After that, use the serial CLI to change them (`set name`, `set password`, etc.), the INI values are no longer consulted for these fields.
 
 Key settings:
 
@@ -108,8 +108,8 @@ Key settings:
 | `lora_reset_pin` | (none) | GPIO line number for RESET |
 | `lora_nss_pin` | (none) | GPIO line number for NSS/CS (if not handled by the SPI driver) |
 | `lora_busy_pin` | (none) | GPIO line number for BUSY |
-| `lora_rxen_pin` | (none) | GPIO line number for RX enable (RF switch); omit if unused |
-| `lora_txen_pin` | (none) | GPIO line number for TX enable (RF switch); omit if unused |
+| `lora_rxen_pin` | (none) | GPIO line number for RX enable (RF switch); omit, or set `-1`/`none`, if unused |
+| `lora_txen_pin` | (none) | GPIO line number for TX enable (RF switch); omit, or set `-1`/`none`, if unused |
 | `lora_freq` | `869.618` | Frequency in MHz |
 | `lora_bw` | `62.5` | Bandwidth in kHz |
 | `lora_sf` | `8` | Spreading factor |
@@ -122,6 +122,42 @@ Key settings:
 | `advert_name` | `"Linux Repeater"` | Node name, first-run default only |
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
+
+Comments (`#`, `;`), blank lines and `[section]` headers are ignored. Boolean
+settings (`dio2_as_rf_switch`, `rx_boosted_gain`) accept `1`/`0`,
+`true`/`false`, `on`/`off` or `yes`/`no`, case-insensitively; anything else is
+a fatal invalid value.
+
+#### Config validation
+
+Every problem is reported on its own line at startup:
+
+| Problem | Response |
+|---------|----------|
+| **Invalid value** — a GPIO pin outside `0..255`, a malformed or out-of-range number, an unrecognised boolean spelling, or empty | **Fatal**, the daemon refuses to start |
+| **Line at or past the 511-byte limit** — the rest of it was never read, so the setting cannot be trusted. A comment, blank line or `[section]` that long is ignored instead | **Fatal**, the daemon refuses to start |
+| **Unrecognised key** — e.g. `lora_frequency` for `lora_freq` | **Warning**, key ignored, startup continues |
+| **File missing or unreadable** | **Warning**, built-in defaults used. The radio then fails to start, since no pins are configured |
+
+```
+WARNING: meshcored.ini: unknown key 'lora_frequency' (ignored)
+WARNING: 1 unrecognised key(s) in /etc/meshcored/meshcored.ini ...
+
+ERROR: meshcored.ini: lora_irq_pin = '260' is not a valid GPIO pin (expected 0..255)
+FATAL: 1 invalid value(s) in /etc/meshcored/meshcored.ini ...
+```
+
+> **Upgrading an existing node?** This validation is stricter than what earlier
+> builds did, so a file they accepted may now be rejected: values with a unit
+> suffix (`lora_tcxo = 1.8V`, `lora_tx_power = 22 dBm`, `current_limit = 140mA`)
+> used to be parsed loosely and are now fatal. Since the shipped unit uses
+> `Restart=on-failure`, a rejected file means a restart loop and a node off the
+> air, so check `journalctl -u meshcored` after upgrading. (`-1` on
+> `lora_rxen_pin`/`lora_txen_pin` still works and still means "not wired".)
+
+**Read the warnings after editing.** An ignored key does not merely fail to
+apply: for a first-run default, the built-in value is persisted on the first
+boot, and fixing the INI afterwards changes nothing.
 
 ### 3. Enable SPI and GPIO access
 
@@ -227,7 +263,7 @@ There are two levels of reset:
 **Prefs only**, keeps the node identity (same Repeater ID). Delete the saved prefs so the INI first-run defaults are re-applied on the next boot:
 
 ```sh
-sudo rm /var/lib/meshcore/com_prefs
+sudo rm /var/lib/meshcore/prefs.json
 sudo systemctl restart meshcored
 ```
 
@@ -241,7 +277,7 @@ sudo systemctl start meshcored
 
 > When running **directly** (not under systemd), `meshcored --fsdir /var/lib/meshcore --erase` is the equivalent one-shot full reset. Do **not** add `--erase` to the service unit: systemd re-runs `ExecStart` on every restart, so it would wipe the filesystem and regenerate the identity each time. (The firmware's own `reboot()` strips `--erase` to avoid self-wiping, but that protection does not extend to a systemd restart.)
 
-> **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `com_prefs` and the INI values are no longer read for those fields. To apply a changed radio parameter, use the CLI (`set freq`, `set sf`, etc.) or reset prefs as above.
+> **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `prefs.json` and the INI values are no longer read for those fields. To apply a changed radio parameter, use the CLI (`set freq`, `set sf`, etc.) or reset prefs as above.
 
 ## Known Gaps / TODO
 
