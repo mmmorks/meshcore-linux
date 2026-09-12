@@ -16,7 +16,7 @@ public:
     virtual long satellitesCount() = 0;
     virtual bool isValid() = 0;
     virtual long getTimestamp() = 0;
-    virtual void sendSentence(const char * sentence);
+    virtual void sendSentence(const char * sentence) {}
     virtual void reset() = 0;
     virtual void begin() = 0;
     virtual void stop() = 0;

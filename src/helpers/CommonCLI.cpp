@@ -19,6 +19,17 @@ static uint32_t _atoi(const char* sp) {
   return n;
 }
 
+// setCurrentTime() returns void, so this is the only signal available that a
+// set was honoured. On Linux it can be silently refused (host clock owned by
+// chrony, or the process lacks CAP_SYS_TIME) and getCurrentTime() then reads
+// back the unchanged clock; on every other target the set always takes, so
+// this is always true there. A couple of seconds of slack absorbs a hardware
+// RTC's read-back latency, not a real failure.
+static bool clockSetTookEffect(uint32_t target, uint32_t actual) {
+  int64_t diff = (int64_t)actual - (int64_t)target;
+  return diff >= -2 && diff <= 2;
+}
+
 static bool isValidName(const char *n) {
   while (*n) {
     if (*n == '[' || *n == ']' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
@@ -210,10 +221,15 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "clock sync", 10) == 0) {
       uint32_t curr = getRTCClock()->getCurrentTime();
       if (sender_timestamp > curr) {
-        getRTCClock()->setCurrentTime(sender_timestamp + 1);
+        uint32_t target = sender_timestamp + 1;
+        getRTCClock()->setCurrentTime(target);
         uint32_t now = getRTCClock()->getCurrentTime();
-        DateTime dt = DateTime(now);
-        sprintf(reply, "OK - clock set: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+        if (clockSetTookEffect(target, now)) {
+          DateTime dt = DateTime(now);
+          sprintf(reply, "OK - clock set: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+        } else {
+          strcpy(reply, "ERR: clock set was refused");
+        }
       } else {
         strcpy(reply, "ERR: clock cannot go backwards");
       }
@@ -231,8 +247,12 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       if (secs > curr) {
         getRTCClock()->setCurrentTime(secs);
         uint32_t now = getRTCClock()->getCurrentTime();
-        DateTime dt = DateTime(now);
-        sprintf(reply, "OK - clock set: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+        if (clockSetTookEffect(secs, now)) {
+          DateTime dt = DateTime(now);
+          sprintf(reply, "OK - clock set: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+        } else {
+          strcpy(reply, "(ERR: clock set was refused)");
+        }
       } else {
         strcpy(reply, "(ERR: clock cannot go backwards)");
       }
@@ -396,7 +416,11 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         bool enabled = l->isEnabled(); // is EN pin on ?
         bool fix = l->isValid();       // has fix ?
         int sats = l->satellitesCount();
-        bool active = !strcmp(_sensors->getSettingByKey("gps"), "1");
+        // getSettingByKey() returns NULL when no "gps" setting is registered
+        // (e.g. no GPS detected -- the Linux default) -- treat that as
+        // "deactivated" rather than handing strcmp() a NULL, which segfaults.
+        const char* gps_setting = _sensors->getSettingByKey("gps");
+        bool active = gps_setting != NULL && strcmp(gps_setting, "1") == 0;
         if (enabled) {
           sprintf(reply, "on, %s, %s, %d sats",
             active?"active":"deactivated",

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cctype>   // real Arduino.h pulls this in; MicroNMEA relies on it
 #include "Stream.h"
 
 inline uint32_t g_mock_millis = 0;

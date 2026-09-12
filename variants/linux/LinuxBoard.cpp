@@ -9,6 +9,7 @@
 #include "linux/gpio/LinuxGPIOPin.h"
 #endif
 #include "LinuxBoard.h"
+#include "LinuxGpsStream.h"
 #include "AppInfo.h"
 
 // Still hardcoded -- see "Known Gaps" in variants/linux/README.md -- but named,
@@ -105,6 +106,15 @@ void LinuxBoard::begin() {
     exit(1);
   }
 
+  // Not fatal, but not silent either: gpsd owns the serial port and its baud
+  // rate, so a gps_baud beside a gpsd:// device does nothing. Saying so beats
+  // leaving the operator to wonder why changing it has no effect.
+  if (config.gps_baud != 9600 &&
+      LinuxGpsStream::parseDevice(config.gps_device).transport == LinuxGpsStream::GPSD_SOCKET) {
+    printf("WARNING: gps_baud is set but gps_device names gpsd, which owns the\n"
+           "         serial port and its baud rate. The value has no effect here.\n");
+  }
+
   printf("SPI begin %s\n", config.spidev);
   SPI.begin(config.spidev, 2000000);
 
@@ -139,6 +149,42 @@ void LinuxBoard::begin() {
   if (failures > 0) {
     printf("FATAL: %d GPIO pin(s) failed to bind; cannot start radio.\n", failures);
     exit(1);
+  }
+
+  // GPS enable/standby pin: some modules (e.g. the L76K on the Waveshare
+  // LoRaWAN/GNSS HAT) must have their STANDBY line driven HIGH to wake and
+  // stream NMEA. Bind and hold it high for the daemon lifetime. Non-fatal: a
+  // repeater must still run without GPS.
+  //
+  // "for the daemon lifetime" is the catch, and it is why the warning below
+  // exists. The line is released when this process exits, leaving it unowned.
+  // Measured on bookworm/libgpiod 1.6.3 the pad keeps its last state, so the
+  // receiver does not drop -- but nothing promises that, and nothing stops
+  // another consumer claiming the line and driving it low. Where gpsd owns the
+  // receiver, that unowned pin is underneath the host's clock, so the host
+  // should be the one holding it.
+  if (config.gps_en_pin != -1) {
+    if (LinuxGpsStream::parseDevice(config.gps_device).transport == LinuxGpsStream::GPSD_SOCKET) {
+      printf("WARNING: gps_en_pin is set alongside a gpsd:// gps_device. The pin is\n"
+             "         still driven, but it is released when meshcored exits, leaving\n"
+             "         the receiver -- and so chrony's GNSS source -- resting on an\n"
+             "         unowned line. Prefer holding it from the host (on a Pi:\n"
+             "         dtoverlay=gpio-hog,gpio=%d) and leaving gps_en_pin unset.\n"
+             "         See variants/linux/README.md.\n",
+             (int)config.gps_en_pin);
+    }
+    if (initGPIOPin(config.gps_en_pin, config.lora_gpiochip, config.gps_en_pin) == 0) {
+      pinMode(config.gps_en_pin, OUTPUT);
+      digitalWrite(config.gps_en_pin, HIGH);
+      printf("GPS enable pin %d driven HIGH\n", (int)config.gps_en_pin);
+    } else {
+      // Expected, and correct, on a host that hogs the line itself: a hogged
+      // GPIO is unavailable to any other consumer by design, and the receiver
+      // is already awake. Only worth acting on if nothing else holds the pin.
+      printf("WARNING: could not claim GPS enable pin %d; GPS may stay asleep\n"
+             "         (expected if the host holds this line, e.g. a GPIO hog)\n",
+             (int)config.gps_en_pin);
+    }
   }
 }
 
@@ -288,6 +334,28 @@ static bool parse_bool(const char *key, const char *value, bool *out, int *bad_v
   return false;
 }
 
+// Accept exactly the bauds LinuxGpsStream::openSerial() can program via
+// termios (see baud_to_speed() in LinuxGpsStream.cpp, read-only for this
+// file); anything else silently falls back to B9600 at open time, which
+// reads as a dead GPS rather than a typo'd config value.
+static bool parse_gps_baud(const char *value, int *out, int *bad_values) {
+  static const int VALID_BAUDS[] = { 4800, 9600, 19200, 38400, 57600, 115200 };
+  char *end = NULL;
+  long v = strtol(value, &end, 10);
+  if (end != value && *end == '\0') {
+    for (size_t i = 0; i < sizeof(VALID_BAUDS) / sizeof(VALID_BAUDS[0]); i++) {
+      if (v == VALID_BAUDS[i]) {
+        *out = (int) v;
+        return true;
+      }
+    }
+  }
+  printf("ERROR: meshcored.ini: gps_baud = '%s' is not a supported rate "
+         "(expected one of 4800, 9600, 19200, 38400, 57600, 115200)\n", value);
+  (*bad_values)++;
+  return false;
+}
+
 // Copy `value` into a string field, freeing whatever it pointed to if this
 // field has already been assigned once during this load() call. The
 // compile-time default is a string literal and not ours to free; `*owned`
@@ -327,7 +395,8 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
   // safe_copy() allocation, so a duplicate key knows there is something of
   // its own to free before overwriting it again.
   bool spidev_owned = false, lora_gpiochip_owned = false,
-       advert_name_owned = false, admin_password_owned = false;
+       advert_name_owned = false, admin_password_owned = false,
+       gps_device_owned = false;
 
   bool first_line = true;
   char line[512];
@@ -465,6 +534,42 @@ LinuxConfig::LoadResult LinuxConfig::load(const char *filename) {
       if (parse_float(key, value, &fval, &result.bad_values)) lat = fval;
     } else if (strcmp(key, "lon") == 0) {
       if (parse_float(key, value, &fval, &result.bad_values)) lon = fval;
+    } else if (strcmp(key, "defer_clock") == 0) {
+      if (parse_bool(key, value, &bval, &result.bad_values)) defer_clock = bval ? 1 : 0;
+    } else if (strcmp(key, "gps_device") == 0) {
+      // Validate here rather than at open time: bad_values makes begin() refuse
+      // to start, which is the right answer for a device string the operator
+      // wrote and we cannot honour. Discovering it later would instead look
+      // like an absent GPS.
+      // Length is validated for the same reason. assign_string() truncates
+      // rather than failing, and a truncated /dev/serial/by-id/ path -- the form
+      // the templates recommend, and real ones run to 74 and 81 characters --
+      // still parses as a device path. It just does not open, which reads as an
+      // absent receiver rather than as the config error it is.
+      if (strlen(value) >= LinuxGpsStream::DEVICE_MAX) {
+        printf("ERROR: meshcored.ini: gps_device is %zu characters; the maximum is %d\n",
+               strlen(value), (int) (LinuxGpsStream::DEVICE_MAX - 1));
+        result.bad_values++;
+      } else if (LinuxGpsStream::parseDevice(value).valid) {
+        assign_string(key, value, &gps_device, &gps_device_owned,
+                      LinuxGpsStream::DEVICE_MAX, &result.bad_values);
+      } else {
+        printf("ERROR: meshcored.ini: gps_device '%s' is not a device path or a "
+               "usable gpsd:// URL\n", value);
+        result.bad_values++;
+      }
+    } else if (strcmp(key, "gps_baud") == 0) {
+      int baud;
+      if (parse_gps_baud(value, &baud, &result.bad_values)) gps_baud = baud;
+    } else if (strcmp(key, "gps_en_pin") == 0) {
+      // -1/none means "no enable pin". Unlike the optional LoRa pins, which map
+      // it to RADIOLIB_NC, this field is a plain int the GPS code compares
+      // against -1, so spell that out rather than lean on the conversion.
+      if (strcmp(value, "-1") == 0 || strcasecmp(value, "none") == 0) {
+        gps_en_pin = -1;
+      } else if (parse_pin(key, value, PIN_REQUIRED, &pin, &result.bad_values)) {
+        gps_en_pin = (int) pin;
+      }
     } else {
       // Nothing below this chain consumes leftovers, so an unrecognised key is
       // a key that does nothing -- inert, and possibly just a key from a newer

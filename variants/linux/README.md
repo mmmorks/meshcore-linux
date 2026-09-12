@@ -122,6 +122,10 @@ Key settings:
 | `advert_name` | `"Linux Repeater"` | Node name, first-run default only |
 | `admin_password` | `"password"` | Admin password, **change this**, first-run default only |
 | `lat` / `lon` | `0.0` | GPS coordinates for advertisement, first-run default only |
+| `gps_device` | *(empty)* | Serial path (`/dev/ttyACM0`) or `gpsd://[host][:port]` (default `127.0.0.1:2947`). Empty disables GPS. See [GPS](#gps) |
+| `gps_baud` | `9600` | Serial `gps_device` only; one of 4800/9600/19200/38400/57600/115200. Ignored for `gpsd://` — gpsd owns the port |
+| `gps_en_pin` | `-1` | GPIO held HIGH to wake a receiver that boots in standby (e.g. the L76K STANDBY line). `-1` = none. Leave unset with a `gpsd://` source — see [Keeping GNSS up without meshcored](#keeping-gnss-up-without-meshcored) |
+| `defer_clock` | *(unset)* | Override whether meshcored sets the system clock from GPS/mesh time sync. Unset: on exactly when `gps_device` is `gpsd://` (gpsd already owns the clock). `true`: never set it — e.g. a serial `gps_device` whose NMEA is separately fed to chrony. `false`: always attempt to set it, even against a `gpsd://` device |
 
 Comments (`#`, `;`), blank lines and `[section]` headers are ignored. Boolean
 settings (`dio2_as_rf_switch`, `rx_boosted_gain`) accept `1`/`0`,
@@ -189,7 +193,7 @@ Create the group, add yourself to it, and install the rules:
 
 ```sh
 sudo groupadd -f -r meshcore
-sudo usermod -aG meshcore "$USER"     # log out/in afterwards for this to take effect
+sudo usermod -aG meshcore,dialout "$USER"   # dialout: serial GPS; log out/in afterwards
 sudo install -m 644 variants/linux/99-meshcore.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
@@ -203,7 +207,8 @@ ls -l /dev/gpiochip* /dev/spidev*    # → crw-rw---- root meshcore
 Your current login session won't pick up the new group until you log out and
 back in. To use it immediately in one shell, prefix the command with
 `sg meshcore -c '…'`. (On Raspberry Pi OS you can instead use the built-in
-`spi`/`gpio` groups: `sudo usermod -aG spi,gpio $USER`.)
+`spi`/`gpio` groups: `sudo usermod -aG spi,gpio,dialout $USER`; `dialout` is only
+needed for a serial GPS, see [GPS](#gps).)
 
 ### 4. Run
 
@@ -235,6 +240,7 @@ sudo install -m 644 variants/linux/meshcored.service /etc/systemd/system/
 sudo install -m 644 variants/linux/99-meshcore.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo useradd -r -g meshcore -s /sbin/nologin meshcore   # -g: reuse the existing meshcore group (its udev rules grant device access)
+sudo usermod -aG dialout meshcore                       # only for a serial GPS, see GPS below
 sudo chmod 640 /etc/meshcored/meshcored.ini
 sudo chown root:meshcore /etc/meshcored/meshcored.ini
 sudo systemctl daemon-reload
@@ -279,8 +285,243 @@ sudo systemctl start meshcored
 
 > **Note:** LoRa radio parameters (`lora_freq`, `lora_bw`, `lora_sf`, `lora_cr`, `lora_tx_power`) are also first-run defaults. After first boot they are saved in `prefs.json` and the INI values are no longer read for those fields. To apply a changed radio parameter, use the CLI (`set freq`, `set sf`, etc.) or reset prefs as above.
 
+## GPS
+
+With `gps_device` configured, the standard MeshCore GPS commands work through
+the CLI:
+
+| Command | Effect |
+|---------|--------|
+| `gps` | Status: on/off, active/deactivated, fix/no-fix, satellite count |
+| `gps on` / `gps off` | Enable/disable GPS reading and location telemetry |
+| `gps sync` | Force a time re-sync from GPS |
+| `gps setloc` | Save the current fix as the node's advertised location |
+| `gps advert none\|prefs\|share` | Control whether location is advertised |
+
+At the 1 s read interval, the two `lat …` debug lines printed on every read
+dominate the journal on a node with a fix.
+
+### Serial GPS
+
+The daemon opens the device directly and holds it for its whole life. It needs
+read access — USB units and the Pi's own UART are usually `dialout`-owned, which
+the `dialout` membership from step 3 covers (`sudo usermod -aG dialout meshcore`
+for the service user).
+
+Some receivers boot into standby and stay silent until an enable line is driven
+high. The L76K on the Waveshare LoRaWAN/GNSS HAT is one: set `gps_en_pin` to its
+STANDBY GPIO (4 on that HAT) and the daemon holds it high from startup.
+
+### Disciplining the host clock from GNSS
+
+Holding the device exclusively locks out `gpsd`, and through it `chrony`. On a
+Linux node that matters more than on an MCU: the node's clock is the whole host's
+clock, and a host with no network and no RTC otherwise boots with a bogus one.
+
+It also matters to the daemon's own timers. ArduLinux derives `millis()` from
+`CLOCK_REALTIME` (`gettimeofday()` minus a start offset captured once), so every
+step of the system clock shifts `millis()` by the same amount and moves every
+mesh deadline already in flight with it. `LinuxRTCClock` therefore refuses a
+timestamp older than 2024, refuses a jump of more than 24 h once the clock has
+been set, and slews sub-second corrections with `adjtime()` instead of stepping
+— but letting chrony own the clock, below, is the better answer.
+
+Point `gps_device` at gpsd and the device becomes gpsd's:
+
+```ini
+gps_device = gpsd://        # 127.0.0.1:2947
+# gps_en_pin stays unset -- the host holds the line, see below
+```
+
+The daemon reconnects to gpsd on its own with backoff, so start order does not
+matter and restarting gpsd underneath a running node is safe. It also stops
+trying to set the system clock — chrony owns it. That also means a `clock sync` /
+`time <epoch>` carrying a timestamp from a remote mesh peer cannot move a
+general-purpose host's clock.
+
+On the host:
+
+```sh
+sudo apt install gpsd gpsd-clients chrony
+```
+
+`/etc/default/gpsd`:
+
+```sh
+DEVICES="/dev/ttyAMA0"      # /dev/ttyS0 on a Pi whose PL011 is not the GPS UART
+GPSD_OPTIONS="-n"
+```
+
+`-n` keeps gpsd reading the receiver after its last client disconnects, which
+chrony's SHM refclock needs — it is not a gpsd socket client. It says nothing
+about *starting*, which is the separate trap covered in
+[Keeping GNSS up without meshcored](#keeping-gnss-up-without-meshcored).
+
+`/etc/chrony/chrony.conf`:
+
+```
+refclock SHM 0 refid GPS offset 0.307 delay 0.2
+```
+
+**The `offset` is mandatory and board-specific.** NMEA without PPS arrives some
+way after the second it describes, so the refclock reads consistently late; left
+uncorrected, chrony marks it a falseticker (`#x` in `chronyc sources`) and ignores
+it. Start at `0.0`, read the steady-state figure, and enter it as a positive
+number — a positive offset cancels a positive reported error, and getting the sign
+backwards doubles it:
+
+```sh
+chronyc sources        # "#x GPS  ...  +307ms[ +307ms]"  ->  offset 0.307
+```
+
+The value is stable within a session (sd ~5 ms) but is not a constant of the
+board: it tracks how long the receiver takes to start and clock out its sentence
+burst, so it moves with the sentence set and the baud rate. On this HAT it has
+been seen at 0.193 s, 0.307 s and 0.384 s with nothing touched. Expect to
+re-check it — and note that
+[adding PPS](docs/gnss-pps-hardware.md#handing-pps-to-chrony) inverts how to
+tune it.
+
+Verify with `chronyc sources` (a `GPS` line that is no longer `#x`) and
+the `gps` CLI command (fix and satellite count).
+
+With a network present chrony will usually still prefer a good NTP server —
+NMEA-only GPS is worth about ±100 ms against a stratum-1 peer's ±30 ms, so `#-`
+rather than `#*` is correct. To prove GPS can hold the clock alone, take the
+network sources away:
+
+```sh
+sudo chronyc offline    # refclocks are unaffected
+# ~4 minutes later, once the NTP peers age out:
+chronyc tracking        # Reference ID : 47505300 (GPS), Stratum : 1
+sudo chronyc online
+```
+
+`gps off` stops the reads rather than closing the socket, so gpsd is left holding
+a client that has stopped draining. No stale NMEA is acted on, though: the first
+read after a gap of more than 5 s reconnects, so `gps on` resumes from live
+sentences.
+
+### PPS on the Waveshare LoRaWAN/GNSS HAT
+
+Needs a hardware mod. The L76K emits a pulse-per-second signal, but the HAT
+routes it only to indicator LED `L_PPS1` through R19 (510R) — no `PPS` net reaches
+the Raspberry Interface block, and no unpopulated jumper or DNF resistor would
+route it. One wire fixes that.
+
+It is worth soldering: NMEA-only is worth about ±100 ms, while kernel PPS on a Pi
+settles under a microsecond, bounded by interrupt latency rather than by the
+receiver.
+
+PPS is a precision layer on top of gpsd, never a replacement: it says when a
+second begins, not which second it is. Keep the NMEA refclock.
+
+The mod itself — identifying R19, sizing the series resistor, landing the wire on
+a Pi header pin, the device-tree overlay, and handing the pulse to chrony (plus
+serving the resulting stratum 1 to the LAN) — is in
+[docs/gnss-pps-hardware.md](docs/gnss-pps-hardware.md).
+
+### Keeping GNSS up without meshcored
+
+Once chrony takes its time from the receiver the dependency runs the wrong way
+round: the host's clock rests on a stack that by default only works while the mesh
+daemon happens to be running. Two things cause that, and a node in this state
+looks perfect until meshcored stops. Both matter more with PPS, because `lock GPS`
+means PPS cannot number its own seconds — no gpsd is not "PPS without NMEA
+labelling", it is no stratum 1 at all.
+
+**1. gpsd does not start until something connects to it.** Debian ships gpsd
+socket-activated: `gpsd.socket` is enabled and `gpsd.service` is not, so the
+daemon is spawned by the first client on port 2947. Where meshcored is the only
+gpsd client, the entire GNSS chain — device, SHM, chrony's stratum 1 — is
+conditional on it connecting, and a meshcored held down by a bad `meshcored.ini`
+takes the host's clock with it.
+
+```sh
+systemctl is-enabled gpsd.service gpsd.socket   # the trap: "disabled" / "enabled"
+sudo systemctl enable --now gpsd.service        # [Install] pulls gpsd.socket in via Also=
+```
+
+Then make a crash self-healing, since there is no longer a client whose reconnect
+would restart it:
+
+```ini
+# /etc/systemd/system/gpsd.service.d/resilience.conf
+[Service]
+Restart=on-failure
+RestartSec=5
+```
+
+**2. The GPS enable pin is unowned whenever meshcored is not running.**
+`gps_en_pin` is held for the daemon's lifetime and no longer. In practice the pad
+keeps its last state and the receiver stays awake, so this is not an outage
+waiting to happen — but what holds the L76K awake is then a pull-up before the
+first run and a leftover output level after the last, neither of which is
+configuration, and an unowned line is also unprotected against another consumer
+claiming it and driving it low.
+
+Hand the line to the kernel instead, in `/boot/firmware/config.txt`, and leave
+`gps_en_pin` unset:
+
+```
+dtoverlay=gpio-hog,gpio=4
+```
+
+A hogged GPIO is driven for the whole boot and, in the overlay's own words, "not
+available to other drivers or for gpioset/gpioget".
+
+> **Pass `gpio=4` explicitly.** The overlay's default is **26**, which on this
+> board is the PPS input — `dtoverlay=gpio-hog` bare would hog the pulse line and
+> break the thing the hog was added to protect.
+
+Not `gpio=4=op,dh`: that firmware directive sets an initial pad state before the
+kernel starts, it does not take ownership, so the line stays free for anything to
+claim and drop. Only the hog makes the pin state both declared and defended.
+
+meshcored's own claim then fails and says so, which is the correct outcome rather
+than a fault (setting `gps_en_pin` alongside a `gpsd://` device draws a warning
+pointing here too):
+
+```
+WARNING: could not claim GPS enable pin 4; GPS may stay asleep
+         (expected if the host holds this line, e.g. a GPIO hog)
+```
+
+Two different failures, so two checks. That GNSS survives the mesh daemon:
+
+```sh
+sudo systemctl stop meshcored
+sleep 30
+chronyc tracking      # want: Reference ID 50505300 (PPS), Stratum 1, unchanged
+cgps -s               # want: still a fix -- gpsd is holding the receiver alone
+sudo systemctl start meshcored
+```
+
+And that it does not need one to *begin* with, which only shows itself across a
+boot — this is the one that bites, because gpsd left to socket activation looks
+identical to a correct node for as long as meshcored keeps connecting:
+
+```sh
+systemctl is-enabled gpsd.service     # want: enabled (not "disabled" + an enabled socket)
+sudo journalctl -b -u gpsd | head -3  # want: started at boot, before any client connected
+```
+
+### Two HAT quirks that are easy to get wrong
+
+- **GPIO 4 is load-bearing.** R13 (marked `NC/0R`) is fitted, so driving GPIO 4
+  low stops NMEA dead. The pin reads high when undriven only because of the SoC's
+  default pull-up on GPIO 0–8, which is not something to rely on. Hold it
+  deliberately: `gps_en_pin = 4` for as long as meshcored runs, or
+  `dtoverlay=gpio-hog,gpio=4` for the whole boot — with a `gpsd://` source, use
+  the hog.
+- **Switch S1 drives the same transistor in parallel with GPIO 4.** If the GPS
+  will not sleep, that switch is why. `FORCE_ON` is pushbutton K1, not a GPIO —
+  GPIO 17 is unconnected here, despite `DEV_FORCE 17` in Waveshare's sample code
+  for the standalone L76X module.
+
 ## Known Gaps / TODO
 
+- **A `gpsd://` host cannot be a bare IPv6 literal**, because `host:port` cannot be split from one unambiguously. Such a value is rejected as an invalid `gps_device` rather than silently misparsed; use a hostname, an IPv4 address, or the `127.0.0.1` default that a local gpsd needs anyway.
 - **Config path is hardcoded**, meshcored always loads `/etc/meshcored/meshcored.ini`; there is no flag to point it elsewhere. (The data *path* is separate and configurable: it is the ArduLinux VFS root, set with `--fsdir`.)
 - **Only repeater firmware**, there is no `linux_companion` target yet; companion radio support (BLE/serial interface to a phone app) is not implemented for Linux.
 - **Serial `erase` command is a no-op**, `formatFileSystem()` returns `false` on Linux, so the interactive serial `erase` command reports failure. To wipe the filesystem, use the `--erase` *startup* flag (or clear the VFS dir) instead, see step 5.

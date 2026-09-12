@@ -23,3 +23,27 @@ admin_password = changeme
 lat = 0.0
 lon = 0.0
 
+
+# GNSS, on the LoRaWAN/GNSS variant of this HAT only (the plain LoRa HAT has no
+# receiver -- leave all three commented there). The L76K's NMEA is on the Pi's
+# own UART, so /dev/ttyS0 needs the serial console off and enable_uart=1 set.
+#
+# gps_en_pin is not optional on this board: GPIO 4 reaches the L76K STANDBY line
+# through R13, and driving it low stops NMEA. Slide switch S1 is wired in
+# parallel with it -- if the GPS never sleeps, that switch is why.
+#
+# gps_device = /dev/ttyS0     # meshcored owns the UART
+# gps_device = gpsd://        # or gpsd owns it, which also lets chrony
+#                             #   discipline the host clock from GNSS.
+#                             #   See "Disciplining the host clock from GNSS"
+#                             #   in README.md.
+# gps_baud = 9600             # serial only; gpsd owns the baud rate itself
+# gps_en_pin = 4
+
+# defer_clock overrides whether meshcored sets the system clock from GPS/mesh
+# time sync. Unset (default): on exactly when gps_device is gpsd:// above.
+# true: never set the clock, even without gpsd:// -- e.g. a serial gps_device
+# whose NMEA is separately fed to chrony. false: always attempt to set it,
+# even against a gpsd:// device -- bounded, because a step of the system clock
+# also steps millis(). See "Disciplining the host clock from GNSS" in README.md.
+# defer_clock = true

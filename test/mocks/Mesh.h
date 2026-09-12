@@ -25,3 +25,9 @@ public:
 };
 
 }
+
+// LinuxGpsStream.cpp logs through this. The real definition lives in
+// src/MeshCore.h, which the native test env does not build.
+#ifndef MESH_DEBUG_PRINTLN
+  #define MESH_DEBUG_PRINTLN(...) {}
+#endif
